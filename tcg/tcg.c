@@ -3636,8 +3636,9 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots,
     ots->mem_coherent = 0;
     if (NEED_SYNC_ARG(0)) {
         temp_sync(s, ots, s->reserved_regs, preferred_regs, IS_DEAD_ARG(0));
-    } else if (IS_DEAD_ARG(0)) {
-        temp_dead(s, ots);
+    } else {
+        /* mov to a non-saved dead register makes no sense.  */
+        tcg_debug_assert(!IS_DEAD_ARG(0));
     }
 }
 
@@ -3761,15 +3762,8 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
     vece = TCGOP_VECE(op);
     vtype = TCGOP_VECL(op) + TCG_TYPE_V64;
 
-    if (its->val_type == TEMP_VAL_CONST) {
-        /* Propagate constant via movi -> dupi.  */
-        tcg_target_ulong val = its->val;
-        if (IS_DEAD_ARG(1)) {
-            temp_dead(s, its);
-        }
-        tcg_reg_alloc_do_movi(s, ots, val, arg_life, op->output_pref[0]);
-        return;
-    }
+    /* tcg_optimize() would have convert this to mov_vec.  */
+    tcg_debug_assert(!(its->val_type == TEMP_VAL_CONST));
 
     dup_out_regs = tcg_op_defs[INDEX_op_dup_vec].args_ct[0].regs;
     dup_in_regs = tcg_op_defs[INDEX_op_dup_vec].args_ct[1].regs;
@@ -3843,10 +3837,10 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
         temp_dead(s, its);
     }
     if (NEED_SYNC_ARG(0)) {
-        temp_sync(s, ots, s->reserved_regs, 0, 0);
-    }
-    if (IS_DEAD_ARG(0)) {
-        temp_dead(s, ots);
+        temp_sync(s, ots, s->reserved_regs, 0, IS_DEAD_ARG(0));
+    } else {
+        /* mov to a non-saved dead register makes no sense.  */
+        tcg_debug_assert(!IS_DEAD_ARG(0));
     }
 }
 
@@ -4052,6 +4046,10 @@ static bool tcg_reg_alloc_dup2(TCGContext *s, const TCGOp *op)
     /* ENV should not be modified.  */
     tcg_debug_assert(!temp_readonly(ots));
 
+    /* tcg_optimize() would have convert this to mov_vec.  */
+    tcg_debug_assert(!(itsl->val_type == TEMP_VAL_CONST &&
+                       itsh->val_type == TEMP_VAL_CONST));
+
     /* Allocate the output register now.  */
     if (ots->val_type != TEMP_VAL_REG) {
         TCGRegSet allocated_regs = s->reserved_regs;
@@ -4071,23 +4069,6 @@ static bool tcg_reg_alloc_dup2(TCGContext *s, const TCGOp *op)
         ots->val_type = TEMP_VAL_REG;
         ots->mem_coherent = 0;
         s->reg_to_temp[ots->reg] = ots;
-    }
-
-    /* Promote dup2 of immediates to dupi_vec. */
-    if (itsl->val_type == TEMP_VAL_CONST && itsh->val_type == TEMP_VAL_CONST) {
-        uint64_t val = deposit64(itsl->val, 32, 32, itsh->val);
-        MemOp vece = MO_64;
-
-        if (val == dup_const(MO_8, val)) {
-            vece = MO_8;
-        } else if (val == dup_const(MO_16, val)) {
-            vece = MO_16;
-        } else if (val == dup_const(MO_32, val)) {
-            vece = MO_32;
-        }
-
-        tcg_out_dupi_vec(s, vtype, vece, ots->reg, val);
-        goto done;
     }
 
     /* If the two inputs form one 64-bit value, try dupm_vec. */
@@ -4121,8 +4102,9 @@ static bool tcg_reg_alloc_dup2(TCGContext *s, const TCGOp *op)
     }
     if (NEED_SYNC_ARG(0)) {
         temp_sync(s, ots, s->reserved_regs, 0, IS_DEAD_ARG(0));
-    } else if (IS_DEAD_ARG(0)) {
-        temp_dead(s, ots);
+    } else {
+        /* mov to a non-saved dead register makes no sense.  */
+        tcg_debug_assert(!IS_DEAD_ARG(0));
     }
     return true;
 }
