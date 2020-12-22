@@ -4423,6 +4423,17 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     tcg_optimize(s);
 #endif
 
+#ifdef DEBUG_DISAS
+    if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_)
+                 && qemu_log_in_addr_range(tb->pc))) {
+        FILE *logfile = qemu_log_lock();
+        qemu_log("OP before liveness analysis:\n");
+        tcg_dump_ops(s, false);
+        qemu_log("\n");
+        qemu_log_unlock(logfile);
+    }
+#endif
+
 #ifdef CONFIG_PROFILER
     qatomic_set(&prof->opt_time, prof->opt_time + profile_getclock());
     qatomic_set(&prof->la_time, prof->la_time - profile_getclock());
