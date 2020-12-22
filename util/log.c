@@ -334,6 +334,8 @@ const QEMULogItem qemu_log_items[] = {
 #endif
     { LOG_STRACE, "strace",
       "log every user-mode syscall, its input, and its result" },
+    { CPU_LOG_TB_OP_SSA, "op_ssa",
+      "show micro ops before liveness analysis" },
     { 0, NULL, NULL },
 };
 
