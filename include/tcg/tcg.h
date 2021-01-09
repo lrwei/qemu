@@ -670,6 +670,9 @@ struct TCGContext {
 #endif
 
     GHashTable *const_table[TCG_TYPE_COUNT];
+    GHashTable *value2num;
+    GPtrArray *num2var;
+
     TCGTempSet free_temps[TCG_TYPE_COUNT * 2];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
 
@@ -1476,5 +1479,9 @@ static inline const TCGOpcode *tcg_swap_vecop_list(const TCGOpcode *n)
 }
 
 bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
+
+TCGTemp *tcg_opt_temp_new(TCGType);
+void tcg_opt_vn_reset(TCGContext *);
+void tcg_opt_vn_initialize(TCGContext *);
 
 #endif /* TCG_H */

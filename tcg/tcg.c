@@ -808,6 +808,8 @@ void tcg_register_thread(void)
     err = tcg_region_initial_alloc__locked(tcg_ctx);
     g_assert(!err);
     qemu_mutex_unlock(&region.lock);
+
+    tcg_opt_vn_initialize(s);
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -1140,6 +1142,7 @@ void tcg_func_start(TCGContext *s)
             g_hash_table_remove_all(s->const_table[i]);
         }
     }
+    tcg_opt_vn_reset(s);
 
     s->nb_ops = 0;
     s->nb_labels = 0;
@@ -1311,6 +1314,17 @@ TCGTemp *tcg_temp_new_internal(TCGType type, bool temp_local)
 #if defined(CONFIG_DEBUG_TCG)
     s->temps_in_use++;
 #endif
+    return ts;
+}
+
+TCGTemp *tcg_opt_temp_new(TCGType type)
+{
+    TCGTemp *ts = tcg_temp_alloc(tcg_ctx);
+
+    ts->base_type = type;
+    ts->type = type;
+    // ts->temp_allocated = 1;
+    ts->kind = TEMP_NORMAL;
     return ts;
 }
 
