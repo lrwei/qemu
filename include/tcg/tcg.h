@@ -671,7 +671,7 @@ struct TCGContext {
 
     GHashTable *const_table[TCG_TYPE_COUNT];
     GHashTable *value2num;
-    GPtrArray *num2var;
+    GArray *num2value;
 
     TCGTempSet free_temps[TCG_TYPE_COUNT * 2];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */

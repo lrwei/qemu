@@ -48,14 +48,30 @@
  * 1. The NUMBER of current VARIABLE is recorded in `ts->state` field, its
  *    being zero means this VARIABLE has not been initialized. NUMBER is
  *    the index of VALUE which is hold in CANONICAL VARIABLE sits at
- *    `g_ptr_array_index(tcg_ctx->num2var, NUMBER)`.
+ *    `g_array_index(tcg_ctx->num2value, NUMBER - 1)`.
  * 2. For all CANONICAL (and only CANONICAL) VARIABLEs, `ts->state_ptr` holds
- *    the information of its VALUE.  */
+ *    the information of its VALUE.
+ * 3. Due to the caching mechanism used by tcg_temp_new_internal(), CANONICAL
+ *    VARIABLEs are rewritten very frequently, therefore, transfering of its
+ *    VALUE to another temporary happens only when that VALUE is explicitly
+ *    requested by further ops.  */
+
+#define OPT_MAX_OPC_PARAM_IARGS 2
+typedef struct TCGValue {
+    TCGOpcode opc : 8;
+    uint16_t numbers[OPT_MAX_OPC_PARAM_IARGS];
+} TCGValue;
 
 typedef struct TempOptInfo {
     uint64_t mask;
-    TCGOp *op;
+    TCGValue *value;
 } TempOptInfo;
+
+typedef struct ValueNumberingEntry {
+    TCGTemp *canonical;
+    TCGOp *redef_op;
+    TempOptInfo *info;
+} ValueNumberingEntry;
 
 static inline bool ts_is_initialized(TCGTemp *ts)
 {
@@ -90,33 +106,26 @@ static inline void ts_set_number(TCGTemp *ts, uintptr_t number)
     ts->state = number;
 }
 
-static inline void ts_set_uninitialized(TCGTemp *ts, bool nullify_state_ptr)
+static inline void ts_set_uninitialized(TCGTemp *ts)
 {
     ts_set_number(ts, 0);
-    if (nullify_state_ptr) {
-        ts->state_ptr = NULL;
-    }
+    ts->state_ptr = NULL;
 }
 
 static inline bool ts_are_copies(TCGTemp *dst_ts, TCGTemp *src_ts)
 {
-    if (!ts_is_initialized(dst_ts)) {
-        return false;
-    }
     /* Source temporary should have been initialized.  */
     tcg_debug_assert(ts_is_initialized(src_ts));
 
+    if (!ts_is_initialized(dst_ts)) {
+        return false;
+    }
     return ts_number(dst_ts) == ts_number(src_ts);
 }
 
 static inline bool args_are_copies(TCGArg arg1, TCGArg arg2)
 {
     return ts_are_copies(arg_temp(arg1), arg_temp(arg2));
-}
-
-static inline TCGTemp *ts_canonical(TCGTemp *ts)
-{
-    return g_ptr_array_index(tcg_ctx->num2var, ts_number(ts));
 }
 
 static inline bool ts_is_const(TCGTemp *ts)
@@ -140,7 +149,34 @@ static inline uint64_t arg_value(TCGArg arg)
     return ts_value(arg_temp(arg));
 }
 
-static void tcg_opt_rescue_canonical(TCGOp *, TCGTemp *);
+static inline ValueNumberingEntry *num2vne(uint16_t number)
+{
+    /* Zero is used to indicate uninitialized variable.  */
+    tcg_debug_assert(number != 0);
+    return &g_array_index(tcg_ctx->num2value, ValueNumberingEntry, number - 1);
+}
+
+static void tcg_opt_number_value(GArray *num2value, TCGTemp *ts)
+{
+    ValueNumberingEntry vne = {
+        .canonical = ts,
+        .info = ts->state_ptr,
+    };
+
+    /* VALUE numbered N actually uses entrys[N - 1], see also num2vne().  */
+    g_array_append_val(num2value, vne);
+    ts_set_number(ts, num2value->len);
+}
+
+static void tcg_opt_canonical_save(TCGTemp *ts, TCGOp *redef_op)
+{
+    ValueNumberingEntry *vne = num2vne(ts_number(ts));
+
+    tcg_debug_assert(ts == vne->canonical);
+    tcg_debug_assert(vne->info == ts_info(ts));
+    vne->redef_op = redef_op;
+    ts_set_uninitialized(ts);
+}
 
 static void init_ts_info(TCGTemp *ts, TCGOp *def_op)
 {
@@ -152,16 +188,11 @@ static void init_ts_info(TCGTemp *ts, TCGOp *def_op)
     } else if (!def_op && ts_is_initialized(ts)) {
         return;
     } else if (ts_is_canonical(ts)) {
-        tcg_opt_rescue_canonical(def_op, ts);
+        tcg_opt_canonical_save(ts, def_op);
     }
-    ts_set_number(ts, tcg_ctx->num2var->len);
-    g_ptr_array_add(tcg_ctx->num2var, ts);
 
-    info = ts->state_ptr;
-    if (info == NULL) {
-        info = tcg_malloc(sizeof(TempOptInfo));
-        ts->state_ptr = info;
-    }
+    tcg_debug_assert(ts->state_ptr == NULL);
+    ts->state_ptr = info = tcg_malloc(sizeof(TempOptInfo));
 
     if (ts_is_const(ts)) {
         info->mask = ts_value(ts);
@@ -172,7 +203,9 @@ static void init_ts_info(TCGTemp *ts, TCGOp *def_op)
     } else {
         info->mask = -1;
     }
-    info->op = def_op;
+    info->value = NULL;
+
+    tcg_opt_number_value(tcg_ctx->num2value, ts);
 }
 
 static void init_arg_info(TCGArg arg, TCGOp *def_op)
@@ -192,7 +225,7 @@ static bool tcg_opt_gen_mov__unchecked(TCGOp *op, TCGArg dst, TCGArg src)
         return true;
     }
 
-    /* Can't infer type information from this shit.  */
+    /* No type information can be inferred from this shit.  */
     tcg_debug_assert(op->opc != INDEX_op_discard);
 
     if (def->flags & TCG_OPF_VECTOR) {
@@ -207,13 +240,21 @@ static bool tcg_opt_gen_mov__unchecked(TCGOp *op, TCGArg dst, TCGArg src)
     op->args[0] = dst;
     op->args[1] = src;
 
-    if (dst_ts->type == src_ts->type) {
+    if (likely(dst_ts->type == src_ts->type)) {
         if (ts_is_canonical(dst_ts)) {
-            tcg_opt_rescue_canonical(op, dst_ts);
+            tcg_opt_canonical_save(dst_ts, op);
         }
         /* Moving between the same type only serves as a propagation
          * of value number.  */
         ts_set_number(dst_ts, ts_number(src_ts));
+
+        /* Prefer using globals as CANONICAL VARIABLE.  */
+        if (dst_ts->kind > src_ts->kind) {
+            ValueNumberingEntry *vne = num2vne(ts_number(src_ts));
+            dst_ts->state_ptr = ts_info(src_ts);
+            src_ts->state_ptr = NULL;
+            vne->canonical = dst_ts;
+        }
         return true;
     } else {
         /* Moving between different types is interpreted as a cast
@@ -288,45 +329,48 @@ static void tcg_opt_reluctantly_redo_copy_propagation(TCGOp *op, TCGTemp *old,
     }
 }
 
-static void tcg_opt_rescue_canonical(TCGOp *redef_op, TCGTemp *canonical)
+static void tcg_opt_canonical_restore(ValueNumberingEntry *vne, uint16_t number)
 {
-    tcg_debug_assert(ts_is_canonical(canonical));
-
     /* Caching mechanism used by tcg_temp_new_internal() guarantees that
      * TCGTemps never change their type, so we can safely use the old type
      * when creating a new one.  */
-    TCGTemp *ts = tcg_opt_temp_new(canonical->type);
+    TCGTemp *ts = tcg_opt_temp_new(vne->canonical->type);
     TCGOp *op;
-
-    tcg_debug_assert(!ts_is_initialized(ts));
 
     /* Hack in order to reuse logic in tcg_opt_gen_mov(). Note that mov_vec
      * is reg-alloc'ed without using TCGOP_VECL/E, don't bother coping those
      * stuffs.  */
-    op = tcg_opt_reluctantly_dup_op_with_caution(redef_op);
-
+    op = tcg_opt_reluctantly_dup_op_with_caution(vne->redef_op);
     tcg_debug_assert(!ts_is_canonical(ts));
-    /* Promote `ts` to be the new CANONICAL VARIABLE after this.  */
-    tcg_opt_gen_mov(op, temp_arg(ts), temp_arg(canonical));
+    tcg_opt_gen_mov(op, temp_arg(ts), temp_arg(vne->canonical));
 
-    /* Transfer TempOptInfo struct to the new CANONICAL VARIABLE.  */
-    ts->state_ptr = ts_info(canonical);
-    canonical->state_ptr = NULL;
-
-    /* Update `num2var` to intercept all future use.  */
-    g_ptr_array_index(tcg_ctx->num2var, ts_number(canonical)) = ts;
+    /* Fix the propagated value number since that of `vne->canonical` would
+     * have been changed by this time, fix it.  */
+    ts_set_number(ts, number);
 
     /* Prefer:  mov_i64 tmp1, tmp0      than:   mov_i64 tmp1, tmp0
      *          add_i64 tmp0, tmp1, $8          add_i64 tmp0, tmp0, $8
      * since the latter one will generates 1 more register movement.  */
-    tcg_opt_reluctantly_redo_copy_propagation(redef_op, canonical, ts);
+    tcg_opt_reluctantly_redo_copy_propagation(vne->redef_op, vne->canonical,
+                                              ts);
+
+    /* Promote `ts` to be the new CANONICAL VARIABLE.  */
+    ts->state_ptr = vne->info;
+    vne->canonical = ts;
+
+    /* CANONICAL VARIABLE has been restored.  */
+    vne->redef_op = NULL;
 }
 
-#define OPT_MAX_OPC_PARAM_IARGS 2
-typedef struct TCGValue {
-    TCGOpcode opc : 8;
-    uint16_t numbers[OPT_MAX_OPC_PARAM_IARGS];
-} TCGValue;
+static TCGTemp *num2var(uint16_t number)
+{
+    ValueNumberingEntry *vne = num2vne(number);
+
+    if (unlikely(vne->redef_op)) {
+        tcg_opt_canonical_restore(vne, number);
+    }
+    return vne->canonical;
+}
 
 static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
                                                         const TCGOp *op)
@@ -337,7 +381,7 @@ static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
         if (op && def->nb_cargs > 0) {
             TCGArg carg = op->args[1 + def->nb_iargs];
             tcg_debug_assert(def->nb_cargs == 1);
-            return likely(carg == (uint16_t) carg);
+            return likely(carg == (int16_t) carg);
         } else {
             return true;
         }
@@ -361,7 +405,7 @@ static TCGValue *tcg_opt_make_value(TCGOp *op, TCGValue *value)
         value->numbers[i - 1] = ts_number(arg_temp(op->args[i]));
     }
     for ( ; i < 1 + def->nb_iargs + def->nb_cargs; i++) {
-        tcg_debug_assert(op->args[i] == (uint16_t) op->args[i]);
+        tcg_debug_assert(op->args[i] == (int16_t) op->args[i]);
         value->numbers[i - 1] = op->args[i];
     }
 
@@ -373,6 +417,7 @@ static void tcg_opt_record_value(GHashTable *value2num, TCGValue **value,
 {
     tcg_debug_assert(g_hash_table_insert(value2num, *value,
                                          GSIZE_TO_POINTER(ts_number(ts))));
+    ts_info(ts)->value = *value;
     /* Consume the value.  */
     *value = NULL;
 }
@@ -429,14 +474,14 @@ static gboolean tcg_op_equal(gconstpointer key, gconstpointer key2)
 void tcg_opt_vn_initialize(TCGContext *s)
 {
     s->value2num = g_hash_table_new(tcg_op_hash, tcg_op_equal);
-    s->num2var = g_ptr_array_new();
+    s->num2value = g_array_sized_new(FALSE, FALSE,
+                                     sizeof(ValueNumberingEntry), 64);
 }
 
 void tcg_opt_vn_reset(TCGContext *s)
 {
     g_hash_table_remove_all(s->value2num);
-    /* 0 is used to indicate uninitialized variable.  */
-    g_ptr_array_set_size(s->num2var, 1);
+    g_array_set_size(s->num2value, 0);
 }
 
 static uint64_t do_constant_folding_2(TCGOpcode op, uint64_t x, uint64_t y)
@@ -794,7 +839,7 @@ void tcg_optimize(TCGContext *s)
     TCGValue *value = NULL;
 
     for (i = 0; i < s->nb_temps; i++) {
-        ts_set_uninitialized(&s->temps[i], true);
+        ts_set_uninitialized(&s->temps[i]);
     }
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, op_next) {
@@ -823,7 +868,7 @@ void tcg_optimize(TCGContext *s)
             /* Filter possible TCG_CALL_DUMMY_ARG.  */
             if (ts) {
                 tcg_debug_assert(ts_is_initialized(ts));
-                op->args[i] = temp_arg(ts_canonical(ts));
+                op->args[i] = temp_arg(num2var(ts_number(ts)));
             }
         }
 
@@ -1670,8 +1715,7 @@ done_algebraic_simplifying_and_constant_folding:
                 value = tcg_opt_make_value(op, value);
                 i = GPOINTER_TO_SIZE(g_hash_table_lookup(s->value2num, value));
                 if (i) {
-                    ts = g_ptr_array_index(s->num2var, i);
-                    tcg_opt_gen_mov(op, op->args[0], temp_arg(ts));
+                    tcg_opt_gen_mov(op, op->args[0], temp_arg(num2var(i)));
                 } else {
                     ts = arg_temp(op->args[0]);
                     init_ts_info(ts, op);
@@ -1682,13 +1726,11 @@ done_algebraic_simplifying_and_constant_folding:
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
         reset_all:
-                /* XXX: No prolonging lifetime, as the everything is going
-                 * to be reset.  */
-
-                /* TODO: In future we need to incorporate tracing compilation.
-                 * then we need to properly handle goto_tb and goto_ptr.  */
+                /* TODO: When incorporating tracing compilation, we need to
+                 * properly handle goto_tb and goto_ptr. For now, just reset
+                 * everything.  */
                 for (i = 0; i < s->nb_temps; i++) {
-                    ts_set_uninitialized(&s->temps[i], false);
+                    ts_set_uninitialized(&s->temps[i]);
                 }
                 tcg_opt_vn_reset(s);
             } else {
