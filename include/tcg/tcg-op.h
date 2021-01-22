@@ -380,6 +380,12 @@ static inline void tcg_gen_ld_i32(TCGv_i32 ret, TCGv_ptr arg2,
     tcg_gen_ldst_op_i32(INDEX_op_ld_i32, ret, arg2, offset);
 }
 
+static inline void _tcg_gen_ld_i32(TCGv_i32 ret, TCGv_ptr arg2,
+                                   tcg_target_long offset)
+{
+    tcg_gen_ldst_op_i32(INDEX_op__ld_i32, ret, arg2, offset);
+}
+
 static inline void tcg_gen_st8_i32(TCGv_i32 arg1, TCGv_ptr arg2,
                                    tcg_target_long offset)
 {
@@ -587,6 +593,12 @@ static inline void tcg_gen_ld_i64(TCGv_i64 ret, TCGv_ptr arg2,
                                   tcg_target_long offset)
 {
     tcg_gen_ldst_op_i64(INDEX_op_ld_i64, ret, arg2, offset);
+}
+
+static inline void _tcg_gen_ld_i64(TCGv_i64 ret, TCGv_ptr arg2,
+                                   tcg_target_long offset)
+{
+    tcg_gen_ldst_op_i64(INDEX_op__ld_i64, ret, arg2, offset);
 }
 
 static inline void tcg_gen_st8_i64(TCGv_i64 arg1, TCGv_ptr arg2,
@@ -1125,6 +1137,7 @@ void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
 #define tcg_gen_atomic_smax_fetch_tl tcg_gen_atomic_smax_fetch_i64
 #define tcg_gen_atomic_umax_fetch_tl tcg_gen_atomic_umax_fetch_i64
 #define tcg_gen_dup_tl_vec  tcg_gen_dup_i64_vec
+#define _tcg_gen_ld_tl _tcg_gen_ld_i64
 #else
 #define tcg_gen_movi_tl tcg_gen_movi_i32
 #define tcg_gen_mov_tl tcg_gen_mov_i32
@@ -1237,6 +1250,7 @@ void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
 #define tcg_gen_atomic_smax_fetch_tl tcg_gen_atomic_smax_fetch_i32
 #define tcg_gen_atomic_umax_fetch_tl tcg_gen_atomic_umax_fetch_i32
 #define tcg_gen_dup_tl_vec  tcg_gen_dup_i32_vec
+#define _tcg_gen_ld_tl _tcg_gen_ld_i32
 #endif
 
 #if UINTPTR_MAX == UINT32_MAX

@@ -2344,6 +2344,7 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_ld32u_i64:
 #endif
     case INDEX_op_ld_i32:
+    case INDEX_op__ld_i32:
         tcg_out_ld(s, TCG_TYPE_I32, a0, a1, a2);
         break;
 
@@ -2594,6 +2595,7 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
         tcg_out_modrm_offset(s, OPC_MOVSLQ, a0, a1, a2);
         break;
     case INDEX_op_ld_i64:
+    case INDEX_op__ld_i64:
         tcg_out_ld(s, TCG_TYPE_I64, a0, a1, a2);
         break;
     case INDEX_op_st_i64:
@@ -3026,9 +3028,11 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_ld16s_i32:
     case INDEX_op_ld16s_i64:
     case INDEX_op_ld_i32:
+    case INDEX_op__ld_i32:
     case INDEX_op_ld32u_i64:
     case INDEX_op_ld32s_i64:
     case INDEX_op_ld_i64:
+    case INDEX_op__ld_i64:
         return &r_r;
 
     case INDEX_op_st8_i32:
