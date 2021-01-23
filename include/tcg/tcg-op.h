@@ -1292,6 +1292,21 @@ static inline void tcg_gen_brcondi_ptr(TCGCond cond, TCGv_ptr a,
     glue(tcg_gen_brcondi_,PTR)(cond, (NAT)a, b, label);
 }
 
+static inline void tcg_gen_shri_ptr(TCGv_ptr r, TCGv_ptr a, intptr_t b)
+{
+    glue(tcg_gen_shri_,PTR)((NAT)r, (NAT)a, b);
+}
+
+static inline void _tcg_gen_ld_ptr(TCGv_ptr r, TCGv_ptr a, intptr_t o)
+{
+    glue(_tcg_gen_ld_,PTR)((NAT)r, a, o);
+}
+
+static inline void tcg_gen_and_ptr(TCGv_ptr r, TCGv_ptr a, TCGv_ptr b)
+{
+    glue(tcg_gen_and_,PTR)((NAT)r, (NAT)a, (NAT)b);
+}
+
 static inline void tcg_gen_ext_i32_ptr(TCGv_ptr r, TCGv_i32 a)
 {
 #if UINTPTR_MAX == UINT32_MAX
