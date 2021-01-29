@@ -151,8 +151,8 @@ static bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
 static void tcg_out_call(TCGContext *s, tcg_insn_unit *target);
 static int tcg_target_const_match(tcg_target_long val, TCGType type,
                                   const TCGArgConstraint *arg_ct);
-#ifdef TCG_TARGET_NEED_LDST_LABELS
-static int tcg_out_ldst_finalize(TCGContext *s);
+#ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
+static int tcg_out_slow_path_finalize(TCGContext *s);
 #endif
 
 #define TCG_HIGHWATER 1024
@@ -4501,8 +4501,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     s->code_buf = tb->tc.ptr;
     s->code_ptr = tb->tc.ptr;
 
-#ifdef TCG_TARGET_NEED_LDST_LABELS
-    QSIMPLEQ_INIT(&s->ldst_labels);
+#ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
+    QSIMPLEQ_INIT(&s->slow_path_labels);
 #endif
 #ifdef TCG_TARGET_NEED_POOL_LABELS
     s->pool_labels = NULL;
@@ -4589,8 +4589,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
-#ifdef TCG_TARGET_NEED_LDST_LABELS
-    i = tcg_out_ldst_finalize(s);
+#ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
+    i = tcg_out_slow_path_finalize(s);
     if (i < 0) {
         return i;
     }

@@ -1802,7 +1802,7 @@ static void add_qemu_ldst_label(TCGContext *s, bool is_ld, bool is_64,
                                 tcg_insn_unit *raddr,
                                 tcg_insn_unit **label_ptr)
 {
-    TCGLabelQemuLdst *label = new_ldst_label(s);
+    TCGLabelQemuLdst *label = new_ldst_label(s, raddr, label_ptr[0]);
 
     label->is_ld = is_ld;
     label->oi = oi;
@@ -1811,22 +1811,18 @@ static void add_qemu_ldst_label(TCGContext *s, bool is_ld, bool is_64,
     label->datahi_reg = datahi;
     label->addrlo_reg = addrlo;
     label->addrhi_reg = addrhi;
-    label->raddr = raddr;
-    label->label_ptr[0] = label_ptr[0];
-    if (TARGET_LONG_BITS > TCG_TARGET_REG_BITS) {
-        label->label_ptr[1] = label_ptr[1];
-    }
 }
 
 /*
  * Generate code for the slow path for a load at the end of block
  */
-static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
+static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
+    TCGLabelQemuLdst *l = spl->ldst;
     TCGMemOpIdx oi = l->oi;
     MemOp opc = get_memop(oi);
     TCGReg data_reg;
-    tcg_insn_unit **label_ptr = &l->label_ptr[0];
+    tcg_insn_unit **label_ptr = &spl->label_ptr;
     int rexw = (l->type == TCG_TYPE_I64 ? P_REXW : 0);
 
     /* resolve label address */
@@ -1852,13 +1848,13 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
         tcg_out_sti(s, TCG_TYPE_I32, oi, TCG_REG_ESP, ofs);
         ofs += 4;
 
-        tcg_out_sti(s, TCG_TYPE_PTR, (uintptr_t)l->raddr, TCG_REG_ESP, ofs);
+        tcg_out_sti(s, TCG_TYPE_PTR, (uintptr_t)spl->raddr, TCG_REG_ESP, ofs);
     } else {
         tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
         /* The second argument is already loaded with addrlo.  */
         tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], oi);
         tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[3],
-                     (uintptr_t)l->raddr);
+                     (uintptr_t)spl->raddr);
     }
 
     tcg_out_call(s, qemu_ld_helpers[opc & (MO_BSWAP | MO_SIZE)]);
@@ -1899,19 +1895,20 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
     }
 
     /* Jump to the code corresponding to next IR of qemu_st */
-    tcg_out_jmp(s, l->raddr);
+    tcg_out_jmp(s, spl->raddr);
     return true;
 }
 
 /*
  * Generate code for the slow path for a store at the end of block
  */
-static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
+static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
+    TCGLabelQemuLdst *l = spl->ldst;
     TCGMemOpIdx oi = l->oi;
     MemOp opc = get_memop(oi);
     MemOp s_bits = opc & MO_SIZE;
-    tcg_insn_unit **label_ptr = &l->label_ptr[0];
+    tcg_insn_unit **label_ptr = &spl->label_ptr;
     TCGReg retaddr;
 
     /* resolve label address */
@@ -1946,7 +1943,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
         ofs += 4;
 
         retaddr = TCG_REG_EAX;
-        tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)l->raddr);
+        tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)spl->raddr);
         tcg_out_st(s, TCG_TYPE_PTR, retaddr, TCG_REG_ESP, ofs);
     } else {
         tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
@@ -1957,10 +1954,10 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
 
         if (ARRAY_SIZE(tcg_target_call_iarg_regs) > 4) {
             retaddr = tcg_target_call_iarg_regs[4];
-            tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)l->raddr);
+            tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)spl->raddr);
         } else {
             retaddr = TCG_REG_RAX;
-            tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)l->raddr);
+            tcg_out_movi(s, TCG_TYPE_PTR, retaddr, (uintptr_t)spl->raddr);
             tcg_out_st(s, TCG_TYPE_PTR, retaddr, TCG_REG_ESP,
                        TCG_TARGET_CALL_STACK_OFFSET);
         }

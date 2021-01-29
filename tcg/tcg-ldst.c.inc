@@ -28,28 +28,50 @@ typedef struct TCGLabelQemuLdst {
     TCGReg addrhi_reg;      /* reg index for high word of guest virtual addr */
     TCGReg datalo_reg;      /* reg index for low word to be loaded or stored */
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
-    tcg_insn_unit *raddr;   /* gen code addr of the next IR of qemu_ld/st IR */
-    tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
-    QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 } TCGLabelQemuLdst;
+
+typedef enum TCGLabelSlowPathType {
+    QemuLdst,
+} TCGLabelSlowPathType;
+
+typedef struct TCGLabelSlowPath {
+    TCGLabelSlowPathType type;
+    tcg_insn_unit *raddr;
+    /* Oversized guest are not supported, once again.  */
+    tcg_insn_unit *label_ptr;
+    union {
+        TCGLabelQemuLdst *ldst;
+    };
+    QSIMPLEQ_ENTRY(TCGLabelSlowPath) next;
+} TCGLabelSlowPath;
 
 
 /*
  * Generate TB finalization at the end of block
  */
 
-static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
-static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
+static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
+static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
-static int tcg_out_ldst_finalize(TCGContext *s)
+static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
-    TCGLabelQemuLdst *lb;
+    switch (spl->type) {
+    case QemuLdst:
+        return spl->ldst->is_ld
+               ? tcg_out_qemu_ld_slow_path(s, spl)
+               : tcg_out_qemu_st_slow_path(s, spl);
+    default:
+        g_assert_not_reached();
+    }
+}
 
-    /* qemu_ld/st slow paths */
-    QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
-        if (lb->is_ld
-            ? !tcg_out_qemu_ld_slow_path(s, lb)
-            : !tcg_out_qemu_st_slow_path(s, lb)) {
+static int tcg_out_slow_path_finalize(TCGContext *s)
+{
+    TCGLabelSlowPath *spl;
+
+    /* Dispatch slow paths.  */
+    QSIMPLEQ_FOREACH(spl, &s->slow_path_labels, next) {
+        if (!tcg_dispatch_slow_path_label(s, spl)) {
             return -2;
         }
 
@@ -65,14 +87,33 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 }
 
 /*
+ * Allocate a new TCGLabelSlowPath entry.
+ */
+
+static inline TCGLabelSlowPath *new_slow_path_label(TCGContext *s,
+                                                    tcg_insn_unit *raddr,
+                                                    tcg_insn_unit *label_ptr)
+{
+    TCGLabelSlowPath *spl = tcg_malloc(sizeof(*spl));
+
+    spl->raddr = raddr;
+    spl->label_ptr = label_ptr;
+    QSIMPLEQ_INSERT_TAIL(&s->slow_path_labels, spl, next);
+    return spl;
+}
+
+/*
  * Allocate a new TCGLabelQemuLdst entry.
  */
 
-static inline TCGLabelQemuLdst *new_ldst_label(TCGContext *s)
+static inline TCGLabelQemuLdst *new_ldst_label(TCGContext *s,
+                                               tcg_insn_unit *raddr,
+                                               tcg_insn_unit *label_ptr)
 {
+    TCGLabelSlowPath *spl = new_slow_path_label(s, raddr, label_ptr);
     TCGLabelQemuLdst *l = tcg_malloc(sizeof(*l));
 
-    QSIMPLEQ_INSERT_TAIL(&s->ldst_labels, l, next);
-
+    spl->type = QemuLdst;
+    spl->ldst = l;
     return l;
 }

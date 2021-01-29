@@ -232,7 +232,7 @@ static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
 #define TCG_TARGET_HAS_MEMORY_BSWAP  1
 
 #ifdef CONFIG_SOFTMMU
-#define TCG_TARGET_NEED_LDST_LABELS
+#define TCG_TARGET_NEED_SLOW_PATH_LABELS
 #endif
 #define TCG_TARGET_NEED_POOL_LABELS
 

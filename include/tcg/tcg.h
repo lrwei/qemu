@@ -643,8 +643,8 @@ struct TCGContext {
     CPUState *cpu;                      /* *_trans */
 
     /* These structures are private to tcg-target.c.inc.  */
-#ifdef TCG_TARGET_NEED_LDST_LABELS
-    QSIMPLEQ_HEAD(, TCGLabelQemuLdst) ldst_labels;
+#ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
+    QSIMPLEQ_HEAD(, TCGLabelSlowPath) slow_path_labels;
 #endif
 #ifdef TCG_TARGET_NEED_POOL_LABELS
     struct TCGLabelPoolData *pool_labels;
