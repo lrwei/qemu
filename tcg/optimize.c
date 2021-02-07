@@ -372,6 +372,62 @@ static TCGTemp *num2var(uint16_t number)
     return vne->canonical;
 }
 
+static void tcg_opt_aggregate_offset(TCGOp *op)
+{
+    TCGValue *value = arg_info(op->args[1])->value;
+    uint64_t offset;
+    TCGTemp *ts;
+
+    switch (op->opc) {
+    CASE_OP_32_64(add):
+        offset = arg_value(op->args[2]);
+        break;
+    case INDEX_op_sub_i32:
+        op->opc = INDEX_op_add_i32;
+        /* subi<i32>(constant<i32>) <=> addi<i32>(neg<i32>(constant<i32>))
+         * holds for all constant<i32> /in [-2**31, 2**31).  */
+        offset = -((int32_t) arg_value(op->args[2]));
+        break;
+    case INDEX_op_sub_i64:
+        op->opc = INDEX_op_add_i64;
+        offset = -arg_value(op->args[2]);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (value) {
+        switch (value->opc) {
+        CASE_OP_32_64(add):
+            /* Hack: .canonical fields of constant temporaries are
+             * always valid, and is never going to change.  */
+            ts = num2vne(value->numbers[1])->canonical;
+            if (ts_is_const(ts)) {
+                offset += ts_value(ts);
+                op->args[1] = temp_arg(num2var(value->numbers[0]));
+            }
+            if (value->opc == INDEX_op_add_i32
+                && unlikely(offset != (int32_t) offset)) {
+                g_print("tcg_opt_aggregate_offset: overflow detected...\n");
+                offset = (int32_t) offset;
+            }
+            break;
+        CASE_OP_32_64(sub):
+            /* Previous SUBI operations should have been transformed
+             * into ADDIs.  */
+            ts = num2vne(value->numbers[1])->canonical;
+            tcg_debug_assert(!ts_is_const(ts));
+            break;
+        default:
+            break;
+        }
+    }
+
+    ts = tcg_constant_internal(arg_temp(op->args[1])->type, offset);
+    init_ts_info(ts, NULL);
+    op->args[2] = temp_arg(ts);
+}
+
 static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
                                                         const TCGOp *op)
 {
@@ -1170,6 +1226,11 @@ void tcg_optimize(TCGContext *s)
 
         CASE_OP_32_64(add):
         CASE_OP_32_64(sub):
+            if (!arg_is_const(op->args[1]) && arg_is_const(op->args[2])) {
+                tcg_opt_aggregate_offset(op);
+                opc = op->opc;
+                break;
+            }
         CASE_OP_32_64(mul):
         CASE_OP_32_64(or):
         CASE_OP_32_64(and):
