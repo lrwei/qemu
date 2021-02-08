@@ -65,12 +65,14 @@ typedef struct TCGValue {
 typedef struct TempOptInfo {
     uint64_t mask;
     TCGValue *value;
+    bool reassociated;
 } TempOptInfo;
 
 typedef struct ValueNumberingEntry {
     TCGTemp *canonical;
     TCGOp *redef_op;
     TempOptInfo *info;
+    uint16_t the_address;
 } ValueNumberingEntry;
 
 static inline bool ts_is_initialized(TCGTemp *ts)
@@ -372,10 +374,32 @@ static TCGTemp *num2var(uint16_t number)
     return vne->canonical;
 }
 
+static bool value_has_constant_offset(TCGValue *value, uint64_t *offset,
+                                      bool check)
+{
+    TCGTemp *ts;
+    TCGOpcode add_tl = TARGET_LONG_BITS == 32 ? INDEX_op_add_i32
+                                              : INDEX_op_add_i64;
+
+    if (check && (!value || value->opc != add_tl)) {
+        return false;
+    }
+
+    /* Hack: .canonical fields of constant temporaries are
+     * always valid, and is never going to change.  */
+    ts = num2vne(value->numbers[1])->canonical;
+    if (!ts_is_const(ts)) {
+        return false;
+    } else {
+        *offset = ts_value(ts);
+        return true;
+    }
+}
+
 static void tcg_opt_aggregate_offset(TCGOp *op)
 {
     TCGValue *value = arg_info(op->args[1])->value;
-    uint64_t offset;
+    uint64_t offset, offset2;
     TCGTemp *ts;
 
     switch (op->opc) {
@@ -399,11 +423,8 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     if (value) {
         switch (value->opc) {
         CASE_OP_32_64(add):
-            /* Hack: .canonical fields of constant temporaries are
-             * always valid, and is never going to change.  */
-            ts = num2vne(value->numbers[1])->canonical;
-            if (ts_is_const(ts)) {
-                offset += ts_value(ts);
+            if (value_has_constant_offset(value, &offset2, false)) {
+                offset += offset2;
                 op->args[1] = temp_arg(num2var(value->numbers[0]));
             }
             if (value->opc == INDEX_op_add_i32
@@ -415,8 +436,7 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
         CASE_OP_32_64(sub):
             /* Previous SUBI operations should have been transformed
              * into ADDIs.  */
-            ts = num2vne(value->numbers[1])->canonical;
-            tcg_debug_assert(!ts_is_const(ts));
+            tcg_debug_assert(!value_has_constant_offset(value, NULL, false));
             break;
         default:
             break;
@@ -426,6 +446,57 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     ts = tcg_constant_internal(arg_temp(op->args[1])->type, offset);
     init_ts_info(ts, NULL);
     op->args[2] = temp_arg(ts);
+}
+
+#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 2))
+static void tcg_opt_reassociate_address(TCGOp *op)
+{
+    TCGTemp *addr = arg_temp(op->args[2]), *_base, *_offset;
+    TCGValue *value = ts_info(addr)->value;
+    ValueNumberingEntry *vne;
+    uint64_t offset, offset2;
+    TCGOp *op2, *op3;
+    TCGOpcode mov_tl = TARGET_LONG_BITS == 32 ? INDEX_op_mov_i32
+                                              : INDEX_op_mov_i64;
+
+    if (ts_is_const(addr)) {
+        /* Constant address ignored for the time being.  */
+        goto not_found;
+    } else if (!value_has_constant_offset(value, &offset, true)) {
+        /* Non-constant offset ignored for the time being.  */
+        vne = num2vne(ts_number(addr));
+        offset = 0;
+    } else {
+        vne = num2vne(value->numbers[0]);
+    }
+
+    if (vne->the_address != 0) {
+        _base = num2var(vne->the_address);
+        if (value_has_constant_offset(ts_info(_base)->value, &offset2, true)) {
+            offset -= offset2;
+        }
+        if (unlikely(llabs(offset) > SPECULATION_THRESHOLD)) {
+            goto not_found;
+        }
+        ts_info(addr)->reassociated = true;
+    } else {
+        vne->the_address = ts_number(addr);
+    not_found:
+        _base = addr;
+        offset = 0;
+        ts_info(addr)->reassociated = false;
+    }
+
+    tcg_debug_assert(addr->type == TCG_TYPE_TL);
+    _offset = tcg_constant_internal(TCG_TYPE_TL, offset);
+    init_ts_info(_offset, NULL);
+
+    /* ts_set_number() must be called through tcg_opt_gen_mov(), as
+     * temporaries `base` and `offset` maybe canonical variables.  */
+    op2 = tcg_op_insert_before(NULL, op, mov_tl);
+    op3 = tcg_op_insert_before(NULL, op, mov_tl);
+    tcg_opt_gen_mov(op3, op->args[1], temp_arg(_offset));
+    tcg_opt_gen_mov(op2, op->args[0], temp_arg(_base));
 }
 
 static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
@@ -926,6 +997,14 @@ void tcg_optimize(TCGContext *s)
                 tcg_debug_assert(ts_is_initialized(ts));
                 op->args[i] = temp_arg(num2var(ts_number(ts)));
             }
+        }
+
+        switch (opc) {
+        case INDEX_op_reassociate_address:
+            tcg_opt_reassociate_address(op);
+            continue;
+        default:
+            break;
         }
 
         /* For commutative operations make constant second argument */
@@ -1783,6 +1862,7 @@ done_algebraic_simplifying_and_constant_folding:
                     /* Save the corresponding known-zero bits mask for the
                      * first output argument (only one supported so far).  */
                     ts_info(ts)->mask = mask;
+
                     tcg_opt_record_value(s->value2num, &value, ts);
                 }
             } else if (def->flags & TCG_OPF_BB_END) {

@@ -2808,6 +2808,45 @@ static inline void plugin_gen_mem_callbacks(TCGv vaddr, uint16_t info)
 #endif
 }
 
+static inline void _tcg_gen_reassociate_address(TCGv base, TCGv offset,
+                                                TCGv addr)
+{
+#if TARGET_LONG_BITS == 32
+    tcg_gen_op3_i32(INDEX_op_reassociate_address, base, offset, addr);
+#else
+    tcg_gen_op3_i64(INDEX_op_reassociate_address, base, offset, addr);
+#endif
+}
+
+__attribute__((unused))
+static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv addr)
+{
+#if TARGET_LONG_BITS < TCG_TARGET_REG_BITS
+    TCGv_i32 _base = tcg_temp_new_i32();
+    TCGv_i32 _offset = tcg_temp_new_i32();
+
+    _tcg_gen_reassociate_address(_base, _offset, addr);
+    /* Hack:
+     * `addr == _base + _offset` holds by definition, but applying
+     * `ext[u]_i32_i64` to each term may render it, and therfore
+     * `addend + addr == addend + base + offset` a false statement.
+     * Thankfully, the `guard` instruction before this calculation
+     * (which checks whether `base` and `base + offset` are within
+     * the same page) guarantees all the above statement holds, so
+     * we are still safe.  */
+    tcg_gen_extu_i32_i64((TCGv_i64) base, _base);
+    tcg_gen_ext_i32_i64((TCGv_i64) offset, _offset);
+
+    tcg_temp_free_i32(_base);
+    tcg_temp_free_i32(_offset);
+#elif TARGET_LONG_BITS == TCG_TARGET_REG_BITS
+    _tcg_gen_reassociate_address((TCGv) base, (TCGv) offset, addr);
+#else
+    /* Oversized-access is not supported.  */
+    g_assert_not_reached();
+#endif
+}
+
 void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
 {
     MemOp orig_memop;
