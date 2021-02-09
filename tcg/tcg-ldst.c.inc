@@ -39,6 +39,7 @@ typedef struct TCGLabelTlbCheck {
 typedef enum TCGLabelSlowPathType {
     QemuLdst,
     TlbCheck,
+    Guard,
 } TCGLabelSlowPathType;
 
 typedef struct TCGLabelSlowPath {
@@ -61,6 +62,7 @@ typedef struct TCGLabelSlowPath {
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
+static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
 static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
@@ -71,6 +73,8 @@ static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
                : tcg_out_qemu_st_slow_path(s, spl);
     case TlbCheck:
         return tcg_out_tlb_check_slow_path(s, spl);
+    case Guard:
+        return tcg_out_guard_slow_path(s, spl);
     default:
         g_assert_not_reached();
     }

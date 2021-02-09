@@ -2699,6 +2699,11 @@ target_ulong helper_tlb_check_st(CPUArchState *env, target_ulong addr,
     return tlb_check_helper(env, addr, oi, retaddr, false);
 }
 
+void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
+{
+    cpu_speculation_recompile(env_cpu(env), retaddr);
+}
+
 /* First set of helpers allows passing in of OI and RETADDR.  This makes
    them callable from other helpers.  */
 

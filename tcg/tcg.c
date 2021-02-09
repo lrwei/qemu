@@ -1525,6 +1525,8 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_qemu_ld_i64:
     case INDEX_op_qemu_st_i64:
     case INDEX_op_tlb_check:
+    case INDEX_op_guard_i32:
+    case INDEX_op_guard_i64:
         return true;
 
     case INDEX_op_goto_ptr:
