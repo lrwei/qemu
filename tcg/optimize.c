@@ -1003,6 +1003,12 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_reassociate_address:
             tcg_opt_reassociate_address(op);
             continue;
+        case INDEX_op_tlb_check:
+            if (arg_info(op->args[2])->reassociated) {
+                op->opc = TARGET_LONG_BITS == 32 ? INDEX_op_guard_i32
+                                                 : INDEX_op_guard_i64;
+            }
+            continue;
         default:
             break;
         }
@@ -1172,38 +1178,7 @@ void tcg_optimize(TCGContext *s)
             break;
         }
 
-        /* Simplify expression for "op r, a, const => mov r, a" cases */
-        switch (opc) {
-        CASE_OP_32_64_VEC(add):
-        CASE_OP_32_64_VEC(sub):
-        CASE_OP_32_64_VEC(or):
-        CASE_OP_32_64_VEC(xor):
-        CASE_OP_32_64_VEC(andc):
-        CASE_OP_32_64(shl):
-        CASE_OP_32_64(shr):
-        CASE_OP_32_64(sar):
-        CASE_OP_32_64(rotl):
-        CASE_OP_32_64(rotr):
-            if (!arg_is_const(op->args[1])
-                && arg_is_const(op->args[2])
-                && arg_value(op->args[2]) == 0) {
-                tcg_opt_gen_mov(op, op->args[0], op->args[1]);
-                continue;
-            }
-            break;
-        CASE_OP_32_64_VEC(and):
-        CASE_OP_32_64_VEC(orc):
-        CASE_OP_32_64(eqv):
-            if (!arg_is_const(op->args[1])
-                && arg_is_const(op->args[2])
-                && arg_value(op->args[2]) == -1) {
-                tcg_opt_gen_mov(op, op->args[0], op->args[1]);
-                continue;
-            }
-            break;
-        default:
-            break;
-        }
+
 
         /* Simplify expression for "op r, a, 0 => movi r, 0" cases */
         switch (opc) {
@@ -1623,6 +1598,39 @@ void tcg_optimize(TCGContext *s)
         default:
             /* Default case: we know nothing about operation (or were unable
              * to compute the operation result) so no propagation is done.  */
+            break;
+        }
+
+        /* Simplify expression for "op r, a, const => mov r, a" cases */
+        switch (opc) {
+        CASE_OP_32_64_VEC(add):
+        CASE_OP_32_64_VEC(sub):
+        CASE_OP_32_64_VEC(or):
+        CASE_OP_32_64_VEC(xor):
+        CASE_OP_32_64_VEC(andc):
+        CASE_OP_32_64(shl):
+        CASE_OP_32_64(shr):
+        CASE_OP_32_64(sar):
+        CASE_OP_32_64(rotl):
+        CASE_OP_32_64(rotr):
+            if (!arg_is_const(op->args[1])
+                && arg_is_const(op->args[2])
+                && arg_value(op->args[2]) == 0) {
+                tcg_opt_gen_mov(op, op->args[0], op->args[1]);
+                continue;
+            }
+            break;
+        CASE_OP_32_64_VEC(and):
+        CASE_OP_32_64_VEC(orc):
+        CASE_OP_32_64(eqv):
+            if (!arg_is_const(op->args[1])
+                && arg_is_const(op->args[2])
+                && arg_value(op->args[2]) == -1) {
+                tcg_opt_gen_mov(op, op->args[0], op->args[1]);
+                continue;
+            }
+            break;
+        default:
             break;
         }
 

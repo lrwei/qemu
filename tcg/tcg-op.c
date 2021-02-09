@@ -2818,7 +2818,6 @@ static inline void _tcg_gen_reassociate_address(TCGv base, TCGv offset,
 #endif
 }
 
-__attribute__((unused))
 static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv addr)
 {
 #if TARGET_LONG_BITS < TCG_TARGET_REG_BITS
@@ -2847,7 +2846,6 @@ static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv add
 #endif
 }
 
-__attribute__((unused))
 static inline void _tcg_gen_tlb_check(TCGv tag, TCGv tag2, TCGv addr,
                                       TCGMemOpIdx _oi)
 {
@@ -2858,7 +2856,6 @@ static inline void _tcg_gen_tlb_check(TCGv tag, TCGv tag2, TCGv addr,
 #endif
 }
 
-__attribute__((unused))
 static void tcg_gen_extract_tag(TCGv tag, TCGv addr, MemOp memop)
 {
     uint32_t a_bits = get_alignment_bits(memop);
@@ -2880,12 +2877,157 @@ static void tcg_gen_extract_tag(TCGv tag, TCGv addr, MemOp memop)
     tcg_gen_andi_tl(tag, tag, tlb_mask);
 }
 
-__attribute__((unused))
 static inline TCGMemOpIdx _make_memop_idx(MemOp memop, uint32_t idx,
                                           bool is_load)
 {
     memop |= is_load ? 0 : MO_STORE;
     return make_memop_idx(memop, idx);
+}
+
+static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
+                                      TCGArg mem_index, bool is_load)
+{
+    TCGv tag = tcg_temp_new();
+    TCGv tag2 = tcg_temp_new();
+    TCGv_ptr base = tcg_temp_new_ptr();
+    TCGv_ptr offset = tcg_temp_new_ptr();
+    TCGv_ptr _index = tcg_temp_new_ptr();
+    TCGv_ptr index = tcg_temp_new_ptr();
+    TCGv_ptr mask = tcg_temp_new_ptr();
+    TCGv_ptr table = tcg_temp_new_ptr();
+    TCGv_ptr tlb_entry = tcg_temp_new_ptr();
+    TCGv_ptr addend = tcg_temp_new_ptr();
+
+    intptr_t fast_ofs = TLB_MASK_TABLE_OFS(mem_index);
+    intptr_t mask_ofs = fast_ofs + offsetof(CPUTLBDescFast, mask);
+    intptr_t table_ofs = fast_ofs + offsetof(CPUTLBDescFast, table);
+    intptr_t addr_ofs = is_load ? offsetof(CPUTLBEntry, addr_read)
+                                : offsetof(CPUTLBEntry, addr_write);
+    intptr_t addend_ofs = offsetof(CPUTLBEntry, addend);
+
+    /* Emphasize that only 64-bit backend is supported, though
+     * the generic type TCGv_ptr is used for native pointers.  */
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    /* Reassociate address into proper `base + offset` form explicitly
+     * to alleviate the burden of optimization. Note that offset needed
+     * here is relative to some previous guest access, and is not the
+     * straight-forward constant offset relative to some non-constant
+     * temporary.  */
+    tcg_gen_reassociate_address(base, offset, addr);
+
+    /* Calculate page number and scale by factor of `sizeof(CPUTLBEntry)`.  */
+    tcg_gen_shri_ptr(_index, base, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+
+    /* Load mask and TLB base address.  */
+    _tcg_gen_ld_ptr(mask, cpu_env, mask_ofs);
+    _tcg_gen_ld_ptr(table, cpu_env, table_ofs);
+
+    /* Mask page number to get TLB index, and eventually, the TLB entry.  */
+    tcg_gen_and_ptr(index, _index, mask);
+    tcg_gen_add_ptr(tlb_entry, table, index);
+
+    /* Load the TLB tags, and check to see if:
+     * 1. this address is cached in TLB
+     * 2. this is an aligned, within-page, ordinary RAM access
+     * Not satisfying the first condition causes a MMU walk and bails out only
+     * if memory exception is encountered, otherwise, execution returns with
+     * TLB entry REFILLED and tag IMPLICITLY UPDATED to its new value.
+     * Execution never returns on violation of the second condition.  */
+    _tcg_gen_ld_tl(tag, tlb_entry, addr_ofs);
+    tcg_gen_extract_tag(tag2, addr, memop);
+    _tcg_gen_tlb_check(tag, tag2, addr, _make_memop_idx(memop, mem_index,
+                                                        is_load));
+
+    /* Load host address addend from TLB entry.  */
+    _tcg_gen_ld_ptr(addend, tlb_entry, addend_ofs);
+
+    /* Calculate host address corresponds to the guest access. Note that
+     * the intended calculation ` _addr = (TCGv_i64) addr + addend` is
+     * pre-reassociated into the following form to alleviate optimization
+     * burden.  */
+    tcg_gen_add_ptr(_addr, base, addend);
+    tcg_gen_add_ptr(_addr, _addr, offset);
+
+    tcg_temp_free(tag);
+    tcg_temp_free(tag2);
+    tcg_temp_free_ptr(base);
+    tcg_temp_free_ptr(offset);
+    tcg_temp_free_ptr(_index);
+    tcg_temp_free_ptr(index);
+    tcg_temp_free_ptr(mask);
+    tcg_temp_free_ptr(table);
+    tcg_temp_free_ptr(tlb_entry);
+    tcg_temp_free_ptr(addend);
+}
+
+typedef void (*gen_direct_ldst_i32)(TCGv_i32, TCGv_ptr, tcg_target_long);
+typedef void (*gen_direct_ldst_i64)(TCGv_i64, TCGv_ptr, tcg_target_long);
+
+static void * const direct_ld_ops_i32[8] = {
+    [MO_UB] = tcg_gen_ld8u_i32,
+    [MO_SB] = tcg_gen_ld8s_i32,
+    [MO_UW] = tcg_gen_ld16u_i32,
+    [MO_SW] = tcg_gen_ld16s_i32,
+    [MO_UL] = tcg_gen_ld_i32,
+};
+
+static void * const direct_st_ops_i32[4] = {
+    [MO_UB] = tcg_gen_st8_i32,
+    [MO_UW] = tcg_gen_st16_i32,
+    [MO_UL] = tcg_gen_st_i32,
+};
+
+static void * const direct_ld_ops_i64[8] = {
+    [MO_UB] = tcg_gen_ld8u_i64,
+    [MO_SB] = tcg_gen_ld8s_i64,
+    [MO_UW] = tcg_gen_ld16u_i64,
+    [MO_SW] = tcg_gen_ld16s_i64,
+    [MO_UL] = tcg_gen_ld32u_i64,
+    [MO_SL] = tcg_gen_ld32s_i64,
+    [MO_Q]  = tcg_gen_ld_i64,
+};
+
+static void * const direct_st_ops_i64[4] = {
+    [MO_UB] = tcg_gen_st8_i64,
+    [MO_UW] = tcg_gen_st16_i64,
+    [MO_UL] = tcg_gen_st32_i64,
+    [MO_Q]  = tcg_gen_st_i64,
+};
+
+static void _gen_ldst_i32(TCGv_i32 val, TCGv addr, MemOp memop, TCGArg idx,
+                          bool is_load)
+{
+    TCGv_ptr _addr = tcg_temp_new_ptr();
+    gen_direct_ldst_i32 gen = is_load ? direct_ld_ops_i32[memop & MO_SSIZE]
+                                      : direct_st_ops_i32[memop & MO_SIZE];
+
+    /* MO_BSWAP should have been taken care of.  */
+    tcg_debug_assert(!(memop & MO_BSWAP));
+
+    tcg_gen_translate_address(_addr, addr, memop, idx, is_load);
+    gen(val, _addr, 0);
+    tcg_temp_free_ptr(_addr);
+}
+
+static void _gen_ldst_i64(TCGv_i64 val, TCGv addr, MemOp memop, TCGArg idx,
+                          bool is_load)
+{
+    TCGv_ptr _addr = tcg_temp_new_ptr();
+    gen_direct_ldst_i64 gen = is_load ? direct_ld_ops_i64[memop & MO_SSIZE]
+                                      : direct_st_ops_i64[memop & MO_SIZE];
+
+    /* MO_BSWAP should have been taken care of.  */
+    tcg_debug_assert(!(memop & MO_BSWAP));
+
+    tcg_gen_translate_address(_addr, addr, memop, idx, is_load);
+    gen(val, _addr, 0);
+    tcg_temp_free_ptr(_addr);
+}
+
+static inline bool no_monolithic_qemu_ld_st(void)
+{
+    return likely((tcg_ctx->tb_cflags & CF_MONOLITHIC) == 0);
 }
 
 void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
@@ -2898,7 +3040,8 @@ void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
     orig_memop = memop;
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        (!TCG_TARGET_HAS_MEMORY_BSWAP || no_monolithic_qemu_ld_st())) {
         memop &= ~MO_BSWAP;
         /* The bswap primitive requires zero-extended input.  */
         if ((memop & MO_SSIZE) == MO_SW) {
@@ -2907,7 +3050,11 @@ void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
-    gen_ldst_i32(INDEX_op_qemu_ld_i32, val, addr, memop, idx);
+    if (no_monolithic_qemu_ld_st()) {
+        _gen_ldst_i32(val, addr, memop, idx, true);
+    } else {
+        gen_ldst_i32(INDEX_op_qemu_ld_i32, val, addr, memop, idx);
+    }
     plugin_gen_mem_callbacks(addr, info);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
@@ -2936,7 +3083,8 @@ void tcg_gen_qemu_st_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     memop = tcg_canonicalize_memop(memop, 0, 1);
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        (!TCG_TARGET_HAS_MEMORY_BSWAP || no_monolithic_qemu_ld_st())) {
         swap = tcg_temp_new_i32();
         switch (memop & MO_SIZE) {
         case MO_16:
@@ -2954,7 +3102,11 @@ void tcg_gen_qemu_st_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
-    gen_ldst_i32(INDEX_op_qemu_st_i32, val, addr, memop, idx);
+    if (no_monolithic_qemu_ld_st()) {
+        _gen_ldst_i32(val, addr, memop, idx, false);
+    } else {
+        gen_ldst_i32(INDEX_op_qemu_st_i32, val, addr, memop, idx);
+    }
     plugin_gen_mem_callbacks(addr, info);
 
     if (swap) {
@@ -2966,6 +3118,8 @@ void tcg_gen_qemu_ld_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
 {
     MemOp orig_memop;
     uint16_t info;
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
 
     if (TCG_TARGET_REG_BITS == 32 && (memop & MO_SIZE) < MO_64) {
         tcg_gen_qemu_ld_i32(TCGV_LOW(val), addr, idx, memop);
@@ -2983,7 +3137,8 @@ void tcg_gen_qemu_ld_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
     orig_memop = memop;
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        (!TCG_TARGET_HAS_MEMORY_BSWAP || no_monolithic_qemu_ld_st())) {
         memop &= ~MO_BSWAP;
         /* The bswap primitive requires zero-extended input.  */
         if ((memop & MO_SIGN) && (memop & MO_SIZE) < MO_64) {
@@ -2992,7 +3147,11 @@ void tcg_gen_qemu_ld_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
-    gen_ldst_i64(INDEX_op_qemu_ld_i64, val, addr, memop, idx);
+    if (no_monolithic_qemu_ld_st()) {
+        _gen_ldst_i64(val, addr, memop, idx, true);
+    } else {
+        gen_ldst_i64(INDEX_op_qemu_ld_i64, val, addr, memop, idx);
+    }
     plugin_gen_mem_callbacks(addr, info);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
@@ -3023,6 +3182,8 @@ void tcg_gen_qemu_st_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     TCGv_i64 swap = NULL;
     uint16_t info;
 
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
     if (TCG_TARGET_REG_BITS == 32 && (memop & MO_SIZE) < MO_64) {
         tcg_gen_qemu_st_i32(TCGV_LOW(val), addr, idx, memop);
         return;
@@ -3033,7 +3194,8 @@ void tcg_gen_qemu_st_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     info = trace_mem_get_info(memop, idx, 1);
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        (!TCG_TARGET_HAS_MEMORY_BSWAP || no_monolithic_qemu_ld_st())) {
         swap = tcg_temp_new_i64();
         switch (memop & MO_SIZE) {
         case MO_16:
@@ -3055,7 +3217,11 @@ void tcg_gen_qemu_st_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
-    gen_ldst_i64(INDEX_op_qemu_st_i64, val, addr, memop, idx);
+    if (no_monolithic_qemu_ld_st()) {
+        _gen_ldst_i64(val, addr, memop, idx, false);
+    } else {
+        gen_ldst_i64(INDEX_op_qemu_st_i64, val, addr, memop, idx);
+    }
     plugin_gen_mem_callbacks(addr, info);
 
     if (swap) {
