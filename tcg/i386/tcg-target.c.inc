@@ -1968,6 +1968,36 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_jmp(s, qemu_st_helpers[opc & (MO_BSWAP | MO_SIZE)]);
     return true;
 }
+
+static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    TCGLabelTlbCheck *l = spl->tlbck;
+    TCGMemOpIdx oi = l->_oi & ~(MO_STORE << 4);
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    /* resolve label address */
+    tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
+
+    /* Signature of the helper to be called:
+     *
+     * target_ulong
+     * helper_tlb_check_{ld, st}(CPUArchState *env, target_ulong addr,
+     *                           TCGMemOpIdx oi, uintptr_t retaddr);  */
+    tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+    /* So as to avoid clobbering RDI when l->addr uses it.  */
+    tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
+    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], oi);
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[3],
+                 (uintptr_t) spl->raddr);
+
+    tcg_out_call(s, (tcg_insn_unit *) (oi == l->_oi ? helper_tlb_check_ld
+                                                    : helper_tlb_check_st));
+
+    tcg_out_mov(s, TCG_TYPE_TL, l->tag, TCG_REG_RAX);
+    tcg_out_jmp(s, spl->raddr);
+    return true;
+}
 #elif TCG_TARGET_REG_BITS == 32
 # define x86_guest_base_seg     0
 # define x86_guest_base_index   -1
@@ -2261,6 +2291,28 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is64)
     tcg_out_qemu_st_direct(s, datalo, datahi, addrlo, x86_guest_base_index,
                            x86_guest_base_offset, x86_guest_base_seg, opc);
 #endif
+}
+
+static void add_tlb_check_label(TCGContext *s, TCGMemOpIdx _oi, TCGReg tag,
+                                TCGReg addr, tcg_insn_unit *raddr,
+                                tcg_insn_unit *label_ptr)
+{
+    TCGLabelTlbCheck *label = new_tlbck_label(s, raddr, label_ptr);
+
+    label->_oi = _oi;
+    label->tag = tag;
+    label->addr = addr;
+}
+
+static void tcg_out_tlb_check(TCGContext *s, TCGArg tag, TCGArg tag2,
+                              bool const_tag2, int rexw, TCGArg addr,
+                              TCGMemOpIdx _oi)
+{
+    tcg_out_cmp(s, tag, tag2, const_tag2, rexw);
+    tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
+    s->code_ptr += 4;
+
+    add_tlb_check_label(s, _oi, tag, addr, s->code_ptr, s->code_ptr - 4);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
@@ -2628,6 +2680,11 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_extrh_i64_i32:
         tcg_out_shifti(s, SHIFT_SHR + P_REXW, a0, 32);
+        break;
+
+    case INDEX_op_tlb_check:
+        rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+        tcg_out_tlb_check(s, a0, a1, const_args[1], rexw, a2, args[3]);
         break;
 #endif
 
@@ -3089,6 +3146,13 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_brcond_i32:
     case INDEX_op_brcond_i64:
         return &r_re;
+    case INDEX_op_tlb_check:
+        {
+            static const TCGTargetOpDef tlb_check
+                = { .args_ct_str = { "r", "re", "r" } };
+            return &tlb_check;
+        }
+        break;
 
     case INDEX_op_bswap16_i32:
     case INDEX_op_bswap16_i64:

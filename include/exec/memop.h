@@ -61,6 +61,7 @@ typedef enum MemOp {
      */
     MO_ASHIFT = 4,
     MO_AMASK = 7 << MO_ASHIFT,
+    MO_STORE = 8 << MO_ASHIFT,
 #ifdef NEED_CPU_H
 #ifdef TARGET_ALIGNED_ONLY
     MO_ALIGN = 0,

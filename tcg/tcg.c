@@ -1524,6 +1524,7 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_qemu_st_i32:
     case INDEX_op_qemu_ld_i64:
     case INDEX_op_qemu_st_i64:
+    case INDEX_op_tlb_check:
         return true;
 
     case INDEX_op_goto_ptr:
@@ -2986,9 +2987,9 @@ static void liveness_pass_1(TCGContext *s)
                 la_bb_end(s, nb_globals, nb_temps);
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 la_global_sync(s, nb_globals);
-                if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                    la_cross_call(s, nb_temps);
-                }
+            }
+            if (def->flags & TCG_OPF_CALL_CLOBBER) {
+                la_cross_call(s, nb_temps);
             }
 
             /* Record arguments that die in this opcode.  */
@@ -3981,6 +3982,11 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             /* XXX: permit generic clobber register list ? */ 
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
                 if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+                    if (i == new_args[0] && op->opc == INDEX_op_tlb_check) {
+                        /* Slow path of tlb_check does not clobber its first
+                         * argument.  */
+                        continue;
+                    }
                     tcg_reg_free(s, i, i_allocated_regs);
                 }
             }

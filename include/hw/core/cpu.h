@@ -862,6 +862,7 @@ void cpu_interrupt(CPUState *cpu, int mask);
 #ifdef NEED_CPU_H
 
 #ifdef CONFIG_SOFTMMU
+QEMU_NORETURN
 static inline void cpu_unaligned_access(CPUState *cpu, vaddr addr,
                                         MMUAccessType access_type,
                                         int mmu_idx, uintptr_t retaddr)
@@ -869,6 +870,8 @@ static inline void cpu_unaligned_access(CPUState *cpu, vaddr addr,
     CPUClass *cc = CPU_GET_CLASS(cpu);
 
     cc->do_unaligned_access(cpu, addr, access_type, mmu_idx, retaddr);
+    /* .do_unaligned_access() never return for existing front-ends.  */
+    g_assert_not_reached();
 }
 
 static inline void cpu_transaction_failed(CPUState *cpu, hwaddr physaddr,

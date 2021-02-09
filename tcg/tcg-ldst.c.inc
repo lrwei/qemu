@@ -30,8 +30,15 @@ typedef struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
 } TCGLabelQemuLdst;
 
+typedef struct TCGLabelTlbCheck {
+    TCGMemOpIdx _oi;
+    TCGReg tag;
+    TCGReg addr;
+} TCGLabelTlbCheck;
+
 typedef enum TCGLabelSlowPathType {
     QemuLdst,
+    TlbCheck,
 } TCGLabelSlowPathType;
 
 typedef struct TCGLabelSlowPath {
@@ -41,6 +48,7 @@ typedef struct TCGLabelSlowPath {
     tcg_insn_unit *label_ptr;
     union {
         TCGLabelQemuLdst *ldst;
+        TCGLabelTlbCheck *tlbck;
     };
     QSIMPLEQ_ENTRY(TCGLabelSlowPath) next;
 } TCGLabelSlowPath;
@@ -52,6 +60,7 @@ typedef struct TCGLabelSlowPath {
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
+static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
 static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
@@ -60,6 +69,8 @@ static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
         return spl->ldst->is_ld
                ? tcg_out_qemu_ld_slow_path(s, spl)
                : tcg_out_qemu_st_slow_path(s, spl);
+    case TlbCheck:
+        return tcg_out_tlb_check_slow_path(s, spl);
     default:
         g_assert_not_reached();
     }
@@ -96,6 +107,7 @@ static inline TCGLabelSlowPath *new_slow_path_label(TCGContext *s,
 {
     TCGLabelSlowPath *spl = tcg_malloc(sizeof(*spl));
 
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
     spl->raddr = raddr;
     spl->label_ptr = label_ptr;
     QSIMPLEQ_INSERT_TAIL(&s->slow_path_labels, spl, next);
@@ -103,17 +115,23 @@ static inline TCGLabelSlowPath *new_slow_path_label(TCGContext *s,
 }
 
 /*
- * Allocate a new TCGLabelQemuLdst entry.
+ * Allocate a new, non-abstact TCGLabelSlowPath entry.
  */
 
-static inline TCGLabelQemuLdst *new_ldst_label(TCGContext *s,
-                                               tcg_insn_unit *raddr,
-                                               tcg_insn_unit *label_ptr)
-{
-    TCGLabelSlowPath *spl = new_slow_path_label(s, raddr, label_ptr);
-    TCGLabelQemuLdst *l = tcg_malloc(sizeof(*l));
-
-    spl->type = QemuLdst;
-    spl->ldst = l;
-    return l;
+#define DEFINE_NEW_LABEL_FUNC(subtype, field)                                  \
+static inline TCGLabel##subtype *new_##field##_label(TCGContext *s,            \
+                                                     tcg_insn_unit *raddr,     \
+                                                     tcg_insn_unit *label_ptr) \
+{                                                                              \
+    TCGLabelSlowPath *spl = new_slow_path_label(s, raddr, label_ptr);          \
+    TCGLabel##subtype *l = tcg_malloc(sizeof(*l));                             \
+                                                                               \
+    spl->type = subtype;                                                       \
+    spl->field = l;                                                            \
+    return l;                                                                  \
 }
+
+DEFINE_NEW_LABEL_FUNC(QemuLdst, ldst)
+DEFINE_NEW_LABEL_FUNC(TlbCheck, tlbck)
+
+#undef DEFINE_NEW_LABEL_FUNC

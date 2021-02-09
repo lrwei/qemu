@@ -2269,6 +2269,29 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     cpu_loop_exit_noexc(cpu);
 }
 
+void cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr)
+{
+    TranslationBlock *tb;
+
+    tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+
+    /* On MIPS and SH, delay slot instructions can only be restarted if
+     * they were already the first instruction in the TB.  */
+#if defined(TARGET_MIPS) || defined(TARGET_SH4)
+    g_assert_not_reached();
+#endif
+
+    /* Generate a new TB capable of doing full qemu_{ld, st}.  */
+    cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
+
+    qemu_log_mask_and_addr(CPU_LOG_EXEC, tb->pc,
+                           "cpu_speculation_recompile: rewound execution of TB "
+                           "to " TARGET_FMT_lx "\n", tb->pc);
+
+    cpu_loop_exit_noexc(cpu);
+}
+
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)
 {
     unsigned int i, i0 = tb_jmp_cache_hash_page(page_addr);

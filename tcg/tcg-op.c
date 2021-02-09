@@ -2847,6 +2847,47 @@ static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv add
 #endif
 }
 
+__attribute__((unused))
+static inline void _tcg_gen_tlb_check(TCGv tag, TCGv tag2, TCGv addr,
+                                      TCGMemOpIdx _oi)
+{
+#if TARGET_LONG_BITS == 32
+    tcg_gen_op4i_i32(INDEX_op_tlb_check, tag, tag2, addr, _oi);
+#else
+    tcg_gen_op4i_i64(INDEX_op_tlb_check, tag, tag2, addr, _oi);
+#endif
+}
+
+__attribute__((unused))
+static void tcg_gen_extract_tag(TCGv tag, TCGv addr, MemOp memop)
+{
+    uint32_t a_bits = get_alignment_bits(memop);
+    uint32_t s_bits = memop & MO_SIZE;
+    uint32_t a_mask = (1 << a_bits) - 1;
+    uint32_t s_mask = (1 << s_bits) - 1;
+    target_ulong tlb_mask = (target_ulong) TARGET_PAGE_MASK | a_mask;
+
+    /* Alignment check implies the cross-page check for accesses with
+     * natural (or more strict) alignment. Otherwise, we calculate the
+     * address of the last byte of the access WITH THE ASSUMPTION THAT
+     * THE ADDRESS ITSELF IS ALIGNED, so that further comparison fails
+     * if either of the requirement is not meet.  */
+    if (a_bits >= s_bits) {
+        tcg_gen_mov_tl(tag, addr);
+    } else {
+        tcg_gen_addi_tl(tag, addr, s_mask - a_mask);
+    }
+    tcg_gen_andi_tl(tag, tag, tlb_mask);
+}
+
+__attribute__((unused))
+static inline TCGMemOpIdx _make_memop_idx(MemOp memop, uint32_t idx,
+                                          bool is_load)
+{
+    memop |= is_load ? 0 : MO_STORE;
+    return make_memop_idx(memop, idx);
+}
+
 void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
 {
     MemOp orig_memop;
