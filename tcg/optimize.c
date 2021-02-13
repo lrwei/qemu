@@ -42,6 +42,15 @@
        his program simply refuse to compile.
 #endif
 
+#if TARGET_LONG_BITS == 32
+static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i32;
+static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i32;
+static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i32;
+#else
+static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i64;
+static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i64;
+static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i64;
+#endif
 
 /* Illustration on data structures used in local value numbering algorithm:
  *
@@ -66,6 +75,7 @@ typedef struct TempOptInfo {
     uint64_t mask;
     TCGValue *value;
     bool reassociated;
+    int64_t offset;
 } TempOptInfo;
 
 typedef struct ValueNumberingEntry {
@@ -215,6 +225,13 @@ static void init_arg_info(TCGArg arg, TCGOp *def_op)
     return init_ts_info(arg_temp(arg), def_op);
 }
 
+static inline TCGArg tcg_opt_constant_new(TCGType type, int64_t value)
+{
+    TCGTemp *ts = tcg_constant_internal(type, value);
+    init_ts_info(ts, NULL);
+    return temp_arg(ts);
+}
+
 static bool tcg_opt_gen_mov__unchecked(TCGOp *op, TCGArg dst, TCGArg src)
 {
     TCGTemp *dst_ts = arg_temp(dst);
@@ -274,7 +291,6 @@ static void tcg_opt_gen_movi(TCGOp *op, TCGArg dst, uint64_t value)
 {
     const TCGOpDef *def = &tcg_op_defs[op->opc];
     TCGType type;
-    TCGTemp *ts;
 
     if (def->flags & TCG_OPF_VECTOR) {
         type = TCGOP_VECL(op) + TCG_TYPE_V64;
@@ -285,9 +301,7 @@ static void tcg_opt_gen_movi(TCGOp *op, TCGArg dst, uint64_t value)
     }
 
     /* Convert movi to mov with constant temp.  */
-    ts = tcg_constant_internal(type, value);
-    init_ts_info(ts, NULL);
-    tcg_opt_gen_mov(op, dst, temp_arg(ts));
+    tcg_opt_gen_mov(op, dst, tcg_opt_constant_new(type, value));
 }
 
 static TCGOp *tcg_opt_reluctantly_dup_op_with_caution(TCGOp *op)
@@ -378,10 +392,8 @@ static bool value_has_constant_offset(TCGValue *value, uint64_t *offset,
                                       bool check)
 {
     TCGTemp *ts;
-    TCGOpcode add_tl = TARGET_LONG_BITS == 32 ? INDEX_op_add_i32
-                                              : INDEX_op_add_i64;
 
-    if (check && (!value || value->opc != add_tl)) {
+    if (check && (!value || value->opc != INDEX_op_add_tl)) {
         return false;
     }
 
@@ -400,7 +412,6 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
 {
     TCGValue *value = arg_info(op->args[1])->value;
     uint64_t offset, offset2;
-    TCGTemp *ts;
 
     switch (op->opc) {
     CASE_OP_32_64(add):
@@ -429,7 +440,6 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
             }
             if (value->opc == INDEX_op_add_i32
                 && unlikely(offset != (int32_t) offset)) {
-                g_print("tcg_opt_aggregate_offset: overflow detected...\n");
                 offset = (int32_t) offset;
             }
             break;
@@ -443,60 +453,104 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
         }
     }
 
-    ts = tcg_constant_internal(arg_temp(op->args[1])->type, offset);
-    init_ts_info(ts, NULL);
-    op->args[2] = temp_arg(ts);
+    op->args[2] = tcg_opt_constant_new(arg_temp(op->args[1])->type, offset);
 }
 
 #define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 2))
-static void tcg_opt_reassociate_address(TCGOp *op)
+static void tcg_opt_reassociate_address_finalize(TCGOp *op)
 {
-    TCGTemp *addr = arg_temp(op->args[2]), *_base, *_offset;
-    TCGValue *value = ts_info(addr)->value;
+    TCGTemp *addr = arg_temp(op->args[2]);
+    TempOptInfo *info = ts_info(addr);
+    TCGArg _base, _offset;
     ValueNumberingEntry *vne;
     uint64_t offset, offset2;
     TCGOp *op2, *op3;
-    TCGOpcode mov_tl = TARGET_LONG_BITS == 32 ? INDEX_op_mov_i32
-                                              : INDEX_op_mov_i64;
 
     if (ts_is_const(addr)) {
         /* Constant address ignored for the time being.  */
         goto not_found;
-    } else if (!value_has_constant_offset(value, &offset, true)) {
+    } else if (!value_has_constant_offset(info->value, &offset, true)) {
         /* Non-constant offset ignored for the time being.  */
         vne = num2vne(ts_number(addr));
         offset = 0;
     } else {
-        vne = num2vne(value->numbers[0]);
+        vne = num2vne(info->value->numbers[0]);
     }
 
     if (vne->the_address != 0) {
-        _base = num2var(vne->the_address);
-        if (value_has_constant_offset(ts_info(_base)->value, &offset2, true)) {
+        _base = temp_arg(num2var(vne->the_address));
+        if (value_has_constant_offset(arg_info(_base)->value, &offset2, true)) {
             offset -= offset2;
         }
         if (unlikely(llabs(offset) > SPECULATION_THRESHOLD)) {
             goto not_found;
         }
-        ts_info(addr)->reassociated = true;
+        info->reassociated = true;
+        info->offset = offset;
     } else {
         vne->the_address = ts_number(addr);
     not_found:
-        _base = addr;
+        _base = temp_arg(addr);
         offset = 0;
-        ts_info(addr)->reassociated = false;
+        info->reassociated = false;
     }
-
-    tcg_debug_assert(addr->type == TCG_TYPE_TL);
-    _offset = tcg_constant_internal(TCG_TYPE_TL, offset);
-    init_ts_info(_offset, NULL);
+    _offset = tcg_opt_constant_new(TCG_TYPE_TL, offset);
 
     /* ts_set_number() must be called through tcg_opt_gen_mov(), as
      * temporaries `base` and `offset` maybe canonical variables.  */
-    op2 = tcg_op_insert_before(NULL, op, mov_tl);
-    op3 = tcg_op_insert_before(NULL, op, mov_tl);
-    tcg_opt_gen_mov(op3, op->args[1], temp_arg(_offset));
-    tcg_opt_gen_mov(op2, op->args[0], temp_arg(_base));
+    op2 = tcg_op_insert_before(NULL, op, INDEX_op_mov_tl);
+    op3 = tcg_op_insert_before(NULL, op, INDEX_op_mov_tl);
+    tcg_opt_gen_mov(op3, op->args[1], _offset);
+    tcg_opt_gen_mov(op2, op->args[0], _base);
+}
+
+static bool tcg_opt_extract_tag_finalize(TCGOp *op)
+{
+    TempOptInfo *info = arg_info(op->args[1]);
+    MemOp memop = op->args[2];
+    uint32_t a_bits = get_alignment_bits(memop);
+    uint32_t s_bits = memop & MO_SIZE;
+    uint32_t a_mask = (1 << a_bits) - 1;
+    uint32_t s_mask = (1 << s_bits) - 1;
+    bool rewind_needed = false;
+
+    if (a_bits >= s_bits) {
+        /* Alignment check implies the cross-page check for accesses with
+         * natural (or more strict) alignment.  */
+    } else if (!info->reassociated || info->offset >= 0) {
+        TCGOp *op2 = tcg_op_insert_before(NULL, op, INDEX_op_add_tl);
+
+        /* Otherwise, we pad the address to the last byte of the access WITH
+         * THE ASSUMPTION THAT THE ADDRESS ITSELF IS ALIGNED, so that further
+         * comparison fails if EITHER of the requirement is not met.  */
+        op2->args[0] = op->args[0];
+        op2->args[1] = op->args[1];
+        op2->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, s_mask - a_mask);
+
+        rewind_needed = true;
+        op->args[1] = op->args[0];
+    } else {
+        /* Special care must be taken after speculation comes into play,
+         * since a wrong speculation that actually fall on the previous
+         * page (which must have NEGATIVE offset) will pass the guard if
+         * it happens to be a cross-page access.
+         * To address this problem, speculation with negative offset only
+         * checks the aligned-ness requirement, WITH THE ASSUMPTION THE
+         * ADDRESS DOES FALL ON THE SAME PAGE, so that further comparison
+         * fails if EITHER of the requirement is not met.  */
+
+        /* If the negative offset is not large enough to guarantee the
+         * within-ness, then we instead require the access itself to be
+         * natually aligned, which unfortunately is quite unlikely to
+         * hold.  */
+        if (unlikely(info->offset + s_mask > 0)) {
+            a_mask = s_mask;
+        }
+    }
+
+    op->opc = INDEX_op_and_tl;
+    op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK | a_mask);
+    return rewind_needed;
 }
 
 static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
@@ -1001,8 +1055,16 @@ void tcg_optimize(TCGContext *s)
 
         switch (opc) {
         case INDEX_op_reassociate_address:
-            tcg_opt_reassociate_address(op);
+            tcg_opt_reassociate_address_finalize(op);
             continue;
+        case INDEX_op_extract_tag:
+            if (tcg_opt_extract_tag_finalize(op)) {
+                /* Rewind to process the newly inserted op.  */
+                op_next = QTAILQ_PREV(op, link);
+                continue;
+            }
+            opc = op->opc;
+            break;
         case INDEX_op_tlb_check:
             if (arg_info(op->args[2])->reassociated) {
                 op->opc = TARGET_LONG_BITS == 32 ? INDEX_op_guard_i32

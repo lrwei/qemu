@@ -30,6 +30,7 @@
 DEF(discard, 1, 0, 0, TCG_OPF_NOT_PRESENT)
 DEF(set_label, 0, 0, 1, TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(reassociate_address, 2, 1, 0, TCG_OPF_SIDE_EFFECTS | TCG_OPF_NOT_PRESENT)
+DEF(extract_tag, 1, 1, 1, TCG_OPF_NOT_PRESENT)
 
 /* variable number of parameters */
 DEF(call, 0, 0, 3, TCG_OPF_CALL_CLOBBER | TCG_OPF_NOT_PRESENT)
