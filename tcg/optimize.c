@@ -553,6 +553,22 @@ static bool tcg_opt_extract_tag_finalize(TCGOp *op)
     return rewind_needed;
 }
 
+static void tcg_opt_encode_offset(TCGOp *op)
+{
+    TCGValue *value = arg_info(op->args[1])->value;
+    uint64_t offset;
+
+    if (unlikely(op->args[2] != 0)) {
+        return;
+    }
+
+    if (value_has_constant_offset(value, &offset, true)
+        && offset == (int32_t) offset) {
+        op->args[1] = temp_arg(num2var(value->numbers[0]));
+        op->args[2] = offset;
+    }
+}
+
 static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
                                                         const TCGOp *op)
 {
@@ -1071,6 +1087,19 @@ void tcg_optimize(TCGContext *s)
                                                  : INDEX_op_guard_i64;
             }
             continue;
+        CASE_OP_32_64(ld8u):
+        CASE_OP_32_64(ld8s):
+        CASE_OP_32_64(ld16u):
+        CASE_OP_32_64(ld16s):
+        CASE_OP_32_64(ld):
+        case INDEX_op_ld32u_i64:
+        case INDEX_op_ld32s_i64:
+        CASE_OP_32_64(st8):
+        CASE_OP_32_64(st16):
+        CASE_OP_32_64(st):
+        case INDEX_op_st32_i64:
+            tcg_opt_encode_offset(op);
+            break;
         default:
             break;
         }
