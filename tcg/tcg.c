@@ -2857,8 +2857,6 @@ static void liveness_pass_1(TCGContext *s)
             la_reset_pref(ts);
             break;
         case INDEX_op_reassociate_address:
-            tcg_debug_assert(arg_temp(op->args[0])->state == TS_DEAD);
-            tcg_debug_assert(arg_temp(op->args[1])->state == TS_DEAD);
             la_global_sync(s, nb_globals);
             break;
 

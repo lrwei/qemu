@@ -456,7 +456,7 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     op->args[2] = tcg_opt_constant_new(arg_temp(op->args[1])->type, offset);
 }
 
-#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 2))
+#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 3))
 static void tcg_opt_reassociate_address_finalize(TCGOp *op)
 {
     TCGTemp *addr = arg_temp(op->args[2]);
@@ -502,6 +502,9 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
     op3 = tcg_op_insert_before(NULL, op, INDEX_op_mov_tl);
     tcg_opt_gen_mov(op3, op->args[1], _offset);
     tcg_opt_gen_mov(op2, op->args[0], _base);
+
+    op->args[0] = _base;
+    op->args[1] = _offset;
 }
 
 static bool tcg_opt_extract_tag_finalize(TCGOp *op)

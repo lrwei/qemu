@@ -280,7 +280,7 @@ typedef struct TCGPool {
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
-#define TCG_STATIC_CALL_ARGS_SIZE 128
+#define TCG_STATIC_CALL_ARGS_SIZE (1 * 8)
 
 typedef enum TCGType {
     TCG_TYPE_I32,
