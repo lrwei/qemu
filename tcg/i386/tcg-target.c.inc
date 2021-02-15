@@ -475,6 +475,7 @@ static inline int tcg_target_const_match(tcg_target_long val, TCGType type,
 #define OPC_VPSRLVQ     (0x45 | P_EXT38 | P_DATA16 | P_REXW)
 #define OPC_VZEROUPPER  (0x77 | P_EXT)
 #define OPC_XCHG_ax_r32	(0x90)
+#define OPC_XCHG        (0x87)
 
 #define OPC_GRP3_Ev	(0xf7)
 #define OPC_GRP5	(0xff)
@@ -1660,6 +1661,12 @@ static void tcg_out_nopn(TCGContext *s, int n)
     tcg_out8(s, 0x90);
 }
 
+__attribute__((unused))
+static void tcg_out_xchg(TCGContext *s, TCGArg arg1, TCGArg arg2, int rexw)
+{
+    tcg_out_modrm(s, OPC_XCHG + rexw, arg1, arg2);
+}
+
 #if defined(CONFIG_SOFTMMU)
 #include "../tcg-ldst.c.inc"
 
@@ -2006,6 +2013,20 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     /* resolve label address */
     tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
 
+#ifdef CONFIG_DEBUG_TCG
+    TCGLabelGuard *l = spl->guard;
+    int rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+
+    if (likely(l->a1 != tcg_target_call_iarg_regs[2])) {
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->a0);
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->a1);
+    } else if (l->a0 != tcg_target_call_iarg_regs[3]) {
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->a1);
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->a0);
+    } else {
+        tcg_out_xchg(s, l->a0, l->a1, rexw);
+    }
+#endif
     tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
     tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
                  (uintptr_t) spl->raddr);
@@ -2332,11 +2353,16 @@ static void tcg_out_tlb_check(TCGContext *s, TCGArg tag, TCGArg tag2,
     add_tlb_check_label(s, _oi, tag, addr, s->code_ptr, s->code_ptr - 4);
 }
 
-static void add_guard_label(TCGContext *s, tcg_insn_unit *raddr,
-                            tcg_insn_unit *label_ptr)
+static void add_guard_label(TCGContext *s, TCGReg a0, TCGReg a1,
+                            tcg_insn_unit *raddr, tcg_insn_unit *label_ptr)
 {
-    TCGLabelSlowPath *spl = new_slow_path_label(s, raddr, label_ptr);
-    spl->type = Guard;
+    __attribute__((unused))
+    TCGLabelGuard *label = new_guard_label(s, raddr, label_ptr);
+
+#ifdef CONFIG_DEBUG_TCG
+    label->a0 = a0;
+    label->a1 = a1;
+#endif
 }
 
 static void tcg_out_guard(TCGContext *s, TCGArg tag, TCGArg tag2,
@@ -2346,7 +2372,7 @@ static void tcg_out_guard(TCGContext *s, TCGArg tag, TCGArg tag2,
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    add_guard_label(s, s->code_ptr, s->code_ptr - 4);
+    add_guard_label(s, tag, tag2, s->code_ptr, s->code_ptr - 4);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
@@ -3180,10 +3206,13 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_rotr_i64:
         return &r_0_ci;
 
-    case INDEX_op_brcond_i32:
-    case INDEX_op_brcond_i64:
     case INDEX_op_guard_i32:
     case INDEX_op_guard_i64:
+    #ifdef CONFIG_DEBUG_TCG
+        return &r_r;
+    #endif
+    case INDEX_op_brcond_i32:
+    case INDEX_op_brcond_i64:
         return &r_re;
     case INDEX_op_tlb_check:
         {

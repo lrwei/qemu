@@ -2699,8 +2699,17 @@ target_ulong helper_tlb_check_st(CPUArchState *env, target_ulong addr,
     return tlb_check_helper(env, addr, oi, retaddr, false);
 }
 
+#ifdef CONFIG_DEBUG_TCG
+void helper_guard_failure(CPUArchState *env, uintptr_t retaddr,
+                          target_ulong a0, target_ulong a1)
+{
+    qemu_log_mask(CPU_LOG_MMU, "Guard failure: a0: " TARGET_FMT_lx
+                  " a1: " TARGET_FMT_lx " retaddr: %p\n",
+                  a0, a1, (void *) retaddr);
+#else
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
 {
+#endif
     cpu_speculation_recompile(env_cpu(env), retaddr);
 }
 

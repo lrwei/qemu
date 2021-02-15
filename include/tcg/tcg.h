@@ -1347,7 +1347,12 @@ target_ulong helper_tlb_check_ld(CPUArchState *env, target_ulong addr,
                                  TCGMemOpIdx oi, uintptr_t retaddr);
 target_ulong helper_tlb_check_st(CPUArchState *env, target_ulong addr,
                                  TCGMemOpIdx oi, uintptr_t retaddr);
+#ifdef CONFIG_DEBUG_TCG
+void helper_guard_failure(CPUArchState *env, uintptr_t retaddr,
+                          target_ulong a0, target_ulong a1);
+#else
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr);
+#endif
 
 /* Temporary aliases until backends are converted.  */
 #ifdef TARGET_WORDS_BIGENDIAN

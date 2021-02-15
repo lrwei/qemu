@@ -36,6 +36,13 @@ typedef struct TCGLabelTlbCheck {
     TCGReg addr;
 } TCGLabelTlbCheck;
 
+typedef struct TCGLabelGuard {
+#ifdef CONFIG_DEBUG_TCG
+    TCGReg a0;
+    TCGReg a1;
+#endif
+} TCGLabelGuard;
+
 typedef enum TCGLabelSlowPathType {
     QemuLdst,
     TlbCheck,
@@ -50,6 +57,7 @@ typedef struct TCGLabelSlowPath {
     union {
         TCGLabelQemuLdst *ldst;
         TCGLabelTlbCheck *tlbck;
+        TCGLabelGuard *guard;
     };
     QSIMPLEQ_ENTRY(TCGLabelSlowPath) next;
 } TCGLabelSlowPath;
@@ -137,5 +145,6 @@ static inline TCGLabel##subtype *new_##field##_label(TCGContext *s,            \
 
 DEFINE_NEW_LABEL_FUNC(QemuLdst, ldst)
 DEFINE_NEW_LABEL_FUNC(TlbCheck, tlbck)
+DEFINE_NEW_LABEL_FUNC(Guard, guard)
 
 #undef DEFINE_NEW_LABEL_FUNC
