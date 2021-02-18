@@ -3701,6 +3701,16 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
        the SOURCE value into its own register first, that way we
        don't have to reload SOURCE the next time it is used. */
     if (ts->val_type == TEMP_VAL_MEM) {
+        if (IS_DEAD_ARG(1) && ts->kind == TEMP_NORMAL
+            && ots->kind == TEMP_NORMAL) {
+            tcg_debug_assert(!IS_DEAD_ARG(0));
+            ots->mem_base = ts->mem_base;
+            ots->mem_offset = ts->mem_offset;
+            ots->mem_allocated = 1, ts->mem_allocated = 0;
+            temp_free_or_dead(s, ots, -1);
+            temp_dead(s, ts);
+            return;
+        }
         temp_load(s, ts, tcg_target_available_regs[itype],
                   allocated_regs, preferred_regs);
     }
