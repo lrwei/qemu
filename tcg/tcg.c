@@ -199,6 +199,7 @@ static void *region_trees;
 static size_t tree_size;
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
+static TCGRegSet tcg_target_tlb_check_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static __attribute__((unused)) inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -2714,9 +2715,10 @@ static void la_global_kill(TCGContext *s, int ng)
 }
 
 /* liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, int nt)
+static void la_cross_call(TCGContext *s, int nt, bool tlb_check)
 {
-    TCGRegSet mask = ~tcg_target_call_clobber_regs;
+    TCGRegSet mask = ~(tlb_check ? tcg_target_tlb_check_clobber_regs
+                                 : tcg_target_call_clobber_regs);
     int i;
 
     for (i = 0; i < nt; i++) {
@@ -2817,7 +2819,7 @@ static void liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, false);
 
                 nb_call_regs = ARRAY_SIZE(tcg_target_call_iarg_regs);
 
@@ -2989,7 +2991,7 @@ static void liveness_pass_1(TCGContext *s)
                 la_global_sync(s, nb_globals);
             }
             if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, opc == INDEX_op_tlb_check);
             }
 
             /* Record arguments that die in this opcode.  */
@@ -3987,16 +3989,26 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_cbranch(s, i_allocated_regs);
     } else if (def->flags & TCG_OPF_BB_END) {
         tcg_reg_alloc_bb_end(s, i_allocated_regs);
+    } else if (op->opc == INDEX_op_tlb_check) {
+        for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+            if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
+                if (i == new_args[0]) {
+                    /* Slow path of tlb_check does not clobber its first
+                     * argument.  */
+                    continue;
+                }
+                tcg_reg_free(s, i, i_allocated_regs);
+            }
+        }
+        /* No output arguments for tlb_check.  */
+        tcg_debug_assert(def->nb_oargs == 0);
+        tcg_out_op(s, op->opc, new_args, const_args);
+        return;
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
             /* XXX: permit generic clobber register list ? */ 
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
                 if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
-                    if (i == new_args[0] && op->opc == INDEX_op_tlb_check) {
-                        /* Slow path of tlb_check does not clobber its first
-                         * argument.  */
-                        continue;
-                    }
                     tcg_reg_free(s, i, i_allocated_regs);
                 }
             }

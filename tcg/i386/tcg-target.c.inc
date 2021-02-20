@@ -4072,7 +4072,12 @@ static void tcg_target_init(TCGContext *s)
 #if !defined(_WIN64)
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_RDI);
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_RSI);
+#else
+#error Calling convention of _WIN64 has not been supported.
 #endif
+        /* tlb_check won't clobber r8 - r11.  */
+        tcg_target_tlb_check_clobber_regs = tcg_target_call_clobber_regs;
+
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R8);
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R9);
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R10);

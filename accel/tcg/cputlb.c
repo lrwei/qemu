@@ -2687,16 +2687,52 @@ bailout:
     cpu_speculation_recompile(env_cpu(env), retaddr);
 }
 
+#define RESERVE_REG(reg)                                \
+    register uint64_t _##reg asm (#reg);                \
+    uint64_t reg = _##reg;
+
+#define RESTORE_REG(reg)                                \
+    asm ("movq %0, %%" #reg :: "rm" (reg) : #reg);
+
+
 target_ulong helper_tlb_check_ld(CPUArchState *env, target_ulong addr,
                                  TCGMemOpIdx oi, uintptr_t retaddr)
 {
-    return tlb_check_helper(env, addr, oi, retaddr, true);
+    target_ulong ret;
+
+    RESERVE_REG(r8)
+    RESERVE_REG(r9)
+    RESERVE_REG(r10)
+    RESERVE_REG(r11)
+
+    ret = tlb_check_helper(env, addr, oi, retaddr, true);
+
+    RESTORE_REG(r11)
+    RESTORE_REG(r10)
+    RESTORE_REG(r9)
+    RESTORE_REG(r8)
+
+    return ret;
 }
 
 target_ulong helper_tlb_check_st(CPUArchState *env, target_ulong addr,
                                  TCGMemOpIdx oi, uintptr_t retaddr)
 {
-    return tlb_check_helper(env, addr, oi, retaddr, false);
+    target_ulong ret;
+
+    RESERVE_REG(r8)
+    RESERVE_REG(r9)
+    RESERVE_REG(r10)
+    RESERVE_REG(r11)
+
+    ret = tlb_check_helper(env, addr, oi, retaddr, false);
+
+    RESTORE_REG(r11)
+    RESTORE_REG(r10)
+    RESTORE_REG(r9)
+    RESTORE_REG(r8)
+
+    return ret;
 }
 
 #ifdef CONFIG_DEBUG_TCG
