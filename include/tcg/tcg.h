@@ -476,13 +476,6 @@ static inline TCGCond tcg_high_cond(TCGCond c)
     }
 }
 
-typedef enum TCGTempVal {
-    TEMP_VAL_DEAD,
-    TEMP_VAL_REG,
-    TEMP_VAL_MEM,
-    TEMP_VAL_CONST,
-} TCGTempVal;
-
 typedef enum TCGTempKind {
     /* Temp is dead at the end of all basic blocks. */
     TEMP_NORMAL,
@@ -498,7 +491,6 @@ typedef enum TCGTempKind {
 
 typedef struct TCGTemp {
     TCGReg reg:8;
-    TCGTempVal val_type:8;
     TCGType base_type:8;
     TCGType type:8;
     TCGTempKind kind:3;
@@ -507,6 +499,8 @@ typedef struct TCGTemp {
     unsigned int mem_coherent:1;
     unsigned int mem_allocated:1;
     unsigned int temp_allocated:1;
+
+    /* 32-bit slot */
 
     int64_t val;
     struct TCGTemp *mem_base;

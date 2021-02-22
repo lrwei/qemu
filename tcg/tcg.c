@@ -1957,38 +1957,6 @@ void tcg_gen_callN(void *func, TCGTemp *ret, int nargs, TCGTemp **args)
 #endif /* TCG_TARGET_EXTEND_ARGS */
 }
 
-static void tcg_reg_alloc_start(TCGContext *s)
-{
-    int i, n;
-
-    for (i = 0, n = s->nb_temps; i < n; i++) {
-        TCGTemp *ts = &s->temps[i];
-        TCGTempVal val = TEMP_VAL_MEM;
-
-        switch (ts->kind) {
-        case TEMP_CONST:
-            val = TEMP_VAL_CONST;
-            break;
-        case TEMP_FIXED:
-            val = TEMP_VAL_REG;
-            break;
-        case TEMP_GLOBAL:
-            break;
-        case TEMP_NORMAL:
-            val = TEMP_VAL_DEAD;
-            /* fall through */
-        case TEMP_LOCAL:
-            ts->mem_allocated = 0;
-            break;
-        default:
-            g_assert_not_reached();
-        }
-        ts->val_type = val;
-    }
-
-    memset(s->reg_to_temp, 0, sizeof(s->reg_to_temp));
-}
-
 static char *tcg_get_arg_str_ptr(TCGContext *s, char *buf, int buf_size,
                                  TCGTemp *ts)
 {
@@ -3219,6 +3187,61 @@ static bool liveness_pass_2(TCGContext *s)
     return changes;
 }
 
+/*
+ * TCG register allocation facilities
+ */
+
+typedef enum TCGTempVal {
+    TEMP_VAL_DEAD,
+    TEMP_VAL_REG,
+    TEMP_VAL_MEM,
+    TEMP_VAL_CONST,
+    TEMP_VAL_INVALID,
+} TCGTempVal;
+
+static inline TCGTempVal ts_val_type(TCGTemp *ts)
+{
+    tcg_debug_assert(ts->state < TEMP_VAL_INVALID);
+    return ts->state;
+}
+
+static inline void ts_set_val_type(TCGTemp *ts, TCGTempVal val_type)
+{
+    ts->state = val_type;
+}
+
+static void tcg_reg_alloc_start(TCGContext *s)
+{
+    int i, n;
+
+    for (i = 0, n = s->nb_temps; i < n; i++) {
+        TCGTemp *ts = &s->temps[i];
+        TCGTempVal val_type = TEMP_VAL_MEM;
+
+        switch (ts->kind) {
+        case TEMP_CONST:
+            val_type = TEMP_VAL_CONST;
+            break;
+        case TEMP_FIXED:
+            val_type = TEMP_VAL_REG;
+            break;
+        case TEMP_GLOBAL:
+            break;
+        case TEMP_NORMAL:
+            val_type = TEMP_VAL_DEAD;
+            /* fall through */
+        case TEMP_LOCAL:
+            ts->mem_allocated = 0;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        ts_set_val_type(ts, val_type);
+    }
+
+    memset(s->reg_to_temp, 0, sizeof(s->reg_to_temp));
+}
+
 #ifdef CONFIG_DEBUG_TCG
 static void dump_regs(TCGContext *s)
 {
@@ -3229,7 +3252,7 @@ static void dump_regs(TCGContext *s)
     for(i = 0; i < s->nb_temps; i++) {
         ts = &s->temps[i];
         printf("  %10s: ", tcg_get_arg_str_ptr(s, buf, sizeof(buf), ts));
-        switch(ts->val_type) {
+        switch(ts_val_type(ts)) {
         case TEMP_VAL_REG:
             printf("%s", tcg_target_reg_names[ts->reg]);
             break;
@@ -3269,7 +3292,7 @@ static void check_regs(TCGContext *s)
     for (reg = 0; reg < TCG_TARGET_NB_REGS; reg++) {
         ts = s->reg_to_temp[reg];
         if (ts != NULL) {
-            if (ts->val_type != TEMP_VAL_REG || ts->reg != reg) {
+            if (ts_val_type(ts) != TEMP_VAL_REG || ts->reg != reg) {
                 printf("Inconsistency for register %s:\n", 
                        tcg_target_reg_names[reg]);
                 goto fail;
@@ -3278,7 +3301,7 @@ static void check_regs(TCGContext *s)
     }
     for (k = 0; k < s->nb_temps; k++) {
         ts = &s->temps[k];
-        if (ts->val_type == TEMP_VAL_REG
+        if (ts_val_type(ts) == TEMP_VAL_REG
             && ts->kind != TEMP_FIXED
             && s->reg_to_temp[ts->reg] != ts) {
             printf("Inconsistency for temp %s:\n",
@@ -3316,28 +3339,28 @@ static void temp_load(TCGContext *, TCGTemp *, TCGRegSet, TCGRegSet, TCGRegSet);
    mark it free; otherwise mark it dead.  */
 static void temp_free_or_dead(TCGContext *s, TCGTemp *ts, int free_or_dead)
 {
-    TCGTempVal new_type;
+    TCGTempVal val_type;
 
     switch (ts->kind) {
     case TEMP_FIXED:
         return;
     case TEMP_GLOBAL:
     case TEMP_LOCAL:
-        new_type = TEMP_VAL_MEM;
+        val_type = TEMP_VAL_MEM;
         break;
     case TEMP_NORMAL:
-        new_type = free_or_dead < 0 ? TEMP_VAL_MEM : TEMP_VAL_DEAD;
+        val_type = free_or_dead < 0 ? TEMP_VAL_MEM : TEMP_VAL_DEAD;
         break;
     case TEMP_CONST:
-        new_type = TEMP_VAL_CONST;
+        val_type = TEMP_VAL_CONST;
         break;
     default:
         g_assert_not_reached();
     }
-    if (ts->val_type == TEMP_VAL_REG) {
+    if (ts_val_type(ts) == TEMP_VAL_REG) {
         s->reg_to_temp[ts->reg] = NULL;
     }
-    ts->val_type = new_type;
+    ts_set_val_type(ts, val_type);
 }
 
 /* Mark a temporary as dead.  */
@@ -3357,7 +3380,7 @@ static void temp_sync(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs,
         if (!ts->mem_allocated) {
             temp_allocate_frame(s, ts);
         }
-        switch (ts->val_type) {
+        switch (ts_val_type(ts)) {
         case TEMP_VAL_CONST:
             /* If we're going to free the temp immediately, then we won't
                require it later in a register, so attempt to store the
@@ -3478,7 +3501,7 @@ static void temp_load(TCGContext *s, TCGTemp *ts, TCGRegSet desired_regs,
 {
     TCGReg reg;
 
-    switch (ts->val_type) {
+    switch (ts_val_type(ts)) {
     case TEMP_VAL_REG:
         return;
     case TEMP_VAL_CONST:
@@ -3518,7 +3541,7 @@ static void temp_load(TCGContext *s, TCGTemp *ts, TCGRegSet desired_regs,
         tcg_abort();
     }
     ts->reg = reg;
-    ts->val_type = TEMP_VAL_REG;
+    ts_set_val_type(ts, TEMP_VAL_REG);
     s->reg_to_temp[reg] = ts;
 }
 
@@ -3528,7 +3551,7 @@ static void temp_save(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs)
 {
     /* The liveness analysis already ensures that globals are back
        in memory. Keep an tcg_debug_assert for safety. */
-    tcg_debug_assert(ts->val_type == TEMP_VAL_MEM || temp_readonly(ts));
+    tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_MEM || temp_readonly(ts));
 }
 
 /* save globals to their canonical location and assume they can be
@@ -3552,7 +3575,7 @@ static void sync_globals(TCGContext *s, TCGRegSet allocated_regs)
 
     for (i = 0, n = s->nb_globals; i < n; i++) {
         TCGTemp *ts = &s->temps[i];
-        tcg_debug_assert(ts->val_type != TEMP_VAL_REG
+        tcg_debug_assert(ts_val_type(ts) != TEMP_VAL_REG
                          || ts->kind == TEMP_FIXED
                          || ts->mem_coherent);
     }
@@ -3574,11 +3597,11 @@ static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
         case TEMP_NORMAL:
             /* The liveness analysis already ensures that temps are dead.
                Keep an tcg_debug_assert for safety. */
-            tcg_debug_assert(ts->val_type == TEMP_VAL_DEAD);
+            tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_DEAD);
             break;
         case TEMP_CONST:
             /* Similarly, we should have freed any allocated register. */
-            tcg_debug_assert(ts->val_type == TEMP_VAL_CONST);
+            tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_CONST);
             break;
         default:
             g_assert_not_reached();
@@ -3604,10 +3627,11 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, TCGRegSet allocated_regs)
          */
         switch (ts->kind) {
         case TEMP_LOCAL:
-            tcg_debug_assert(ts->val_type != TEMP_VAL_REG || ts->mem_coherent);
+            tcg_debug_assert(ts_val_type(ts) != TEMP_VAL_REG ||
+                             ts->mem_coherent);
             break;
         case TEMP_NORMAL:
-            tcg_debug_assert(ts->val_type == TEMP_VAL_DEAD);
+            tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_DEAD);
             break;
         case TEMP_CONST:
             break;
@@ -3628,10 +3652,10 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots,
     tcg_debug_assert(!temp_readonly(ots));
 
     /* The movi is not explicitly generated here.  */
-    if (ots->val_type == TEMP_VAL_REG) {
+    if (ts_val_type(ots) == TEMP_VAL_REG) {
         s->reg_to_temp[ots->reg] = NULL;
     }
-    ots->val_type = TEMP_VAL_CONST;
+    ts_set_val_type(ots, TEMP_VAL_CONST);
     ots->val = val;
     ots->mem_coherent = 0;
     if (NEED_SYNC_ARG(0)) {
@@ -3664,7 +3688,7 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
     otype = ots->type;
     itype = ts->type;
 
-    if (ts->val_type == TEMP_VAL_CONST) {
+    if (ts_val_type(ts) == TEMP_VAL_CONST) {
         /* propagate constant or generate sti */
         tcg_target_ulong val = ts->val;
         if (IS_DEAD_ARG(1)) {
@@ -3678,12 +3702,12 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
        to have it in a register in order to perform the copy.  Copy
        the SOURCE value into its own register first, that way we
        don't have to reload SOURCE the next time it is used. */
-    if (ts->val_type == TEMP_VAL_MEM) {
+    if (ts_val_type(ts) == TEMP_VAL_MEM) {
         temp_load(s, ts, tcg_target_available_regs[itype],
                   allocated_regs, preferred_regs);
     }
 
-    tcg_debug_assert(ts->val_type == TEMP_VAL_REG);
+    tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_REG);
     if (IS_DEAD_ARG(0)) {
         /* mov to a non-saved dead register makes no sense (even with
            liveness analysis disabled). */
@@ -3699,13 +3723,13 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
     } else {
         if (IS_DEAD_ARG(1) && ts->kind != TEMP_FIXED) {
             /* the mov can be suppressed */
-            if (ots->val_type == TEMP_VAL_REG) {
+            if (ts_val_type(ots) == TEMP_VAL_REG) {
                 s->reg_to_temp[ots->reg] = NULL;
             }
             ots->reg = ts->reg;
             temp_dead(s, ts);
         } else {
-            if (ots->val_type != TEMP_VAL_REG) {
+            if (ts_val_type(ots) != TEMP_VAL_REG) {
                 /* When allocating a new register, make sure to not spill the
                    input one. */
                 tcg_regset_set_reg(allocated_regs, ts->reg);
@@ -3730,7 +3754,7 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
                 return;
             }
         }
-        ots->val_type = TEMP_VAL_REG;
+        ts_set_val_type(ots, TEMP_VAL_REG);
         ots->mem_coherent = 0;
         s->reg_to_temp[ots->reg] = ots;
         if (NEED_SYNC_ARG(0)) {
@@ -3763,27 +3787,27 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
     vtype = TCGOP_VECL(op) + TCG_TYPE_V64;
 
     /* tcg_optimize() would have convert this to mov_vec.  */
-    tcg_debug_assert(!(its->val_type == TEMP_VAL_CONST));
+    tcg_debug_assert(!(ts_val_type(its) == TEMP_VAL_CONST));
 
     dup_out_regs = tcg_op_defs[INDEX_op_dup_vec].args_ct[0].regs;
     dup_in_regs = tcg_op_defs[INDEX_op_dup_vec].args_ct[1].regs;
 
     /* Allocate the output register now.  */
-    if (ots->val_type != TEMP_VAL_REG) {
+    if (ts_val_type(ots) != TEMP_VAL_REG) {
         TCGRegSet allocated_regs = s->reserved_regs;
 
-        if (!IS_DEAD_ARG(1) && its->val_type == TEMP_VAL_REG) {
+        if (!IS_DEAD_ARG(1) && ts_val_type(its) == TEMP_VAL_REG) {
             /* Make sure to not spill the input register. */
             tcg_regset_set_reg(allocated_regs, its->reg);
         }
         ots->reg = tcg_reg_alloc(s, dup_out_regs, allocated_regs,
                                  op->output_pref[0], ots->indirect_base);
-        ots->val_type = TEMP_VAL_REG;
+        ts_set_val_type(ots, TEMP_VAL_REG);
         ots->mem_coherent = 0;
         s->reg_to_temp[ots->reg] = ots;
     }
 
-    switch (its->val_type) {
+    switch (ts_val_type(its)) {
     case TEMP_VAL_REG:
         /*
          * The dup constriaints must be broad, covering all possible VECE.
@@ -3878,7 +3902,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         arg_ct = &def->args_ct[i];
         ts = arg_temp(arg);
 
-        if (ts->val_type == TEMP_VAL_CONST
+        if (ts_val_type(ts) == TEMP_VAL_CONST
             && tcg_target_const_match(ts->val, ts->type, arg_ct)) {
             /* constant is OK for instruction */
             const_args[i] = 1;
@@ -3904,7 +3928,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
              * Check if the current register has already been allocated
              * for another input aliased to an output.
              */
-            if (ts->val_type == TEMP_VAL_REG) {
+            if (ts_val_type(ts) == TEMP_VAL_REG) {
                 reg = ts->reg;
                 for (int k2 = 0; k2 < k; k2++) {
                     int i2 = def->args_ct[nb_oargs + k2].sort_index;
@@ -3991,10 +4015,10 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                                     op->output_pref[k], ts->indirect_base);
             }
             tcg_regset_set_reg(o_allocated_regs, reg);
-            if (ts->val_type == TEMP_VAL_REG) {
+            if (ts_val_type(ts) == TEMP_VAL_REG) {
                 s->reg_to_temp[ts->reg] = NULL;
             }
-            ts->val_type = TEMP_VAL_REG;
+            ts_set_val_type(ts, TEMP_VAL_REG);
             ts->reg = reg;
             /*
              * Temp value is modified, so the value kept in memory is
@@ -4047,26 +4071,26 @@ static bool tcg_reg_alloc_dup2(TCGContext *s, const TCGOp *op)
     tcg_debug_assert(!temp_readonly(ots));
 
     /* tcg_optimize() would have convert this to mov_vec.  */
-    tcg_debug_assert(!(itsl->val_type == TEMP_VAL_CONST &&
-                       itsh->val_type == TEMP_VAL_CONST));
+    tcg_debug_assert(!(ts_val_type(itsl) == TEMP_VAL_CONST &&
+                       ts_val_type(itsh) == TEMP_VAL_CONST));
 
     /* Allocate the output register now.  */
-    if (ots->val_type != TEMP_VAL_REG) {
+    if (ts_val_type(ots) != TEMP_VAL_REG) {
         TCGRegSet allocated_regs = s->reserved_regs;
         TCGRegSet dup_out_regs =
             tcg_op_defs[INDEX_op_dup_vec].args_ct[0].regs;
 
         /* Make sure to not spill the input registers. */
-        if (!IS_DEAD_ARG(1) && itsl->val_type == TEMP_VAL_REG) {
+        if (!IS_DEAD_ARG(1) && ts_val_type(itsl) == TEMP_VAL_REG) {
             tcg_regset_set_reg(allocated_regs, itsl->reg);
         }
-        if (!IS_DEAD_ARG(2) && itsh->val_type == TEMP_VAL_REG) {
+        if (!IS_DEAD_ARG(2) && ts_val_type(itsh) == TEMP_VAL_REG) {
             tcg_regset_set_reg(allocated_regs, itsh->reg);
         }
 
         ots->reg = tcg_reg_alloc(s, dup_out_regs, allocated_regs,
                                  op->output_pref[0], ots->indirect_base);
-        ots->val_type = TEMP_VAL_REG;
+        ts_set_val_type(ots, TEMP_VAL_REG);
         ots->mem_coherent = 0;
         s->reg_to_temp[ots->reg] = ots;
     }
@@ -4174,7 +4198,7 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
             ts = arg_temp(arg);
             reg = tcg_target_call_iarg_regs[i];
 
-            if (ts->val_type == TEMP_VAL_REG) {
+            if (ts_val_type(ts) == TEMP_VAL_REG) {
                 if (ts->reg != reg) {
                     tcg_reg_free(s, reg, allocated_regs);
                     if (!tcg_out_mov(s, ts->type, reg, ts->reg)) {
@@ -4235,10 +4259,10 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
 
         reg = tcg_target_call_oarg_regs[i];
         tcg_debug_assert(s->reg_to_temp[reg] == NULL);
-        if (ts->val_type == TEMP_VAL_REG) {
+        if (ts_val_type(ts) == TEMP_VAL_REG) {
             s->reg_to_temp[ts->reg] = NULL;
         }
-        ts->val_type = TEMP_VAL_REG;
+        ts_set_val_type(ts, TEMP_VAL_REG);
         ts->reg = reg;
         ts->mem_coherent = 0;
         s->reg_to_temp[reg] = ts;
