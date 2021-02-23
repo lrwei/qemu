@@ -3368,12 +3368,8 @@ static void temp_sync(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs,
         }
         switch (ts_val_type(ts)) {
         case TEMP_VAL_CONST:
-            /* If we're going to free the temp immediately, then we won't
-               require it later in a register, so attempt to store the
-               constant to memory directly.  */
-            if (free_or_dead
-                && tcg_out_sti(s, ts->type, ts->val,
-                               ts->mem_base->reg, ts->mem_offset)) {
+            if (tcg_out_sti(s, ts->type, ts->val, ts->mem_base->reg,
+                            ts->mem_offset)) {
                 break;
             }
             temp_load(s, ts, tcg_target_available_regs[ts->type],
@@ -3514,7 +3510,6 @@ static void temp_load(TCGContext *s, TCGTemp *ts, TCGRegSet desired_regs,
 
             tcg_out_dupi_vec(s, ts->type, vece, reg, ts->val);
         }
-        ts->mem_coherent = 0;
         break;
     case TEMP_VAL_MEM:
         reg = tcg_reg_alloc(s, desired_regs, allocated_regs,
