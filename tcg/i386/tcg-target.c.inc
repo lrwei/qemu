@@ -40,7 +40,7 @@ static const char * const tcg_target_reg_names[TCG_TARGET_NB_REGS] = {
 };
 #endif
 
-static const int tcg_target_reg_alloc_order[] = {
+static const TCGReg tcg_target_reg_alloc_order[] = {
 #if TCG_TARGET_REG_BITS == 64
     TCG_REG_RBP,
     TCG_REG_RBX,
@@ -90,7 +90,7 @@ static const int tcg_target_reg_alloc_order[] = {
 #endif
 };
 
-static const int tcg_target_call_iarg_regs[] = {
+static const TCGReg tcg_target_call_iarg_regs[] = {
 #if TCG_TARGET_REG_BITS == 64
 #if defined(_WIN64)
     TCG_REG_RCX,
@@ -108,7 +108,7 @@ static const int tcg_target_call_iarg_regs[] = {
 #endif
 };
 
-static const int tcg_target_call_oarg_regs[] = {
+static const TCGReg tcg_target_call_oarg_regs[] = {
     TCG_REG_EAX,
 #if TCG_TARGET_REG_BITS == 32
     TCG_REG_EDX
@@ -270,26 +270,26 @@ static const char *target_parse_constraint(TCGArgConstraint *ct,
 }
 
 /* test if a constant matches the constraint */
-static inline int tcg_target_const_match(tcg_target_long val, TCGType type,
-                                         const TCGArgConstraint *arg_ct)
+static inline bool tcg_target_const_match(tcg_target_long val, TCGType type,
+                                          const TCGArgConstraint *arg_ct)
 {
     int ct = arg_ct->ct;
     if (ct & TCG_CT_CONST) {
-        return 1;
+        return true;
     }
     if ((ct & TCG_CT_CONST_S32) && val == (int32_t)val) {
-        return 1;
+        return true;
     }
     if ((ct & TCG_CT_CONST_U32) && val == (uint32_t)val) {
-        return 1;
+        return true;
     }
     if ((ct & TCG_CT_CONST_I32) && ~val == (int32_t)~val) {
-        return 1;
+        return true;
     }
     if ((ct & TCG_CT_CONST_WSZ) && val == (type == TCG_TYPE_I32 ? 32 : 64)) {
-        return 1;
+        return true;
     }
-    return 0;
+    return false;
 }
 
 # define LOWREGMASK(x)	((x) & 7)
