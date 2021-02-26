@@ -222,6 +222,7 @@ typedef enum TCGOpcode {
 #define tcg_regset_set_reg(d, r)   ((d) |= (TCGRegSet)1 << (r))
 #define tcg_regset_reset_reg(d, r) ((d) &= ~((TCGRegSet)1 << (r)))
 #define tcg_regset_test_reg(d, r)  (((d) >> (r)) & 1)
+#define tcg_regset_from_reg(r)     ((TCGRegSet)1 << (r))
 
 #ifndef TCG_TARGET_INSN_UNIT_SIZE
 # error "Missing TCG_TARGET_INSN_UNIT_SIZE"
