@@ -43,14 +43,13 @@
 #else
 #define MAX_OPC_PARAM_PER_ARG 1
 #endif
-#define MAX_OPC_PARAM_IARGS 6
-#define MAX_OPC_PARAM_OARGS 1
-#define MAX_OPC_PARAM_ARGS (MAX_OPC_PARAM_IARGS + MAX_OPC_PARAM_OARGS)
+/* Limited by the fact that TCGLifeData is 16 bits wide.  */
+#define MAX_OPC_PARAM_ARGS 7
 
-/* A Call op needs up to 4 + 2N parameters on 32-bit archs,
- * and up to 4 + N parameters on 64-bit archs
+/* A Call op needs up to 2 + 2N parameters on 32-bit archs,
+ * and up to 2 + N parameters on 64-bit archs
  * (N = number of input arguments + output arguments).  */
-#define MAX_OPC_PARAM (4 + (MAX_OPC_PARAM_PER_ARG * MAX_OPC_PARAM_ARGS))
+#define MAX_OPC_PARAM (2 + (MAX_OPC_PARAM_PER_ARG * MAX_OPC_PARAM_ARGS))
 
 #define CPU_TEMP_BUF_NLONGS 128
 
@@ -533,8 +532,18 @@ typedef struct TCGTempSet {
    this imples a max of 6*2 (64-bit in) + 2 (64-bit out) = 14 operands.
    There are never more than 2 outputs, which means that we can store all
    dead + sync data within 16 bits.  */
-#define DEAD_ARG  4
-#define SYNC_ARG  1
+
+QEMU_BUILD_BUG_ON(TCG_TARGET_REG_BITS != 64);
+/* Above is the old story. On 64-bit host, TCGLifeData is now structured
+ * as following:
+ *  15          9 8        2 1        0
+ * | CLOBBER_ARG | DEAD_ARG | SYNC_ARG |
+ * So that we can support 7 argument in total for every TCGOp, with at
+ * most 2 of them being used as output argument, 7 + 7 + 2 == 16.  */
+
+#define SYNC_ARG        (1 << 0)
+#define DEAD_ARG        (1 << 2)
+#define CLOBBER_ARG     (1 << 9)
 typedef uint16_t TCGLifeData;
 
 /* The layout here is designed to avoid a bitfield crossing of
@@ -549,6 +558,8 @@ typedef struct TCGOp {
     /* Lifetime data of the operands.  */
     unsigned life   : 16;       /* 32 */
 
+    /* 32-bit slot */
+
     /* Next and previous opcodes.  */
     QTAILQ_ENTRY(TCGOp) link;
 #ifdef CONFIG_PLUGIN
@@ -557,6 +568,8 @@ typedef struct TCGOp {
 
     /* Arguments for the opcode.  */
     TCGArg args[MAX_OPC_PARAM];
+
+    /* 48-bit slot */
 
     /* Register preferences for the output(s).  */
     TCGRegSet output_pref[2];
