@@ -2135,20 +2135,30 @@ static void tcg_dump_ops(TCGContext *s, bool have_prefs)
 
         if (op->life) {
             unsigned life = op->life;
+            uint32_t mask;
 
-            if (life & (SYNC_ARG * 3)) {
+            if (life & (DEAD_ARG - SYNC_ARG)) {
                 qemu_log("  sync:");
-                for (i = 0; i < 2; ++i) {
-                    if (life & (SYNC_ARG << i)) {
+                for (i = 0, mask = SYNC_ARG; mask < DEAD_ARG; mask <<= 1, i++) {
+                    if (life & mask) {
                         qemu_log(" %d", i);
                     }
                 }
             }
-            life /= DEAD_ARG;
-            if (life) {
+            if (life & (CLOBBER_ARG - DEAD_ARG)) {
                 qemu_log("  dead:");
-                for (i = 0; life; ++i, life >>= 1) {
-                    if (life & 1) {
+                for (i = 0, mask = DEAD_ARG; mask < CLOBBER_ARG;
+                     mask <<= 1, i++) {
+                    if (life & mask) {
+                        qemu_log(" %d", i);
+                    }
+                }
+            }
+            if (life & (0 - CLOBBER_ARG)) {
+                qemu_log("  may clobber:");
+                for (i = 0, mask = CLOBBER_ARG; mask < (TCGLifeData) -1;
+                     mask <<= 1, i++) {
+                    if (life & mask) {
                         qemu_log(" %d", i);
                     }
                 }
@@ -2443,11 +2453,17 @@ static void reachable_code_pass(TCGContext *s)
     }
 }
 
-#define TS_DEAD  1
-#define TS_MEM   2
+/*
+ * TCG liveness analysis facilities
+ */
 
-#define IS_DEAD_ARG(n)   (arg_life & (DEAD_ARG << (n)))
-#define NEED_SYNC_ARG(n) (arg_life & (SYNC_ARG << (n)))
+#define TS_DEAD                 (1 << 0)
+#define TS_MAY_CLOBBER          (1 << 1)
+#define TS_MEM                  (1 << 2)
+
+#define IS_DEAD_ARG(n)          (arg_life & (DEAD_ARG << (n)))
+#define MAY_CLOBBER_ARG(n)      (arg_life & (CLOBBER_ARG << (n)))
+#define NEED_SYNC_ARG(n)        (arg_life & (SYNC_ARG << (n)))
 
 /* For liveness_pass_1, the register preferences for a given temp.  */
 static inline TCGRegSet *la_temp_pref(TCGTemp *ts)
@@ -2575,8 +2591,44 @@ static void la_cross_call(TCGContext *s, size_t nt, bool tlb_check)
                 set = tcg_target_available_regs[ts->type] & mask;
             }
             *pset = set;
+
+            /* Mark all live temporaries as 'maybe clobbered'. This should
+             * come BEFORE `la_record_life` for call clobbering ops, so as
+             * to catch all temporaries that might be clobbered.  */
+            ts->state |= TS_MAY_CLOBBER;
         }
     }
+}
+
+static void la_record_life(const TCGTemp *ts, TCGLifeData *parg_life,
+                           uint8_t i, bool is_oargs)
+{
+    TCGLifeData arg_life = *parg_life;
+
+    /* The argument is dead after this op, free the register it uses.
+     * For input argument, it might be the very output of the current
+     * op that kills the input, free the register early to benefit the
+     * register allocation of the output.  */
+    if (ts->state & TS_DEAD) {
+        arg_life |= DEAD_ARG << i;
+    }
+    /* The argument is still alive after this op, but another op before
+     * the VERY NEXT USE of this argument might clobber the register it
+     * uses, check if the argument indeed uses a caller-saved register,
+     * and free it early if needed.
+     * Note that `call` and `tlb_check` will clobber different sets of
+     * registers, only the intersection of those registers will be early
+     * freed.  */
+    if (ts->state & TS_MAY_CLOBBER) {
+        tcg_debug_assert(!(ts->state & TS_DEAD));
+        arg_life |= CLOBBER_ARG << i;
+    }
+    /* The output argument should be synced back to its canonical memory
+     * location at the end of this op.  */
+    if (is_oargs && (ts->state & TS_MEM)) {
+        arg_life |= SYNC_ARG << i;
+    }
+    *parg_life = arg_life;
 }
 
 /* Liveness analysis: update op->life to record if any argument
@@ -2629,20 +2681,16 @@ static void liveness_pass_1(TCGContext *s)
                     goto do_remove;
                 }
             do_not_remove_call:
-                /* Output args are dead.  */
+                /* Output arguments are dead.  */
                 for (i = 0; i < nb_oargs; i++) {
                     ts = arg_temp(op->args[i]);
-                    if (ts->state & TS_DEAD) {
-                        arg_life |= DEAD_ARG << i;
-                    }
-                    if (ts->state & TS_MEM) {
-                        arg_life |= SYNC_ARG << i;
-                    }
-                    ts->state = TS_DEAD;
-                    la_reset_pref(ts);
 
                     /* Not used -- it will be tcg_target_call_oarg_regs[i].  */
                     op->output_pref[i] = 0;
+
+                    la_record_life(ts, &arg_life, i, true);
+                    ts->state = TS_DEAD;
+                    la_reset_pref(ts);
                 }
 
                 if (!(call_flags & (TCG_CALL_NO_WRITE_GLOBALS |
@@ -2652,16 +2700,17 @@ static void liveness_pass_1(TCGContext *s)
                     la_global_sync(s, nb_globals);
                 }
 
-                /* Record arguments that die in this helper.  */
-                for (i = nb_oargs; i < nb_iargs + nb_oargs; i++) {
-                    ts = arg_temp(op->args[i]);
-                    if (ts && ts->state & TS_DEAD) {
-                        arg_life |= DEAD_ARG << i;
-                    }
-                }
-
                 /* For all live registers, remove call-clobbered prefs.  */
                 la_cross_call(s, nb_temps, false);
+
+                /* Record arguments that die or may clobbered in this call.  */
+                for (i = nb_oargs; i < nb_iargs + nb_oargs; i++) {
+                    if (!(ts = arg_temp(op->args[i]))) {
+                        continue;
+                    }
+                    la_record_life(ts, &arg_life, i, false);
+                    ts->state &= ~TS_MAY_CLOBBER;
+                }
 
                 nb_call_regs = ARRAY_SIZE(tcg_target_call_iarg_regs);
 
@@ -2813,19 +2862,14 @@ static void liveness_pass_1(TCGContext *s)
             break;
 
         do_not_remove:
+            /* Output arguments are dead.  */
             for (i = 0; i < nb_oargs; i++) {
                 ts = arg_temp(op->args[i]);
 
                 /* Remember the preference of the uses that followed.  */
                 op->output_pref[i] = *la_temp_pref(ts);
 
-                /* Output args are dead.  */
-                if (ts->state & TS_DEAD) {
-                    arg_life |= DEAD_ARG << i;
-                }
-                if (ts->state & TS_MEM) {
-                    arg_life |= SYNC_ARG << i;
-                }
+                la_record_life(ts, &arg_life, i, true);
                 ts->state = TS_DEAD;
                 la_reset_pref(ts);
             }
@@ -2845,12 +2889,11 @@ static void liveness_pass_1(TCGContext *s)
             }
 
         do_not_remove2:
-            /* Record arguments that die in this opcode.  */
+            /* Record arguments that die or may clobbered in this opcode.  */
             for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                 ts = arg_temp(op->args[i]);
-                if (ts->state & TS_DEAD) {
-                    arg_life |= DEAD_ARG << i;
-                }
+                la_record_life(ts, &arg_life, i, false);
+                ts->state &= ~TS_MAY_CLOBBER;
             }
 
             /* Input arguments are live for preceding opcodes.  */
@@ -3340,6 +3383,27 @@ static void tcg_reg_free(TCGContext *s, TCGReg reg)
     }
 }
 
+static bool temp_with_reg_in_clobber_list(TCGTemp *ts)
+{
+    if (ts_val_type(ts) != TEMP_VAL_REG) {
+        return false;
+    } else if (!tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs,
+                                    ts->reg)) {
+        return false;
+    }
+    return true;
+}
+
+#define DO_CLOBBER_ARG(n, ts)   \
+    (!!MAY_CLOBBER_ARG(n) && temp_with_reg_in_clobber_list(ts))
+
+static void temp_clobber(TCGContext *s, TCGTemp *ts)
+{
+    tcg_debug_assert(temp_with_reg_in_clobber_list(ts));
+    tcg_debug_assert(s->reg_to_temp[ts->reg] == ts);
+    tcg_reg_free(s, ts->reg);
+}
+
 /**
  * tcg_reg_alloc:
  * @required_regs: Set of registers in which we must allocate.
@@ -3587,12 +3651,18 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots, TCGTemp *ts,
     ots->mem_coherent = false;
     ts_set_val_type(ots, TEMP_VAL_CONST);
 
+    /* No need to clobber, as neither of {ts, ots} is of TEMP_VAL_CONST.  */
     if (IS_DEAD_ARG(1)) {
         temp_dead(s, ts);
     }
     if (NEED_SYNC_ARG(0)) {
         temp_sync_internal(s, ots, IS_DEAD_ARG(0), s->reserved_regs,
                            preferred_regs);
+        /* Register may need to be allocated to SYNC the constant, which
+         * might happen to be also in the clobber list.  */
+        if (unlikely(DO_CLOBBER_ARG(0, ots))) {
+            temp_clobber(s, ots);
+        }
     } else {
         /* Mov to a non-saved dead register makes no sense.  */
         tcg_debug_assert(!IS_DEAD_ARG(0));
@@ -3644,6 +3714,8 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
         temp_store(s, ots, otype, ts->reg);
         if (IS_DEAD_ARG(1)) {
             temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(1, ts)) {
+            temp_clobber(s, ts);
         }
         temp_dead(s, ots);
     } else {
@@ -3668,10 +3740,15 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
                 ts_set_val_type(ots, TEMP_VAL_MEM);
                 return;
             }
+            if (DO_CLOBBER_ARG(1, ts)) {
+                temp_clobber(s, ts);
+            }
         }
         temp_commit_register(s, ots, reg, true);
         if (NEED_SYNC_ARG(0)) {
-            temp_sync(s, ots, 0);
+            temp_sync(s, ots, -DO_CLOBBER_ARG(0, ots));
+        } else if (DO_CLOBBER_ARG(0, ots)) {
+            temp_clobber(s, ots);
         }
     }
 }
@@ -3768,12 +3845,17 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
 done:
     if (IS_DEAD_ARG(1)) {
         temp_dead(s, its);
+    } else if (DO_CLOBBER_ARG(1, its)) {
+        temp_clobber(s, its);
     }
     if (NEED_SYNC_ARG(0)) {
-        temp_sync(s, ots, IS_DEAD_ARG(0));
+        temp_sync(s, ots, IS_DEAD_ARG(0) - DO_CLOBBER_ARG(0, ots));
     } else {
         /* Mov to a non-saved dead register makes no sense.  */
         tcg_debug_assert(!IS_DEAD_ARG(0));
+        if (DO_CLOBBER_ARG(0, ots)) {
+            temp_clobber(s, ots);
+        }
     }
 }
 
@@ -3785,6 +3867,7 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
     size_t i;
     TCGArg new_args[TCG_MAX_OP_ARGS];
     BackendValType arg_types[TCG_MAX_OP_ARGS];
+    TCGTemp *ts;
 
     tcg_debug_assert(def->nb_oargs == 0);
     tcg_debug_assert(def->nb_cargs == 1);
@@ -3796,8 +3879,8 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
     /* Satisfy input constraints.  */
     for (i = 0; i < 3; i++) {
         const TCGArgConstraint *arg_ct = &def->args_ct[i];
-        TCGTemp *ts = arg_temp(op->args[i]);
 
+        ts = arg_temp(op->args[i]);
         if (ts_val_type(ts) == TEMP_VAL_CONST) {
             if (tcg_target_const_match(ts->val, ts->type, arg_ct)) {
                 /* Constant is OK for the instruction.  */
@@ -3816,14 +3899,19 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
     }
 
     for (i = 0; i < 3; i++) {
+        ts = arg_temp(op->args[i]);
         if (IS_DEAD_ARG(i)) {
-            temp_dead(s, arg_temp(op->args[i]));
+            temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(i, ts)) {
+            temp_clobber(s, ts);
         }
     }
 
     for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
         if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
-            tcg_reg_free(s, i);
+            /* Liveness analysis should have ensured that temporaries
+             * using registers clobbered by this op be freed.  */
+            tcg_debug_assert(!s->reg_to_temp[i]);
         }
     }
 
@@ -3937,8 +4025,11 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 
     /* Mark dead temporaries and free the associated registers.  */
     for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
+        ts = arg_temp(op->args[i]);
         if (IS_DEAD_ARG(i)) {
-            temp_dead(s, arg_temp(op->args[i]));
+            temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(i, ts)) {
+            temp_clobber(s, ts);
         }
     }
 
@@ -3999,15 +4090,20 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         ts = arg_temp(op->args[i]);
 
         if (NEED_SYNC_ARG(i)) {
-            temp_sync(s, ts, IS_DEAD_ARG(i));
+            temp_sync(s, ts, IS_DEAD_ARG(i) - DO_CLOBBER_ARG(i, ts));
         } else if (IS_DEAD_ARG(i)) {
             temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(i, ts)) {
+            temp_clobber(s, ts);
         }
     }
 }
 
 static bool tcg_reg_alloc_dup2(TCGContext *s, const TCGOp *op)
 {
+    /* DUP2 is not updated as with the other tcg_reg_alloc_*.  */
+    g_assert_not_reached();
+
     const TCGLifeData arg_life = op->life;
     TCGTemp *ots, *itsl, *itsh;
     TCGType vtype = TCGOP_VECL(op) + TCG_TYPE_V64;
@@ -4150,8 +4246,11 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
 
     /* Mark dead temporaries and free the associated registers.  */
     for (i = nb_oargs; i < nb_iargs + nb_oargs; i++) {
+        ts = arg_temp(op->args[i]);
         if (IS_DEAD_ARG(i)) {
-            temp_dead(s, arg_temp(op->args[i]));
+            temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(i, ts)) {
+            temp_clobber(s, ts);
         }
     }
 
@@ -4188,9 +4287,11 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
         temp_commit_register(s, ts, reg, true);
 
         if (NEED_SYNC_ARG(i)) {
-            temp_sync(s, ts, IS_DEAD_ARG(i));
+            temp_sync(s, ts, IS_DEAD_ARG(i) - DO_CLOBBER_ARG(i, ts));
         } else if (IS_DEAD_ARG(i)) {
             temp_dead(s, ts);
+        } else if (DO_CLOBBER_ARG(i, ts)) {
+            temp_clobber(s, ts);
         }
     }
 }
