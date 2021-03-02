@@ -249,6 +249,14 @@ static int tcg_cpu_exec(CPUState *cpu)
     return ret;
 }
 
+static void tcg_cpu_init_cflags(CPUState *cpu, bool parallel)
+{
+    uint32_t cflags = cpu->cluster_index << CF_CLUSTER_SHIFT;
+    cflags |= parallel ? CF_PARALLEL : 0;
+    cflags |= icount_enabled() ? CF_USE_ICOUNT : 0;
+    cpu->tcg_cflags = cflags;
+}
+
 /*
  * Destroy any remaining vCPUs which have been unplugged and have
  * finished running
@@ -479,7 +487,6 @@ static void tcg_start_vcpu_thread(CPUState *cpu)
     if (!tcg_region_inited) {
         tcg_region_inited = 1;
         tcg_region_init();
-        parallel_cpus = qemu_tcg_mttcg_enabled() && current_machine->smp.max_cpus > 1;
     }
 
     if (qemu_tcg_mttcg_enabled() || !single_tcg_cpu_thread) {
@@ -488,14 +495,14 @@ static void tcg_start_vcpu_thread(CPUState *cpu)
         qemu_cond_init(cpu->halt_cond);
 
         if (qemu_tcg_mttcg_enabled()) {
+            tcg_cpu_init_cflags(cpu, current_machine->smp.max_cpus > 1);
             /* create a thread per vCPU with TCG (MTTCG) */
             snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "CPU %d/TCG",
                  cpu->cpu_index);
-
             qemu_thread_create(cpu->thread, thread_name, tcg_cpu_thread_fn,
                                cpu, QEMU_THREAD_JOINABLE);
-
         } else {
+            tcg_cpu_init_cflags(cpu, false);
             /* share a single thread for all cpus with TCG */
             snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "ALL CPUs/TCG");
             qemu_thread_create(cpu->thread, thread_name,
@@ -509,6 +516,7 @@ static void tcg_start_vcpu_thread(CPUState *cpu)
         cpu->hThread = qemu_thread_get_handle(cpu->thread);
 #endif
     } else {
+        tcg_cpu_init_cflags(cpu, false);
         /* For non-MTTCG cases we share the thread */
         cpu->thread = single_tcg_cpu_thread;
         cpu->halt_cond = single_tcg_halt_cond;
