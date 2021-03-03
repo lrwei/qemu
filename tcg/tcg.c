@@ -1140,7 +1140,7 @@ void tcg_func_start(TCGContext *s)
             g_hash_table_remove_all(s->const_table[i]);
         }
     }
-    tcg_opt_vn_reset(s);
+    tcg_opt_vn_reset(s, true);
 
     s->nb_ops = 0;
     s->nb_labels = 0;

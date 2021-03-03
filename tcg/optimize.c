@@ -65,15 +65,11 @@ static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i64;
  *    VALUE to another temporary happens only when that VALUE is explicitly
  *    requested by further ops.  */
 
-#define OPT_MAX_OPC_PARAM_IARGS 2
-typedef struct TCGValue {
-    TCGOpcode opc : 8;
-    uint16_t numbers[OPT_MAX_OPC_PARAM_IARGS];
-} TCGValue;
+#define OPT_MAX_OPC_PARAM_IARGS ARRAY_SIZE(((TCGOp *) 0)->numbers)
 
 typedef struct TempOptInfo {
     uint64_t mask;
-    TCGValue *value;
+    TCGOp *value;
     bool reassociated;
     int64_t offset;
 } TempOptInfo;
@@ -388,7 +384,7 @@ static TCGTemp *num2var(uint16_t number)
     return vne->canonical;
 }
 
-static bool value_has_constant_offset(TCGValue *value, uint64_t *offset,
+static bool value_has_constant_offset(TCGOp *value, uint64_t *offset,
                                       bool check)
 {
     TCGTemp *ts;
@@ -410,7 +406,7 @@ static bool value_has_constant_offset(TCGValue *value, uint64_t *offset,
 
 static void tcg_opt_aggregate_offset(TCGOp *op)
 {
-    TCGValue *value = arg_info(op->args[1])->value;
+    TCGOp *value = arg_info(op->args[1])->value;
     uint64_t offset, offset2;
 
     switch (op->opc) {
@@ -558,7 +554,7 @@ static bool tcg_opt_extract_tag_finalize(TCGOp *op)
 
 static void tcg_opt_encode_offset(TCGOp *op)
 {
-    TCGValue *value = arg_info(op->args[1])->value;
+    TCGOp *value = arg_info(op->args[1])->value;
     uint64_t offset;
 
     if (unlikely(op->args[2] != 0)) {
@@ -589,18 +585,19 @@ static inline bool try_common_subexpression_elimination(const TCGOpDef *def,
     return false;
 }
 
-static TCGValue *tcg_opt_make_value(TCGOp *op, TCGValue *value)
+static uint16_t tcg_opt_lookup_value(GHashTable *value2num, TCGOp *op)
 {
     const TCGOpDef *def = &tcg_op_defs[op->opc];
     size_t i;
+    /* VALUE corresponds to COMPUTATION.  */
+    TCGOp *value = op;
 
     tcg_debug_assert(try_common_subexpression_elimination(def, NULL));
 
-    if (!value) {
-        value = tcg_malloc(sizeof(TCGValue));
-    }
-
-    value->opc = op->opc;
+    /* Record the number of the input values, which serves as a construction
+     * of the hash key, as well as a registration of the value-relationship
+     * just calculated by value numbering, the recorded value number remains
+     * valid as long as `s->num2value` is not reset.  */
     for (i = 1; i < 1 + def->nb_iargs; i++) {
         value->numbers[i - 1] = ts_number(arg_temp(op->args[i]));
     }
@@ -608,18 +605,15 @@ static TCGValue *tcg_opt_make_value(TCGOp *op, TCGValue *value)
         tcg_debug_assert(op->args[i] == (int16_t) op->args[i]);
         value->numbers[i - 1] = op->args[i];
     }
-
-    return value;
+    return GPOINTER_TO_UINT(g_hash_table_lookup(value2num, value));
 }
 
-static void tcg_opt_record_value(GHashTable *value2num, TCGValue **value,
+static void tcg_opt_record_value(GHashTable *value2num, TCGOp *value,
                                  TCGTemp *ts)
 {
-    tcg_debug_assert(g_hash_table_insert(value2num, *value,
+    tcg_debug_assert(g_hash_table_insert(value2num, value,
                                          GSIZE_TO_POINTER(ts_number(ts))));
-    ts_info(ts)->value = *value;
-    /* Consume the value.  */
-    *value = NULL;
+    ts_info(ts)->value = value;
 }
 
 /* Fake boost::hash_combine(), in which 0x9e3779b9 equals 2^32 / phi.  */
@@ -628,15 +622,14 @@ static inline void hash_combine(uint32_t *seed, uint32_t value)
     *seed ^= value + 0x9e3779b9 + (*seed << 6) + (*seed >> 2);
 }
 
-/* Converts a TCGOp to a 32-bit hash value.
+/* Converts a VALUE to a 32-bit hash value.
  *
- * All information isn't encoded for simplicity, indeed, the first constant
- * input argument OR the second variable input argument is encoded, based on
- * the observation that they don't show up together very often, and constant
- * offset is very important to distinguish ld operations.  */
+ * For simplicity, only operations with at most 2 input arguments
+ * are numbered. Hopefully, this will include the majority of the
+ * operations encountered in TCG.  */
 static guint tcg_op_hash(gconstpointer key)
 {
-    const TCGValue *value = key;
+    const TCGOp *value = key;
     const TCGOpDef *def = &tcg_op_defs[value->opc];
     uint32_t hash = value->numbers[0];
 
@@ -650,10 +643,10 @@ static guint tcg_op_hash(gconstpointer key)
     return hash;
 }
 
-/* Check that 2 TCGValues do equal.  */
+/* Check that 2 VALUEs do equal.  */
 static gboolean tcg_op_equal(gconstpointer key, gconstpointer key2)
 {
-    const TCGValue *value = key, *value2 = key2;
+    const TCGOp *value = key, *value2 = key2;
     const TCGOpDef *def = &tcg_op_defs[value->opc];
     size_t i;
 
@@ -678,10 +671,12 @@ void tcg_opt_vn_initialize(TCGContext *s)
                                      sizeof(ValueNumberingEntry), 64);
 }
 
-void tcg_opt_vn_reset(TCGContext *s)
+void tcg_opt_vn_reset(TCGContext *s, bool full_reset)
 {
     g_hash_table_remove_all(s->value2num);
-    g_array_set_size(s->num2value, 0);
+    if (full_reset) {
+        g_array_set_size(s->num2value, 0);
+    }
 }
 
 static uint64_t do_constant_folding_2(TCGOpcode op, uint64_t x, uint64_t y)
@@ -1036,7 +1031,6 @@ void tcg_optimize(TCGContext *s)
 {
     TCGOp *op, *op_next, *prev_mb = NULL;
     size_t i;
-    TCGValue *value = NULL;
 
     for (i = 0; i < s->nb_temps; i++) {
         ts_set_uninitialized(&s->temps[i]);
@@ -1089,6 +1083,8 @@ void tcg_optimize(TCGContext *s)
                 op->opc = TARGET_LONG_BITS == 32 ? INDEX_op_guard_i32
                                                  : INDEX_op_guard_i64;
             }
+            op->numbers[0] = ts_number(arg_temp(op->args[0]));
+            op->numbers[1] = ts_number(arg_temp(op->args[1]));
             continue;
         CASE_OP_32_64(ld8u):
         CASE_OP_32_64(ld8s):
@@ -1271,8 +1267,6 @@ void tcg_optimize(TCGContext *s)
         default:
             break;
         }
-
-
 
         /* Simplify expression for "op r, a, 0 => movi r, 0" cases */
         switch (opc) {
@@ -1953,10 +1947,7 @@ done_algebraic_simplifying_and_constant_folding:
 
         default:
             if (try_common_subexpression_elimination(def, op)) {
-                /* This variable retains its value throughout the loop.  */
-                value = tcg_opt_make_value(op, value);
-                i = GPOINTER_TO_SIZE(g_hash_table_lookup(s->value2num, value));
-                if (i) {
+                if ((i = tcg_opt_lookup_value(s->value2num, op))) {
                     tcg_opt_gen_mov(op, op->args[0], temp_arg(num2var(i)));
                 } else {
                     ts = arg_temp(op->args[0]);
@@ -1964,8 +1955,7 @@ done_algebraic_simplifying_and_constant_folding:
                     /* Save the corresponding known-zero bits mask for the
                      * first output argument (only one supported so far).  */
                     ts_info(ts)->mask = mask;
-
-                    tcg_opt_record_value(s->value2num, &value, ts);
+                    tcg_opt_record_value(s->value2num, op, ts);
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
         reset_all:
@@ -1975,7 +1965,9 @@ done_algebraic_simplifying_and_constant_folding:
                 for (i = 0; i < s->nb_temps; i++) {
                     ts_set_uninitialized(&s->temps[i]);
                 }
-                tcg_opt_vn_reset(s);
+                /* Keep numbers that is already assigned to values, so that
+                 * further transformation can leverage those information.  */
+                tcg_opt_vn_reset(s, false);
             } else {
         reset:
                 for (i = 0; i < nb_oargs; i++) {

@@ -558,7 +558,9 @@ typedef struct TCGOp {
     /* Lifetime data of the operands.  */
     unsigned life   : 16;       /* 32 */
 
-    /* 32-bit slot */
+    /* Value number or (signed) constant of inputs. Operations with
+     * more than 2 input arguments will not numbered.  */
+    uint16_t numbers[2];        /* 64 */
 
     /* Next and previous opcodes.  */
     QTAILQ_ENTRY(TCGOp) link;
@@ -1514,7 +1516,7 @@ static inline const TCGOpcode *tcg_swap_vecop_list(const TCGOpcode *n)
 bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
 
 TCGTemp *tcg_opt_temp_new(TCGType);
-void tcg_opt_vn_reset(TCGContext *);
+void tcg_opt_vn_reset(TCGContext *, bool);
 void tcg_opt_vn_initialize(TCGContext *);
 
 #endif /* TCG_H */
