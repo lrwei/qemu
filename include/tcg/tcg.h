@@ -569,7 +569,10 @@ typedef struct TCGOp {
     /* Arguments for the opcode.  */
     TCGArg args[MAX_OPC_PARAM];
 
-    /* 48-bit slot */
+    /* Position of the next use.  */
+    uint16_t next_use[MAX_OPC_PARAM_ARGS];
+
+    /* 16-bit slot */
 
     /* Register preferences for the output(s).  */
     TCGRegSet output_pref[2];
@@ -704,6 +707,9 @@ struct TCGContext {
 
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;
+
+    /* Index of the current TCGOp, inversed.  */
+    uint16_t current_insn;
 };
 
 static inline bool temp_readonly(TCGTemp *ts)
