@@ -107,7 +107,7 @@ static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
 static void tcg_out_movi(TCGContext *s, TCGType type,
                          TCGReg ret, tcg_target_long arg);
 static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
-                       const int *const_args);
+                       const BackendValType *arg_types);
 #if TCG_TARGET_MAYBE_vec
 static bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                             TCGReg dst, TCGReg src);
@@ -117,7 +117,7 @@ static void tcg_out_dupi_vec(TCGContext *s, TCGType type, unsigned vece,
                              TCGReg dst, int64_t arg);
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc, unsigned vecl,
                            unsigned vece, const TCGArg *args,
-                           const int *const_args);
+                           const BackendValType *arg_types);
 #else
 static inline bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                                    TCGReg dst, TCGReg src)
@@ -136,7 +136,7 @@ static inline void tcg_out_dupi_vec(TCGContext *s, TCGType type, unsigned vece,
 }
 static inline void tcg_out_vec_op(TCGContext *s, TCGOpcode opc, unsigned vecl,
                                   unsigned vece, const TCGArg *args,
-                                  const int *const_args)
+                                  const BackendValType *arg_types)
 {
     g_assert_not_reached();
 }
@@ -4074,7 +4074,7 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
     TCGTemp *ts;
     TCGReg reg;
     TCGArg new_args[TCG_MAX_OP_ARGS];
-    int const_args[TCG_MAX_OP_ARGS];
+    BackendValType arg_types[TCG_MAX_OP_ARGS];
 
     tcg_debug_assert(def->nb_oargs == 0);
     tcg_debug_assert(def->nb_cargs == 1);
@@ -4091,7 +4091,7 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
         if (ts_val_type(ts) == TEMP_VAL_CONST
             && tcg_target_const_match(ts->val, ts->type, arg_ct)) {
             /* Constant is OK for the instruction.  */
-            const_args[i] = 1;
+            arg_types[i] = BACKEND_CONST;
             new_args[i] = ts->val;
             continue;
         }
@@ -4108,7 +4108,7 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
             temp_move(s, ts, reg);
         }
         new_args[i] = reg;
-        const_args[i] = 0;
+        arg_types[i] = BACKEND_REG;
         tcg_regset_set_reg(allocated_regs, reg);
     }
 
@@ -4132,7 +4132,7 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
         }
     }
 
-    tcg_out_op(s, op->opc, new_args, const_args);
+    tcg_out_op(s, op->opc, new_args, arg_types);
 
     /* Deal with the first input temporary, as described above.  */
     temp_finalize(s, op, 0, false);
@@ -4149,7 +4149,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     const TCGArgConstraint *arg_ct;
     TCGTemp *ts;
     TCGArg new_args[TCG_MAX_OP_ARGS];
-    int const_args[TCG_MAX_OP_ARGS];
+    BackendValType arg_types[TCG_MAX_OP_ARGS];
 
     nb_oargs = def->nb_oargs;
     nb_iargs = def->nb_iargs;
@@ -4172,7 +4172,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         if (ts_val_type(ts) == TEMP_VAL_CONST
             && tcg_target_const_match(ts->val, ts->type, arg_ct)) {
             /* Constant is OK for the instruction.  */
-            const_args[i] = 1;
+            arg_types[i] = BACKEND_CONST;
             new_args[i] = ts->val;
             continue;
         }
@@ -4227,7 +4227,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             }
         }
         new_args[i] = reg;
-        const_args[i] = 0;
+        arg_types[i] = BACKEND_REG;
         tcg_regset_set_reg(i_allocated_regs, reg);
     }
 
@@ -4264,7 +4264,8 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             /* Output temporary should be well-formed.  */
             tcg_reg_alloc_check_output(ts);
 
-            if (arg_ct->oalias && !const_args[arg_ct->alias_index]) {
+            if (arg_ct->oalias
+                && (arg_types[arg_ct->alias_index] == BACKEND_REG)) {
                 reg = new_args[arg_ct->alias_index];
             } else if (arg_ct->newreg) {
                 reg = tcg_reg_alloc(s, arg_ct->regs &
@@ -4283,9 +4284,9 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     /* Emit instruction.  */
     if (def->flags & TCG_OPF_VECTOR) {
         tcg_out_vec_op(s, op->opc, TCGOP_VECL(op), TCGOP_VECE(op),
-                       new_args, const_args);
+                       new_args, arg_types);
     } else {
-        tcg_out_op(s, op->opc, new_args, const_args);
+        tcg_out_op(s, op->opc, new_args, arg_types);
     }
 
     for(i = 0; i < nb_oargs; i++) {

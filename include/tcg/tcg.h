@@ -484,6 +484,11 @@ typedef enum TCGTempVal {
     TEMP_VAL_INVALID,
 } TCGTempVal;
 
+typedef enum BackendValType {
+    BACKEND_REG,
+    BACKEND_CONST,
+} BackendValType;
+
 typedef enum TCGTempKind {
     /* Temp is dead at the end of all basic blocks. */
     TEMP_NORMAL,
