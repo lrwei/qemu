@@ -571,6 +571,11 @@ typedef struct TCGTemp {
     void *state_ptr;
 } TCGTemp;
 
+typedef enum BackendValType {
+    BACKEND_REG,
+    BACKEND_CONST,
+} BackendValType;
+
 typedef struct TCGProfile {
     int64_t cpu_exec_time;
     int64_t tb_count1;
