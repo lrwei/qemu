@@ -62,14 +62,6 @@
 #include "exec/log.h"
 #include "sysemu/sysemu.h"
 
-/* Forward declarations for functions declared in tcg-target.c.inc and
-   used here. */
-static void tcg_target_init(TCGContext *s);
-static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode);
-static void tcg_target_qemu_prologue(TCGContext *s);
-static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
-                        intptr_t value, intptr_t addend);
-
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
     uint32_t len __attribute__((aligned((sizeof(void *)))));
@@ -93,12 +85,19 @@ typedef struct QEMU_PACKED {
     DebugFrameFDEHeader fde;
 } DebugFrameHeader;
 
+/* Forward declarations for functions declared in tcg-target.c.inc and
+   used here. */
+static void tcg_target_init(TCGContext *s);
+static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode);
+static void tcg_target_qemu_prologue(TCGContext *s);
+static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
+                        intptr_t value, intptr_t addend);
+
 static void tcg_register_jit_int(void *buf, size_t size,
                                  const void *debug_frame,
                                  size_t debug_frame_size)
     __attribute__((unused));
 
-/* Forward declarations for functions declared and used in tcg-target.c.inc. */
 static const char *target_parse_constraint(TCGArgConstraint *ct,
                                            const char *ct_str, TCGType type);
 static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
@@ -148,9 +147,13 @@ static bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
 static void tcg_out_call(TCGContext *s, tcg_insn_unit *target);
 static bool tcg_target_const_match(tcg_target_long val, TCGType type,
                                    const TCGArgConstraint *arg_ct);
+static bool tcg_target_memory_match(intptr_t offset,
+                                    const TCGArgConstraint *arg_ct);
 #ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
 static int tcg_out_slow_path_finalize(TCGContext *s);
 #endif
+
+#include "tcg-pool.c.inc"
 
 #define TCG_HIGHWATER 1024
 
@@ -339,8 +342,6 @@ static void set_jmp_reset_offset(TCGContext *s, int which)
      */
     s->tb_jmp_reset_offset[which] = tcg_current_code_size(s);
 }
-
-#include "tcg-target.c.inc"
 
 /* compare a pointer @ptr and a tb_tc @s */
 static int ptr_cmp_tb_tc(const void *ptr, const struct tb_tc *s)
@@ -791,6 +792,8 @@ void tcg_register_thread(void)
             s->temps[i].mem_base = &s->temps[b];
         }
     }
+    /* Relink frame_temp.  */
+    s->frame_temp = &s->temps[tcg_init_ctx.frame_temp - tcg_init_ctx.temps];
 
     /* Claim an entry in tcg_ctxs */
     n = qatomic_fetch_inc(&n_tcg_ctxs);
@@ -935,6 +938,7 @@ static const TCGHelperInfo all_helpers[] = {
 };
 static GHashTable *helper_table;
 
+#include "tcg-target-abi.c.inc"
 static TCGReg indirect_reg_alloc_order[ARRAY_SIZE(tcg_target_reg_alloc_order)];
 static void process_op_defs(TCGContext *s);
 static TCGTemp *tcg_global_reg_new_internal(TCGContext *s, TCGType type,
@@ -2317,6 +2321,11 @@ static int get_constraint_priority(const TCGOpDef *def, int k)
     if (arg_ct->oalias) {
         /* an alias is equivalent to a single register */
         n = 1;
+    } else if (arg_ct->ct & TCG_CT_MEMORY) {
+        /* The decision to use memory operand should be made last, so that
+         * if an operand is used multiple times in single op, it'll almost
+         * surely be allocated in register.  */
+        return 0;
     } else {
         n = ctpop64(arg_ct->regs);
     }
@@ -4105,6 +4114,8 @@ static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
              */
             reg = tcg_reg_alloc(s, arg_ct->regs & ~allocated_regs,
                                 0, ts->indirect_base);
+            /* Impossible to spill `ts->reg`, otherwise we wouldn't be here.  */
+            tcg_debug_assert(reg != ts->reg);
             temp_move(s, ts, reg);
         }
         new_args[i] = reg;
@@ -4174,6 +4185,11 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             /* Constant is OK for the instruction.  */
             arg_types[i] = BACKEND_CONST;
             new_args[i] = ts->val;
+            continue;
+        } else if (IS_DEAD_ARG(i) && (ts_val_type(ts) == TEMP_VAL_MEM)
+                   && tcg_target_memory_match(ts->mem_offset, arg_ct)) {
+            arg_types[i] = BACKEND_MEMORY;
+            new_args[i] = temp_arg(ts);
             continue;
         }
 
@@ -4478,6 +4494,8 @@ static void tcg_reg_alloc_call(TCGContext *s, const TCGOp *op)
     }
 }
 
+#include "tcg-target.c.inc"
+
 #ifdef CONFIG_PROFILER
 
 /* avoid copy/paste errors */
@@ -4770,8 +4788,15 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             if (tcg_reg_alloc_dup2(s, op)) {
                 break;
             }
-            /* fall through */
+            goto do_default;
+        case INDEX_op_add_i32:
+        case INDEX_op_add_i64:
+            if (tcg_reg_alloc_op_arch(s, op)) {
+                break;
+            }
+            goto do_default;
         default:
+        do_default:
             /* Sanity check that we've not introduced any unhandled opcodes. */
             tcg_debug_assert(tcg_op_supported(opc));
             /* Note: in order to speed up the code, it would be much

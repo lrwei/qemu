@@ -487,6 +487,7 @@ typedef enum TCGTempVal {
 typedef enum BackendValType {
     BACKEND_REG,
     BACKEND_CONST,
+    BACKEND_MEMORY,
 } BackendValType;
 
 typedef enum TCGTempKind {
@@ -1023,7 +1024,9 @@ int64_t tcg_cpu_exec_time(void);
 void tcg_dump_info(void);
 void tcg_dump_op_count(void);
 
-#define TCG_CT_CONST  1 /* any constant of register size */
+#define TCG_CT_CONST    1 /* Any constant of register size.  */
+#define TCG_CT_MEMORY   2 /* Some kind of memory operand, must be decorated
+                           * by tcg-target-specific flags.  */
 
 typedef struct TCGArgConstraint {
     unsigned ct : 16;
