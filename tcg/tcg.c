@@ -62,14 +62,6 @@
 #include "exec/log.h"
 #include "sysemu/sysemu.h"
 
-/* Forward declarations for functions declared in tcg-target.c.inc and
-   used here. */
-static void tcg_target_init(TCGContext *s);
-static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode);
-static void tcg_target_qemu_prologue(TCGContext *s);
-static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
-                        intptr_t value, intptr_t addend);
-
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
     uint32_t len __attribute__((aligned((sizeof(void *)))));
@@ -93,12 +85,19 @@ typedef struct QEMU_PACKED {
     DebugFrameFDEHeader fde;
 } DebugFrameHeader;
 
+/* Forward declarations for functions declared in tcg-target.c.inc and
+   used here. */
+static void tcg_target_init(TCGContext *s);
+static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode);
+static void tcg_target_qemu_prologue(TCGContext *s);
+static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
+                        intptr_t value, intptr_t addend);
+
 static void tcg_register_jit_int(void *buf, size_t size,
                                  const void *debug_frame,
                                  size_t debug_frame_size)
     __attribute__((unused));
 
-/* Forward declarations for functions declared and used in tcg-target.c.inc. */
 static const char *target_parse_constraint(TCGArgConstraint *ct,
                                            const char *ct_str, TCGType type);
 static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
@@ -151,6 +150,8 @@ static bool tcg_target_const_match(tcg_target_long val, TCGType type,
 #ifdef TCG_TARGET_NEED_SLOW_PATH_LABELS
 static int tcg_out_slow_path_finalize(TCGContext *s);
 #endif
+
+#include "tcg-pool.c.inc"
 
 #define TCG_HIGHWATER 1024
 
@@ -338,8 +339,6 @@ static void set_jmp_reset_offset(TCGContext *s, int which)
      */
     s->tb_jmp_reset_offset[which] = tcg_current_code_size(s);
 }
-
-#include "tcg-target.c.inc"
 
 /* compare a pointer @ptr and a tb_tc @s */
 static int ptr_cmp_tb_tc(const void *ptr, const struct tb_tc *s)
@@ -932,6 +931,7 @@ static const TCGHelperInfo all_helpers[] = {
 };
 static GHashTable *helper_table;
 
+#include "tcg-target-abi.c.inc"
 static TCGReg indirect_reg_alloc_order[ARRAY_SIZE(tcg_target_reg_alloc_order)];
 static void process_op_defs(TCGContext *s);
 static TCGTemp *tcg_global_reg_new_internal(TCGContext *s, TCGType type,
@@ -4117,6 +4117,8 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
         }
     }
 }
+
+#include "tcg-target.c.inc"
 
 #ifdef CONFIG_PROFILER
 
