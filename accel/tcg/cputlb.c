@@ -2620,7 +2620,7 @@ void cpu_stq_le_data(CPUArchState *env, target_ulong ptr, uint64_t val)
     cpu_stq_le_data_ra(env, ptr, val, 0);
 }
 
-static inline uint64_t QEMU_ALWAYS_INLINE
+static inline void QEMU_ALWAYS_INLINE
 tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                  uintptr_t retaddr, bool is_load)
 {
@@ -2635,7 +2635,6 @@ tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
     uint32_t a_bits = get_alignment_bits(op);
     uint32_t size = memop_size(op);
     volatile CPUTLBDesc *desc = &env_tlb(env)->d[mmu_idx];
-    target_ulong non_straight_mask = ~(TARGET_PAGE_MASK | TLB_INVALID_MASK);
 
     /* Handle CPU specific unaligned behaviour.  */
     if (unlikely(a_bits > 0 && (addr & ((1 << a_bits) - 1)))) {
@@ -2658,7 +2657,7 @@ tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
             }
         }
         tlb_addr = is_load ? entry->addr_read : tlb_addr_write(entry);
-        /* Invalid mask in tlb_addr must be keeped, if any.  */
+        tlb_addr &= ~TLB_INVALID_MASK;
     }
 
     /* Handle slow unaligned access (it spans two pages or IO).  */
@@ -2669,19 +2668,16 @@ tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
     }
 
     /* Handle anything that isn't just a straight memory access.  */
-    if (unlikely(tlb_addr & non_straight_mask)) {
+    if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
         if (is_load) {
             goto bailout;
-        } else if ((tlb_addr & non_straight_mask) != TLB_NOTDIRTY) {
+        } else if ((tlb_addr & ~TARGET_PAGE_MASK) != TLB_NOTDIRTY) {
             goto bailout;
         }
         notdirty_write(env_cpu(env), addr, size, &desc->iotlb[index],
                        retaddr);
-        /* Note that this may still contains TLB_NOTDIRTY.  */
-        tlb_addr = tlb_addr_write(entry);
     }
-
-    return tlb_addr;
+    return;
 
 bailout:
     cpu_speculation_recompile(env_cpu(env), retaddr);
@@ -2695,44 +2691,36 @@ bailout:
     asm ("movq %0, %%" #reg :: "rm" (reg) : #reg);
 
 
-target_ulong helper_tlb_check_ld(CPUArchState *env, target_ulong addr,
-                                 TCGMemOpIdx oi, uintptr_t retaddr)
+void helper_tlb_check_ld(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                         uintptr_t retaddr)
 {
-    target_ulong ret;
-
     RESERVE_REG(r8)
     RESERVE_REG(r9)
     RESERVE_REG(r10)
     RESERVE_REG(r11)
 
-    ret = tlb_check_helper(env, addr, oi, retaddr, true);
+    tlb_check_helper(env, addr, oi, retaddr, true);
 
     RESTORE_REG(r11)
     RESTORE_REG(r10)
     RESTORE_REG(r9)
     RESTORE_REG(r8)
-
-    return ret;
 }
 
-target_ulong helper_tlb_check_st(CPUArchState *env, target_ulong addr,
-                                 TCGMemOpIdx oi, uintptr_t retaddr)
+void helper_tlb_check_st(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                         uintptr_t retaddr)
 {
-    target_ulong ret;
-
     RESERVE_REG(r8)
     RESERVE_REG(r9)
     RESERVE_REG(r10)
     RESERVE_REG(r11)
 
-    ret = tlb_check_helper(env, addr, oi, retaddr, false);
+    tlb_check_helper(env, addr, oi, retaddr, false);
 
     RESTORE_REG(r11)
     RESTORE_REG(r10)
     RESTORE_REG(r9)
     RESTORE_REG(r8)
-
-    return ret;
 }
 
 #ifdef CONFIG_DEBUG_TCG

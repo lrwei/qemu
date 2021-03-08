@@ -31,15 +31,16 @@ typedef struct TCGLabelQemuLdst {
 } TCGLabelQemuLdst;
 
 typedef struct TCGLabelTlbCheck {
+    TCGArg addr;
+    BackendValType addr_type;
     TCGMemOpIdx _oi;
-    TCGReg tag;
-    TCGReg addr;
 } TCGLabelTlbCheck;
 
 typedef struct TCGLabelGuard {
 #ifdef CONFIG_DEBUG_TCG
-    TCGReg a0;
-    TCGReg a1;
+    TCGReg arg;
+    TCGReg entry;
+    intptr_t offset;
 #endif
 } TCGLabelGuard;
 

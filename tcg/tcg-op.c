@@ -2858,14 +2858,16 @@ static void _tcg_gen_extract_tag(TCGv tag, TCGv addr, MemOp memop)
 #endif
 }
 
-static inline void _tcg_gen_tlb_check(TCGv tag, TCGv tag2, TCGv addr,
+static inline void _tcg_gen_tlb_check(TCGv_ptr tlb_entry, TCGv tag, TCGv addr,
                                       TCGMemOpIdx _oi)
 {
+    tcg_gen_op4(INDEX_op_tlb_check, tcgv_ptr_arg(tlb_entry),
 #if TARGET_LONG_BITS == 32
-    tcg_gen_op4i_i32(INDEX_op_tlb_check, tag, tag2, addr, _oi);
+                tcgv_i32_arg(tag), tcgv_i32_arg(addr),
 #else
-    tcg_gen_op4i_i64(INDEX_op_tlb_check, tag, tag2, addr, _oi);
+                tcgv_i64_arg(tag), tcgv_i64_arg(addr),
 #endif
+                (TCGArg) _oi);
 }
 
 static inline TCGMemOpIdx _make_memop_idx(MemOp memop, uint32_t idx,
@@ -2879,7 +2881,6 @@ static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
                                       TCGArg mem_index, bool is_load)
 {
     TCGv tag = tcg_temp_new();
-    TCGv tag2 = tcg_temp_new();
     TCGv_ptr base = tcg_temp_new_ptr();
     TCGv_ptr offset = tcg_temp_new_ptr();
     TCGv_ptr _index = tcg_temp_new_ptr();
@@ -2892,8 +2893,6 @@ static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
     intptr_t fast_ofs = TLB_MASK_TABLE_OFS(mem_index);
     intptr_t mask_ofs = fast_ofs + offsetof(CPUTLBDescFast, mask);
     intptr_t table_ofs = fast_ofs + offsetof(CPUTLBDescFast, table);
-    intptr_t addr_ofs = is_load ? offsetof(CPUTLBEntry, addr_read)
-                                : offsetof(CPUTLBEntry, addr_write);
     intptr_t addend_ofs = offsetof(CPUTLBEntry, addend);
 
     /* Emphasize that only 64-bit backend is supported, though
@@ -2918,17 +2917,16 @@ static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
     tcg_gen_and_ptr(index, _index, mask);
     tcg_gen_add_ptr(tlb_entry, table, index);
 
-    /* Load the TLB tags, and check to see if:
+    /* Extract the TLB tag from address, and check to see if:
      * 1. this address is cached in TLB
      * 2. this is an aligned, within-page, ordinary RAM access
      * Not satisfying the first condition causes a MMU walk and bails out only
      * if memory exception is encountered, otherwise, execution returns with
-     * TLB entry REFILLED and tag IMPLICITLY UPDATED to its new value.
+     * TLB entry REFILLED.
      * Execution never returns on violation of the second condition.  */
-    _tcg_gen_ld_tl(tag, tlb_entry, addr_ofs);
-    _tcg_gen_extract_tag(tag2, addr, memop);
-    _tcg_gen_tlb_check(tag, tag2, addr, _make_memop_idx(memop, mem_index,
-                                                        is_load));
+    _tcg_gen_extract_tag(tag, addr, memop);
+    _tcg_gen_tlb_check(tlb_entry, tag, addr, _make_memop_idx(memop, mem_index,
+                                                             is_load));
 
     /* Load host address addend from TLB entry.  */
     _tcg_gen_ld_ptr(addend, tlb_entry, addend_ofs);
@@ -2941,7 +2939,6 @@ static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
     tcg_gen_add_ptr(_addr, _addr, offset);
 
     tcg_temp_free(tag);
-    tcg_temp_free(tag2);
     tcg_temp_free_ptr(base);
     tcg_temp_free_ptr(offset);
     tcg_temp_free_ptr(_index);

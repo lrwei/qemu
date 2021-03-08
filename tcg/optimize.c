@@ -1082,6 +1082,9 @@ void tcg_optimize(TCGContext *s)
             if (arg_info(op->args[2])->reassociated) {
                 op->opc = TARGET_LONG_BITS == 32 ? INDEX_op_guard_i32
                                                  : INDEX_op_guard_i64;
+                /* From: tlb_check entry, tag, addr, _oi
+                 * To:   guard     entry, tag, _oi  */
+                op->args[2] = op->args[3];
             }
             op->numbers[0] = ts_number(arg_temp(op->args[0]));
             op->numbers[1] = ts_number(arg_temp(op->args[1]));

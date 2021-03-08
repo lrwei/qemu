@@ -153,12 +153,15 @@ static const char *target_parse_constraint(TCGArgConstraint *ct,
         /* A vector register.  */
         ct->regs |= ALL_VECTOR_REGS;
         break;
-
         /* qemu_ld/st address constraint */
     case 'L':
         ct->regs = TCG_TARGET_REG_BITS == 64 ? 0xffff : 0xff;
         tcg_regset_reset_reg(ct->regs, TCG_REG_L0);
         tcg_regset_reset_reg(ct->regs, TCG_REG_L1);
+        break;
+        /* Constraint for tlb_entry used by tlb_check.  */
+    case 'T':
+        ct->regs = ALL_GENERAL_REGS & ~tcg_target_tlb_check_clobber_regs;
         break;
 
     case 'e':
@@ -238,6 +241,7 @@ static inline bool tcg_target_memory_match(intptr_t offset,
 
 #define OPC_ARITH_EvIz	(0x81)
 #define OPC_ARITH_EvIb	(0x83)
+#define OPC_ARITH_EvGv	(0x01)		/* ... plus (ARITH_FOO << 3) */
 #define OPC_ARITH_GvEv	(0x03)		/* ... plus (ARITH_FOO << 3) */
 #define OPC_ANDN        (0xf2 | P_EXT38)
 #define OPC_ADD_GvEv	(OPC_ARITH_GvEv | (ARITH_ADD << 3))
@@ -248,6 +252,7 @@ static inline bool tcg_target_memory_match(intptr_t offset,
 #define OPC_BSWAP	(0xc8 | P_EXT)
 #define OPC_CALL_Jz	(0xe8)
 #define OPC_CMOVCC      (0x40 | P_EXT)  /* ... plus condition code */
+#define OPC_CMP_EvGv	(OPC_ARITH_EvGv | (ARITH_CMP << 3))
 #define OPC_CMP_GvEv	(OPC_ARITH_GvEv | (ARITH_CMP << 3))
 #define OPC_DEC_r32	(0x48)
 #define OPC_IMUL_GvEv	(0xaf | P_EXT)
@@ -1310,6 +1315,28 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, int small)
     }
 }
 
+static void tcg_out_cmpm(TCGContext *s, TCGArg base, intptr_t offset,
+                         TCGArg arg, BackendValType arg_type, int rexw)
+{
+    if (arg_type == BACKEND_REG) {
+        /* cmp %arg, offset(base) */
+        tcg_out_modrm_offset(s, OPC_CMP_EvGv + rexw, arg, base, offset);
+    } else {
+        /* cmp $arg, offset(base) */
+        tcg_debug_assert(arg_type == BACKEND_CONST);
+        if (arg == (int8_t) arg) {
+            tcg_out_modrm_offset(s, OPC_ARITH_EvIb + rexw, ARITH_CMP, base,
+                                 offset);
+            tcg_out8(s, arg);
+        } else {
+            tcg_debug_assert(arg == (int32_t) arg);
+            tcg_out_modrm_offset(s, OPC_ARITH_EvIz + rexw, ARITH_CMP, base,
+                                 offset);
+            tcg_out32(s, arg);
+        }
+    }
+}
+
 static void tcg_out_cmp(TCGContext *s, TCGArg arg1, TCGArg arg2,
                         BackendValType arg2_type, int rexw)
 {
@@ -1318,9 +1345,11 @@ static void tcg_out_cmp(TCGContext *s, TCGArg arg1, TCGArg arg2,
             /* test r, r */
             tcg_out_modrm(s, OPC_TESTL + rexw, arg1, arg1);
         } else {
+            /* cmp $arg2, %arg1 */
             tgen_arithi(s, ARITH_CMP + rexw, arg1, arg2, 0);
         }
     } else {
+        /* cmp %arg2, %arg1 */
         tgen_arithr(s, ARITH_CMP + rexw, arg1, arg2);
     }
 }
@@ -1934,21 +1963,25 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
     /* Signature of the helper to be called:
      *
-     * target_ulong
+     * void
      * helper_tlb_check_{ld, st}(CPUArchState *env, target_ulong addr,
      *                           TCGMemOpIdx oi, uintptr_t retaddr);  */
-    tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+    if (l->addr_type == BACKEND_REG) {
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+    } else {
+        tcg_debug_assert(l->addr_type == BACKEND_CONST);
+        tcg_out_movi(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+    }
     /* So as to avoid clobbering RDI when l->addr uses it.  */
     tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
     tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], oi);
     tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[3],
                  (uintptr_t) spl->raddr);
 
-    tcg_out_call(s, (tcg_insn_unit *) (oi == l->_oi ? helper_tlb_check_ld
-                                                    : helper_tlb_check_st));
-
-    tcg_out_mov(s, TCG_TYPE_TL, l->tag, TCG_REG_RAX);
-    tcg_out_jmp(s, spl->raddr);
+    /* "Tail call" to the helper, with the return address back inline.  */
+    tcg_out_push(s, tcg_target_call_iarg_regs[3]);
+    tcg_out_jmp(s, (tcg_insn_unit *) (oi == l->_oi ? helper_tlb_check_ld
+                                                   : helper_tlb_check_st));
     return true;
 }
 
@@ -1961,24 +1994,23 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
 #ifdef CONFIG_DEBUG_TCG
     TCGLabelGuard *l = spl->guard;
-    int rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
 
-    if (likely(l->a1 != tcg_target_call_iarg_regs[2])) {
-        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->a0);
-        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->a1);
-    } else if (l->a0 != tcg_target_call_iarg_regs[3]) {
-        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->a1);
-        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->a0);
+    if (likely(l->arg != tcg_target_call_iarg_regs[2])) {
+        tcg_out_ld(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->entry,
+                   l->offset);
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->arg);
     } else {
-        tcg_out_xchg(s, l->a0, l->a1, rexw);
+        tcg_out_ld(s, TCG_TYPE_TL, TCG_REG_RAX, l->entry, l->offset);
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[3], l->arg);
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], TCG_REG_RAX);
     }
 #endif
     tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
     tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
                  (uintptr_t) spl->raddr);
 
-    tcg_out_call(s, (tcg_insn_unit *) helper_guard_failure);
     /* Guard failure never returns.  */
+    tcg_out_jmp(s, (tcg_insn_unit *) helper_guard_failure);
     return true;
 }
 
@@ -2277,48 +2309,60 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is64)
 #endif
 }
 
-static void add_tlb_check_label(TCGContext *s, TCGMemOpIdx _oi, TCGReg tag,
-                                TCGReg addr, tcg_insn_unit *raddr,
-                                tcg_insn_unit *label_ptr)
+static void add_tlb_check_label(TCGContext *s, tcg_insn_unit *raddr,
+                                tcg_insn_unit *label_ptr, TCGArg addr,
+                                BackendValType addr_type, TCGMemOpIdx _oi)
 {
     TCGLabelTlbCheck *label = new_tlbck_label(s, raddr, label_ptr);
 
-    label->_oi = _oi;
-    label->tag = tag;
     label->addr = addr;
+    label->addr_type = addr_type;
+    label->_oi = _oi;
 }
 
-static void tcg_out_tlb_check(TCGContext *s, TCGArg tag, TCGArg tag2,
-                              BackendValType arg2_type, int rexw, TCGArg addr,
-                              TCGMemOpIdx _oi)
+static void tcg_out_tlb_check(TCGContext *s, TCGArg entry, TCGArg arg,
+                              TCGArg addr, const BackendValType *arg_types,
+                              int rexw, TCGMemOpIdx _oi)
 {
-    tcg_out_cmp(s, tag, tag2, arg2_type, rexw);
+    intptr_t offset = _oi & (MO_STORE << 4) ? offsetof(CPUTLBEntry, addr_write)
+                                            : offsetof(CPUTLBEntry, addr_read);
+
+    tcg_out_cmpm(s, entry, offset, arg, arg_types[1], rexw);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    add_tlb_check_label(s, _oi, tag, addr, s->code_ptr, s->code_ptr - 4);
+    add_tlb_check_label(s, s->code_ptr, s->code_ptr - 4, addr, arg_types[2],
+                        _oi);
 }
 
-static void add_guard_label(TCGContext *s, TCGReg a0, TCGReg a1,
-                            tcg_insn_unit *raddr, tcg_insn_unit *label_ptr)
+static void add_guard_label(TCGContext *s, tcg_insn_unit *raddr,
+                            tcg_insn_unit *label_ptr, TCGReg arg, TCGReg entry,
+                            intptr_t offset)
 {
     __attribute__((unused))
     TCGLabelGuard *label = new_guard_label(s, raddr, label_ptr);
 
 #ifdef CONFIG_DEBUG_TCG
-    label->a0 = a0;
-    label->a1 = a1;
+    label->arg = arg;
+    label->entry = entry;
+    label->offset = offset;
 #endif
 }
 
-static void tcg_out_guard(TCGContext *s, TCGArg tag, TCGArg tag2,
-                          BackendValType arg2_type, int rexw)
+static void tcg_out_guard(TCGContext *s, TCGArg entry, TCGArg arg,
+                          BackendValType arg_type, int rexw, TCGMemOpIdx _oi)
 {
-    tcg_out_cmp(s, tag, tag2, arg2_type, rexw);
+    intptr_t offset = _oi & (MO_STORE << 4) ? offsetof(CPUTLBEntry, addr_write)
+                                            : offsetof(CPUTLBEntry, addr_read);
+
+    tcg_out_cmpm(s, entry, offset, arg, arg_type, rexw);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    add_guard_label(s, tag, tag2, s->code_ptr, s->code_ptr - 4);
+#ifdef CONFIG_DEBUG_TCG
+    tcg_debug_assert(arg_type == BACKEND_REG);
+#endif
+    add_guard_label(s, s->code_ptr, s->code_ptr - 4, arg, entry, offset);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2698,10 +2742,10 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
 
     case INDEX_op_tlb_check:
         rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
-        tcg_out_tlb_check(s, a0, a1, arg_types[1], rexw, a2, args[3]);
+        tcg_out_tlb_check(s, a0, a1, a2, arg_types, rexw, args[3]);
         break;
     OP_32_64(guard):
-        tcg_out_guard(s, a0, a1, arg_types[1], rexw);
+        tcg_out_guard(s, a0, a1, arg_types[1], rexw, a2);
         break;
 #endif
 
@@ -3237,7 +3281,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_tlb_check:
         {
             static const TCGTargetOpDef tlb_check
-                = { .args_ct_str = { "r", "re", "r" } };
+                = { .args_ct_str = { "T", "re", "re" } };
             return &tlb_check;
         }
 
