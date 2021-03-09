@@ -1337,37 +1337,46 @@ static void tcg_out_cmpm(TCGContext *s, TCGArg base, intptr_t offset,
     }
 }
 
-static void tcg_out_cmp(TCGContext *s, TCGArg arg1, TCGArg arg2,
-                        BackendValType arg2_type, int rexw)
+static void tcg_out_cmp(TCGContext *s, TCGArg a0, TCGArg a1,
+                        const BackendValType *arg_types, int rexw)
 {
-    if (arg2_type == BACKEND_CONST) {
-        if (arg2 == 0) {
-            /* test r, r */
-            tcg_out_modrm(s, OPC_TESTL + rexw, arg1, arg1);
+    if (arg_types[0] == BACKEND_REG) {
+        if (arg_types[1] == BACKEND_CONST) {
+            if (a1 == 0) {
+                /* test r, r */
+                tcg_out_modrm(s, OPC_TESTL + rexw, a0, a0);
+            } else {
+                /* cmp $a1, %a0 */
+                tgen_arithi(s, ARITH_CMP + rexw, a0, a1, 0);
+            }
         } else {
-            /* cmp $arg2, %arg1 */
-            tgen_arithi(s, ARITH_CMP + rexw, arg1, arg2, 0);
+            tcg_debug_assert(arg_types[1] == BACKEND_REG);
+            /* cmp %a1, %a0 */
+            tgen_arithr(s, ARITH_CMP + rexw, a0, a1);
         }
     } else {
-        /* cmp %arg2, %arg1 */
-        tgen_arithr(s, ARITH_CMP + rexw, arg1, arg2);
+        tcg_debug_assert(arg_types[0] == BACKEND_MEMORY);
+        TCGTemp *ts = arg_temp(a0);
+        tcg_debug_assert(ts_val_type(ts->mem_base) == TEMP_VAL_REG);
+        tcg_out_cmpm(s, ts->mem_base->reg, ts->mem_offset, a1, arg_types[1],
+                     rexw);
     }
 }
 
 static void tcg_out_brcond32(TCGContext *s, TCGCond cond, TCGArg arg1,
-                             TCGArg arg2, BackendValType arg2_type,
+                             TCGArg arg2, const BackendValType *arg_types,
                              TCGLabel *label, int small)
 {
-    tcg_out_cmp(s, arg1, arg2, arg2_type, 0);
+    tcg_out_cmp(s, arg1, arg2, arg_types, 0);
     tcg_out_jxx(s, tcg_cond_to_jcc[cond], label, small);
 }
 
 #if TCG_TARGET_REG_BITS == 64
 static void tcg_out_brcond64(TCGContext *s, TCGCond cond, TCGArg arg1,
-                             TCGArg arg2, BackendValType arg2_type,
+                             TCGArg arg2, const BackendValType *arg_types,
                              TCGLabel *label, int small)
 {
-    tcg_out_cmp(s, arg1, arg2, arg2_type, P_REXW);
+    tcg_out_cmp(s, arg1, arg2, arg_types, P_REXW);
     tcg_out_jxx(s, tcg_cond_to_jcc[cond], label, small);
 }
 #else
@@ -1378,6 +1387,9 @@ static void tcg_out_brcond2(TCGContext *s, const TCGArg *args,
 {
     TCGLabel *label_next = gen_new_label();
     TCGLabel *label_this = arg_label(args[5]);
+
+    /* Not updated to use BACKEND_MEMORY.  */
+    g_assert_not_reached();
 
     switch(args[4]) {
     case TCG_COND_EQ:
@@ -1457,9 +1469,9 @@ static void tcg_out_brcond2(TCGContext *s, const TCGArg *args,
 
 static void tcg_out_setcond32(TCGContext *s, TCGCond cond, TCGArg dest,
                               TCGArg arg1, TCGArg arg2,
-                              BackendValType arg2_type)
+                              const BackendValType *arg_types)
 {
-    tcg_out_cmp(s, arg1, arg2, arg2_type, 0);
+    tcg_out_cmp(s, arg1, arg2, arg_types, 0);
     tcg_out_modrm(s, OPC_SETCC | tcg_cond_to_jcc[cond], 0, dest);
     tcg_out_ext8u(s, dest, dest, BACKEND_REG);
 }
@@ -1467,9 +1479,9 @@ static void tcg_out_setcond32(TCGContext *s, TCGCond cond, TCGArg dest,
 #if TCG_TARGET_REG_BITS == 64
 static void tcg_out_setcond64(TCGContext *s, TCGCond cond, TCGArg dest,
                               TCGArg arg1, TCGArg arg2,
-                              BackendValType arg2_type)
+                              const BackendValType *arg_types)
 {
-    tcg_out_cmp(s, arg1, arg2, arg2_type, P_REXW);
+    tcg_out_cmp(s, arg1, arg2, arg_types, P_REXW);
     tcg_out_modrm(s, OPC_SETCC | tcg_cond_to_jcc[cond], 0, dest);
     tcg_out_ext8u(s, dest, dest, BACKEND_REG);
 }
@@ -1479,6 +1491,9 @@ static void tcg_out_setcond2(TCGContext *s, const TCGArg *args,
 {
     TCGArg new_args[6];
     TCGLabel *label_true, *label_over;
+
+    /* Not updated to use BACKEND_MEMORY.  */
+    g_assert_not_reached();
 
     memcpy(new_args, args+1, 5*sizeof(TCGArg));
 
@@ -1531,19 +1546,21 @@ static void tcg_out_cmov(TCGContext *s, TCGCond cond, int rexw,
 }
 
 static void tcg_out_movcond32(TCGContext *s, TCGCond cond, TCGReg dest,
-                              TCGReg c1, TCGArg c2, BackendValType arg2_type,
+                              TCGArg c1, TCGArg c2,
+                              const BackendValType *arg_types,
                               TCGReg v1)
 {
-    tcg_out_cmp(s, c1, c2, arg2_type, 0);
+    tcg_out_cmp(s, c1, c2, arg_types, 0);
     tcg_out_cmov(s, cond, 0, dest, v1);
 }
 
 #if TCG_TARGET_REG_BITS == 64
 static void tcg_out_movcond64(TCGContext *s, TCGCond cond, TCGReg dest,
-                              TCGReg c1, TCGArg c2, BackendValType arg2_type,
+                              TCGArg c1, TCGArg c2,
+                              const BackendValType *arg_types,
                               TCGReg v1)
 {
-    tcg_out_cmp(s, c1, c2, arg2_type, P_REXW);
+    tcg_out_cmp(s, c1, c2, arg_types, P_REXW);
     tcg_out_cmov(s, cond, P_REXW, dest, v1);
 }
 #endif
@@ -1578,6 +1595,10 @@ static void tcg_out_clz(TCGContext *s, int rexw, TCGReg dest, TCGReg arg1,
             tcg_out_cmov(s, TCG_COND_LTU, rexw, dest, arg2);
         }
     } else {
+        const BackendValType arg_types[] = {
+            BACKEND_REG, BACKEND_CONST
+        };
+
         tcg_debug_assert(!const_a2);
         tcg_debug_assert(dest != arg1);
         tcg_debug_assert(dest != arg2);
@@ -1587,7 +1608,7 @@ static void tcg_out_clz(TCGContext *s, int rexw, TCGReg dest, TCGReg arg1,
         tgen_arithi(s, ARITH_XOR + rexw, dest, rexw ? 63 : 31, 0);
 
         /* Since we have destroyed the flags from BSR, we have to re-test.  */
-        tcg_out_cmp(s, arg1, 0, 1, rexw);
+        tcg_out_cmp(s, arg1, 0, arg_types, rexw);
         tcg_out_cmov(s, TCG_COND_EQ, rexw, dest, arg2);
     }
 }
@@ -2610,13 +2631,13 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
 
     case INDEX_op_brcond_i32:
-        tcg_out_brcond32(s, a2, a0, a1, arg_types[1], arg_label(args[3]), 0);
+        tcg_out_brcond32(s, a2, a0, a1, arg_types, arg_label(args[3]), 0);
         break;
     case INDEX_op_setcond_i32:
-        tcg_out_setcond32(s, args[3], a0, a1, a2, arg_types[2]);
+        tcg_out_setcond32(s, args[3], a0, a1, a2, &arg_types[1]);
         break;
     case INDEX_op_movcond_i32:
-        tcg_out_movcond32(s, args[5], a0, a1, a2, arg_types[2], args[3]);
+        tcg_out_movcond32(s, args[5], a0, a1, a2, &arg_types[1], args[3]);
         break;
 
     OP_32_64(bswap16):
@@ -2715,13 +2736,13 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
 
     case INDEX_op_brcond_i64:
-        tcg_out_brcond64(s, a2, a0, a1, arg_types[1], arg_label(args[3]), 0);
+        tcg_out_brcond64(s, a2, a0, a1, arg_types, arg_label(args[3]), 0);
         break;
     case INDEX_op_setcond_i64:
-        tcg_out_setcond64(s, args[3], a0, a1, a2, arg_types[2]);
+        tcg_out_setcond64(s, args[3], a0, a1, a2, &arg_types[1]);
         break;
     case INDEX_op_movcond_i64:
-        tcg_out_movcond64(s, args[5], a0, a1, a2, arg_types[2], args[3]);
+        tcg_out_movcond64(s, args[5], a0, a1, a2, &arg_types[1], args[3]);
         break;
 
     case INDEX_op_bswap64_i64:
@@ -3174,7 +3195,6 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     static const TCGTargetOpDef re_r = { .args_ct_str = { "re", "r" } };
     static const TCGTargetOpDef qi_r = { .args_ct_str = { "qi", "r" } };
     static const TCGTargetOpDef r_r = { .args_ct_str = { "r", "r" } };
-    static const TCGTargetOpDef r_re = { .args_ct_str = { "r", "re" } };
     static const TCGTargetOpDef r_0 = { .args_ct_str = { "r", "0" } };
     static const TCGTargetOpDef r_r_ri = { .args_ct_str = { "r", "r", "ri" } };
     static const TCGTargetOpDef r_r_re = { .args_ct_str = { "r", "r", "re" } };
@@ -3270,20 +3290,30 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_rotr_i64:
         return &r_0_ci;
 
-    case INDEX_op_guard_i32:
-    case INDEX_op_guard_i64:
-    #ifdef CONFIG_DEBUG_TCG
-        return &r_r;
-    #endif
     case INDEX_op_brcond_i32:
     case INDEX_op_brcond_i64:
-        return &r_re;
+        {
+            static const TCGTargetOpDef brcond
+                = { .args_ct_str = { "rm", "re" } };
+            return &brcond;
+        }
     case INDEX_op_tlb_check:
         {
             static const TCGTargetOpDef tlb_check
                 = { .args_ct_str = { "T", "re", "re" } };
             return &tlb_check;
         }
+    case INDEX_op_guard_i32:
+    case INDEX_op_guard_i64:
+    #ifdef CONFIG_DEBUG_TCG
+        return &r_r;
+    #else
+        {
+            static const TCGTargetOpDef guard
+                = { .args_ct_str = { "r", "re" } };
+            return &guard;
+        }
+    #endif
 
     case INDEX_op_bswap16_i32:
     case INDEX_op_bswap16_i64:
@@ -3341,14 +3371,14 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_setcond_i64:
         {
             static const TCGTargetOpDef setc
-                = { .args_ct_str = { "q", "r", "re" } };
+                = { .args_ct_str = { "q", "rm", "re" } };
             return &setc;
         }
     case INDEX_op_movcond_i32:
     case INDEX_op_movcond_i64:
         {
             static const TCGTargetOpDef movc
-                = { .args_ct_str = { "r", "r", "re", "r", "0" } };
+                = { .args_ct_str = { "r", "rm", "re", "r", "0" } };
             return &movc;
         }
     case INDEX_op_div2_i32:
