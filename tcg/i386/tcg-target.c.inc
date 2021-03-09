@@ -737,14 +737,37 @@ static inline void tcg_out_vex_modrm_pool(TCGContext *s, int opc, int r)
     tcg_out32(s, 0);
 }
 
+static inline TCGTemp *arg_mem_temp(TCGArg arg)
+{
+    TCGTemp *ts = arg_temp(arg);
+    tcg_debug_assert(ts_val_type(ts->mem_base) == TEMP_VAL_REG);
+    return ts;
+}
+
 /* Generate dest op= src.  Uses the same ARITH_* codes as tgen_arithi.  */
-static inline void tgen_arithr(TCGContext *s, int subop, int dest, int src)
+static inline void tgen_arithrm(TCGContext *s, int opc, TCGReg dst, TCGArg src,
+                                BackendValType src_type)
 {
     /* Propagate an opcode prefix, such as P_REXW.  */
-    int ext = subop & ~0x7;
-    subop &= 0x7;
+    int ext = opc & ~0x7;
 
-    tcg_out_modrm(s, OPC_ARITH_GvEv + (subop << 3) + ext, dest, src);
+    opc = OPC_ARITH_GvEv + ((opc & 0x7) << 3) + ext;
+    if (src_type == BACKEND_REG) {
+        tcg_out_modrm(s, opc, dst, src);
+    } else {
+        tcg_debug_assert(src_type == BACKEND_MEMORY);
+        TCGTemp *ts = arg_mem_temp(src);
+        tcg_out_modrm_offset(s, opc, dst, ts->mem_base->reg, ts->mem_offset);
+    }
+}
+
+static inline void tgen_arithr(TCGContext *s, int opc, TCGReg dst, TCGReg src)
+{
+    tgen_arithrm(s, opc, dst, src, BACKEND_REG);
+}
+static inline void tgen_arithm(TCGContext *s, int opc, TCGReg dst, TCGArg src)
+{
+    tgen_arithrm(s, opc, dst, src, BACKEND_MEMORY);
 }
 
 static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
@@ -1148,9 +1171,8 @@ static inline void tcg_out_ext(TCGContext *s, int opc, TCGArg dest, TCGArg src,
         }
         tcg_out_modrm(s, opc, dest, src);
     } else {
-        TCGTemp *ts = arg_temp(src);
         tcg_debug_assert(arg_type == BACKEND_MEMORY);
-        tcg_debug_assert(ts_val_type(ts->mem_base) == TEMP_VAL_REG);
+        TCGTemp *ts = arg_mem_temp(src);
         tcg_out_modrm_offset(s, opc, dest, ts->mem_base->reg, ts->mem_offset);
     }
 }
@@ -1356,8 +1378,7 @@ static void tcg_out_cmp(TCGContext *s, TCGArg a0, TCGArg a1,
         }
     } else {
         tcg_debug_assert(arg_types[0] == BACKEND_MEMORY);
-        TCGTemp *ts = arg_temp(a0);
-        tcg_debug_assert(ts_val_type(ts->mem_base) == TEMP_VAL_REG);
+        TCGTemp *ts = arg_mem_temp(a0);
         tcg_out_cmpm(s, ts->mem_base->reg, ts->mem_offset, a1, arg_types[1],
                      rexw);
     }
@@ -2519,13 +2540,6 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         c = ARITH_SUB;
         goto gen_arith;
     OP_32_64(and):
-        if (arg_types[2] == BACKEND_MEMORY) {
-            TCGTemp *ts = arg_temp(a2);
-            tcg_debug_assert(ts_val_type(ts->mem_base) == TEMP_VAL_REG);
-            tcg_out_modrm_offset(s, OPC_AND_GvEv + rexw, a0, ts->mem_base->reg,
-                                 ts->mem_offset);
-            break;
-        }
         c = ARITH_AND;
         goto gen_arith;
     OP_32_64(or):
@@ -2535,10 +2549,13 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         c = ARITH_XOR;
         goto gen_arith;
     gen_arith:
-        if (const_a2) {
+        if (arg_types[2] == BACKEND_CONST) {
             tgen_arithi(s, c + rexw, a0, a2, 0);
-        } else {
+        } else if (arg_types[2] == BACKEND_REG) {
             tgen_arithr(s, c + rexw, a0, a2);
+        } else {
+            tcg_debug_assert(arg_types[2] == BACKEND_MEMORY);
+            tgen_arithm(s, c + rexw, a0, a2);
         }
         break;
 
@@ -2552,18 +2569,22 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
 
     OP_32_64(mul):
-        if (const_a2) {
-            int32_t val;
-            val = a2;
-            if (val == (int8_t)val) {
+        if (arg_types[2] == BACKEND_CONST) {
+            if (a2 == (int8_t) a2) {
                 tcg_out_modrm(s, OPC_IMUL_GvEvIb + rexw, a0, a0);
-                tcg_out8(s, val);
+                tcg_out8(s, a2);
             } else {
+                tcg_debug_assert(a2 == (int32_t) a2);
                 tcg_out_modrm(s, OPC_IMUL_GvEvIz + rexw, a0, a0);
-                tcg_out32(s, val);
+                tcg_out32(s, a2);
             }
-        } else {
+        } else if (arg_types[2] == BACKEND_REG) {
             tcg_out_modrm(s, OPC_IMUL_GvEv + rexw, a0, a2);
+        } else {
+            tcg_debug_assert(arg_types[2] == BACKEND_MEMORY);
+            TCGTemp *ts = arg_mem_temp(a2);
+            tcg_out_modrm_offset(s, OPC_IMUL_GvEv + rexw, a0, ts->mem_base->reg,
+                                 ts->mem_offset);
         }
         break;
 
@@ -3199,7 +3220,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     static const TCGTargetOpDef r_r_ri = { .args_ct_str = { "r", "r", "ri" } };
     static const TCGTargetOpDef r_r_re = { .args_ct_str = { "r", "r", "re" } };
     static const TCGTargetOpDef r_0_r = { .args_ct_str = { "r", "0", "r" } };
-    static const TCGTargetOpDef r_0_re = { .args_ct_str = { "r", "0", "re" } };
+    static const TCGTargetOpDef r_0_rem = { .args_ct_str = { "r", "0", "rem" } };
     static const TCGTargetOpDef r_0_ci = { .args_ct_str = { "r", "0", "ci" } };
     static const TCGTargetOpDef r_L = { .args_ct_str = { "r", "L" } };
     static const TCGTargetOpDef L_L = { .args_ct_str = { "L", "L" } };
@@ -3258,7 +3279,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_or_i64:
     case INDEX_op_xor_i32:
     case INDEX_op_xor_i64:
-        return &r_0_re;
+        return &r_0_rem;
 
     case INDEX_op_and_i32:
     case INDEX_op_and_i64:
