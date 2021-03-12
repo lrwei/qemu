@@ -622,26 +622,41 @@ static inline void hash_combine(uint32_t *seed, uint32_t value)
     *seed ^= value + 0x9e3779b9 + (*seed << 6) + (*seed >> 2);
 }
 
+/* Coupled with the fact of there being at most 2 argument.  */
+QEMU_BUILD_BUG_ON(OPT_MAX_OPC_PARAM_IARGS != 2);
+
 /* Converts a VALUE to a 32-bit hash value.
  *
  * For simplicity, only operations with at most 2 input arguments
  * are numbered. Hopefully, this will include the majority of the
- * operations encountered in TCG.  */
+ * operations encountered in TCG, and also makes commutative hash
+ * simpler to implement.  */
 static guint tcg_op_hash(gconstpointer key)
 {
     const TCGOp *value = key;
     const TCGOpDef *def = &tcg_op_defs[value->opc];
-    uint32_t hash = value->numbers[0];
+    uint32_t hash;
 
     tcg_debug_assert(try_common_subexpression_elimination(def, NULL));
 
     if (def->nb_cargs > 0 || def->nb_iargs > 1) {
-        hash_combine(&hash, value->numbers[1]);
+        /* This makes hash function commutative EVEN FOR NON-COMMUTATIVE
+         * opcodes, but should results in unwanted confliction for only
+         * minority of the binary operations.  */
+        if (value->numbers[0] < value->numbers[1]) {
+            hash = (value->numbers[0] << 16) | value->numbers[1];
+        } else {
+            hash = (value->numbers[1] << 16) | value->numbers[0];
+        }
+    } else {
+        hash = value->numbers[0];
     }
     hash_combine(&hash, value->opc);
 
     return hash;
 }
+
+QEMU_BUILD_BUG_ON((TRUE != true) || (FALSE != false));
 
 /* Check that 2 VALUEs do equal.  */
 static gboolean tcg_op_equal(gconstpointer key, gconstpointer key2)
@@ -658,10 +673,28 @@ static gboolean tcg_op_equal(gconstpointer key, gconstpointer key2)
 
     for (i = 0; i < def->nb_iargs + def->nb_cargs; i++) {
         if (value->numbers[i] != value2->numbers[i]) {
-            return FALSE;
+            goto try_commutate;
         }
     }
     return TRUE;
+
+try_commutate:
+    switch (value->opc) {
+    CASE_OP_32_64(add):
+    CASE_OP_32_64(mul):
+    CASE_OP_32_64(and):
+    CASE_OP_32_64(or):
+    CASE_OP_32_64(xor):
+    CASE_OP_32_64(eqv):
+    CASE_OP_32_64(nand):
+    CASE_OP_32_64(nor):
+    CASE_OP_32_64(muluh):
+    CASE_OP_32_64(mulsh):
+        return (value->numbers[0] == value2->numbers[1]) &&
+               (value->numbers[1] == value2->numbers[0]);
+    default:
+        return FALSE;
+    }
 }
 
 void tcg_opt_vn_initialize(TCGContext *s)
