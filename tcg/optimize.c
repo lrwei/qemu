@@ -410,11 +410,11 @@ static TCGTemp *num2var(uint16_t number)
     return vne->canonical;
 }
 
-static bool value_has_constant_offset(TCGOp *value, uint64_t *poffset,
+static bool value_has_constant_offset(TCGOp *value, int64_t *poffset,
                                       bool check)
 {
     TCGTemp *ts;
-    uint64_t offset = 0;
+    int64_t offset = 0;
     bool found = false;
 
     if (check && (!value || value->opc != INDEX_op_add_tl)) {
@@ -440,7 +440,7 @@ done:
 static void tcg_opt_aggregate_offset(TCGOp *op)
 {
     TCGOp *value = arg_info(op->args[1])->value;
-    uint64_t offset, offset2;
+    int64_t offset, offset2;
 
     switch (op->opc) {
     CASE_OP_32_64(add):
@@ -504,7 +504,7 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
     TempOptInfo *info = ts_info(addr);
     TCGArg _base, _offset;
     ValueNumberingEntry *vne;
-    uint64_t offset, offset2;
+    int64_t offset, offset2;
     TCGOp *op2, *op3;
     BaseAddress *address;
 
@@ -612,7 +612,7 @@ static bool tcg_opt_extract_tag_finalize(TCGOp *op)
 static void tcg_opt_encode_offset(TCGOp *op)
 {
     TCGOp *value = arg_info(op->args[1])->value;
-    uint64_t offset;
+    int64_t offset;
 
     if (unlikely(op->args[2] != 0)) {
         return;
