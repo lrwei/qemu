@@ -68,17 +68,39 @@ static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i64;
 #define OPT_MAX_OPC_PARAM_IARGS ARRAY_SIZE(((TCGOp *) 0)->numbers)
 
 typedef struct TempOptInfo {
-    uint64_t mask;
     TCGOp *value;
+
+    /*
+     * One-off informations.
+     */
+    uint64_t mask;
+    /* Used by REASSOCIATE_ADDRESS, EXTRACT_TAG, and TLB_CHECK.  */
     bool reassociated;
+
+    /* Value-number of THE BASE ADDRESS.  */
+    uint16_t number_of_the_base_address;
+    /* Offset with respect to THE BASE ADDRESS.  */
     int64_t offset;
+    /* For example: base_address = sp - 16, address = sp - 8, then:
+     * .number_of_the_base_address = ts_number(base_address), .offset = +8  */
 } TempOptInfo;
+
+typedef struct BaseAddress {
+    QSLIST_ENTRY(BaseAddress) next;
+
+    /* Value-number of THIS ADDRESS.  */
+    uint16_t number_of_this_address;
+    /* Offset with respect to the base VALUE.  */
+    int64_t offset;
+    /* For example: base_address = sp - 16, then:
+     * .number_of_this_address = ts_number(base_address), .offset = -16  */
+} BaseAddress;
 
 typedef struct ValueNumberingEntry {
     TCGTemp *canonical;
-    TCGOp *redef_op;
     TempOptInfo *info;
-    uint16_t the_address;
+    TCGOp *redef_op;
+    QSLIST_HEAD(, BaseAddress) base_addresses;
 } ValueNumberingEntry;
 
 static inline bool ts_is_initialized(TCGTemp *ts)
@@ -171,6 +193,9 @@ static void tcg_opt_number_value(GArray *num2value, TCGTemp *ts)
         .info = ts->state_ptr,
     };
 
+    /* List head should be automatically initialized.  */
+    tcg_debug_assert(QSLIST_EMPTY(&vne.base_addresses));
+
     /* VALUE numbered N actually uses entrys[N - 1], see also num2vne().  */
     g_array_append_val(num2value, vne);
     ts_set_number(ts, num2value->len);
@@ -212,6 +237,7 @@ static void init_ts_info(TCGTemp *ts, TCGOp *def_op)
         info->mask = -1;
     }
     info->value = NULL;
+    info->reassociated = false;
 
     tcg_opt_number_value(tcg_ctx->num2value, ts);
 }
@@ -384,24 +410,31 @@ static TCGTemp *num2var(uint16_t number)
     return vne->canonical;
 }
 
-static bool value_has_constant_offset(TCGOp *value, uint64_t *offset,
+static bool value_has_constant_offset(TCGOp *value, uint64_t *poffset,
                                       bool check)
 {
     TCGTemp *ts;
+    uint64_t offset = 0;
+    bool found = false;
 
     if (check && (!value || value->opc != INDEX_op_add_tl)) {
-        return false;
+        goto done;
     }
 
     /* Hack: .canonical fields of constant temporaries are
      * always valid, and is never going to change.  */
     ts = num2vne(value->numbers[1])->canonical;
     if (!ts_is_const(ts)) {
-        return false;
-    } else {
-        *offset = ts_value(ts);
-        return true;
+        goto done;
     }
+    offset = ts_value(ts);
+    found = true;
+
+done:
+    if (poffset) {
+        *poffset = offset;
+    }
+    return found;
 }
 
 static void tcg_opt_aggregate_offset(TCGOp *op)
@@ -452,7 +485,19 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     op->args[2] = tcg_opt_constant_new(arg_temp(op->args[1])->type, offset);
 }
 
-#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 3))
+/* Allocate a new base ADDRESS, whose OFFSET on VALUE `num2value(number)`
+ * is `offset`.  */
+static void tcg_opt_base_address_new(uint16_t number_of_this_address,
+                                     int64_t offset, ValueNumberingEntry *vne)
+{
+    BaseAddress *address = tcg_malloc(sizeof(BaseAddress));
+
+    address->number_of_this_address = number_of_this_address;
+    address->offset = offset;
+    QSLIST_INSERT_HEAD(&vne->base_addresses, address, next);
+}
+
+#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 2))
 static void tcg_opt_reassociate_address_finalize(TCGOp *op)
 {
     TCGTemp *addr = arg_temp(op->args[2]);
@@ -461,36 +506,48 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
     ValueNumberingEntry *vne;
     uint64_t offset, offset2;
     TCGOp *op2, *op3;
+    BaseAddress *address;
+
+    if (info->reassociated) {
+        goto found;
+    }
 
     if (ts_is_const(addr)) {
-        /* Constant address ignored for the time being.  */
-        goto not_found;
+        uint64_t page_addr = ts_value(addr) & TARGET_PAGE_MASK;
+        TCGTemp *artificial_base = arg_temp(tcg_opt_constant_new(TCG_TYPE_TL,
+                                                                 page_addr));
+        vne = num2vne(ts_number(artificial_base));
+        offset = ts_value(addr) & ~TARGET_PAGE_MASK;
     } else if (!value_has_constant_offset(info->value, &offset, true)) {
         /* Non-constant offset ignored for the time being.  */
         vne = num2vne(ts_number(addr));
-        offset = 0;
+        tcg_debug_assert(offset == 0);
     } else {
         vne = num2vne(info->value->numbers[0]);
     }
 
-    if (vne->the_address != 0) {
-        _base = temp_arg(num2var(vne->the_address));
-        if (value_has_constant_offset(arg_info(_base)->value, &offset2, true)) {
-            offset -= offset2;
+    /* Scan through the existing addresses to find a possible base. List
+     * heads should have been initialized in tcg_opt_number_value.  */
+    QSLIST_FOREACH(address, &vne->base_addresses, next) {
+        /* Calculate `addr`'s offset with respect to `address`.  */
+        offset2 = offset - address->offset;
+        if (llabs(offset2) <= SPECULATION_THRESHOLD || ts_is_const(addr)) {
+            info->reassociated = true;
+            info->number_of_the_base_address = address->number_of_this_address;
+            info->offset = offset2;
+            goto found;
         }
-        if (unlikely(llabs(offset) > SPECULATION_THRESHOLD)) {
-            goto not_found;
-        }
-        info->reassociated = true;
-        info->offset = offset;
-    } else {
-        vne->the_address = ts_number(addr);
-    not_found:
-        _base = temp_arg(addr);
-        offset = 0;
-        info->reassociated = false;
     }
-    _offset = tcg_opt_constant_new(TCG_TYPE_TL, offset);
+
+    /* Not found, register `addr` itself as a new base address.  */
+    tcg_opt_base_address_new(ts_number(addr), offset, vne);
+    info->reassociated = false;
+    info->number_of_the_base_address = ts_number(addr);
+    info->offset = 0;
+
+found:
+    _base = temp_arg(num2var(info->number_of_the_base_address));
+    _offset = tcg_opt_constant_new(TCG_TYPE_TL, info->offset);
 
     /* ts_set_number() must be called through tcg_opt_gen_mov(), as
      * temporaries `base` and `offset` maybe canonical variables.  */
