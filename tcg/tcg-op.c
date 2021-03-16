@@ -2809,22 +2809,23 @@ static inline void plugin_gen_mem_callbacks(TCGv vaddr, uint16_t info)
 }
 
 static inline void _tcg_gen_reassociate_address(TCGv base, TCGv offset,
-                                                TCGv addr)
+                                                TCGv addr, uint8_t idx)
 {
 #if TARGET_LONG_BITS == 32
-    tcg_gen_op3_i32(INDEX_op_reassociate_address, base, offset, addr);
+    tcg_gen_op4i_i32(INDEX_op_reassociate_address, base, offset, addr, idx);
 #else
-    tcg_gen_op3_i64(INDEX_op_reassociate_address, base, offset, addr);
+    tcg_gen_op4i_i64(INDEX_op_reassociate_address, base, offset, addr, idx);
 #endif
 }
 
-static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv addr)
+static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset,
+                                        TCGv addr, uint8_t idx)
 {
 #if TARGET_LONG_BITS < TCG_TARGET_REG_BITS
     TCGv_i32 _base = tcg_temp_new_i32();
     TCGv_i32 _offset = tcg_temp_new_i32();
 
-    _tcg_gen_reassociate_address(_base, _offset, addr);
+    _tcg_gen_reassociate_address(_base, _offset, addr, idx);
     /* Hack:
      * `addr == _base + _offset` holds by definition, but applying
      * `ext[u]_i32_i64` to each term may render it, and therfore
@@ -2839,7 +2840,7 @@ static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset, TCGv add
     tcg_temp_free_i32(_base);
     tcg_temp_free_i32(_offset);
 #elif TARGET_LONG_BITS == TCG_TARGET_REG_BITS
-    _tcg_gen_reassociate_address((TCGv) base, (TCGv) offset, addr);
+    _tcg_gen_reassociate_address((TCGv) base, (TCGv) offset, addr, idx);
 #else
     /* Oversized-access is not supported.  */
     g_assert_not_reached();
@@ -2870,7 +2871,7 @@ static inline void _tcg_gen_tlb_check(TCGv_ptr tlb_entry, TCGv tag, TCGv addr,
                 (TCGArg) _oi);
 }
 
-static inline TCGMemOpIdx _make_memop_idx(MemOp memop, uint32_t idx,
+static inline TCGMemOpIdx _make_memop_idx(MemOp memop, uint8_t idx,
                                           bool is_load)
 {
     memop |= is_load ? 0 : MO_STORE;
@@ -2904,7 +2905,7 @@ static void tcg_gen_translate_address(TCGv_ptr _addr, TCGv addr, MemOp memop,
      * here is relative to some previous guest access, and is not the
      * straight-forward constant offset relative to some non-constant
      * temporary.  */
-    tcg_gen_reassociate_address(base, offset, addr);
+    tcg_gen_reassociate_address(base, offset, addr, mem_index);
 
     /* Calculate page number and scale by factor of `sizeof(CPUTLBEntry)`.  */
     tcg_gen_shri_ptr(_index, base, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);

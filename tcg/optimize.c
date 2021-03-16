@@ -92,6 +92,8 @@ typedef struct BaseAddress {
 
     /* Value-number of THIS ADDRESS.  */
     uint16_t number_of_this_address;
+    /* Record to prevent associating memory access with different TLB index.  */
+    uint8_t mem_index;
     /* Offset with respect to the base VALUE.  */
     int64_t offset;
     /* For example: base_address = sp - 16, then:
@@ -494,11 +496,13 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
 /* Allocate a new base ADDRESS, whose OFFSET on VALUE `num2value(number)`
  * is `offset`.  */
 static void tcg_opt_base_address_new(uint16_t number_of_this_address,
-                                     int64_t offset, ValueNumberingEntry *vne)
+                                     uint8_t mem_index, int64_t offset,
+                                     ValueNumberingEntry *vne)
 {
     BaseAddress *address = tcg_malloc(sizeof(BaseAddress));
 
     address->number_of_this_address = number_of_this_address;
+    address->mem_index = mem_index;
     address->offset = offset;
     QSLIST_INSERT_HEAD(&vne->base_addresses, address, next);
 }
@@ -538,6 +542,12 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
         /* Calculate `addr`'s offset with respect to `address`.  */
         offset2 = offset - address->offset;
         if (llabs(offset2) <= SPECULATION_THRESHOLD || ts_is_const(addr)) {
+            /* Prevent associating memory access with different TLB index,
+             * e.g. user and kernel access to the same address, IF ANY.  */
+            if (unlikely(op->args[3] != address->mem_index)) {
+                g_assert_not_reached();
+                continue;
+            }
             info->reassociated = true;
             info->number_of_the_base_address = address->number_of_this_address;
             info->offset = offset2;
@@ -546,7 +556,7 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
     }
 
     /* Not found, register `addr` itself as a new base address.  */
-    tcg_opt_base_address_new(ts_number(addr), offset, vne);
+    tcg_opt_base_address_new(ts_number(addr), op->args[3], offset, vne);
     info->reassociated = false;
     info->number_of_the_base_address = ts_number(addr);
     info->offset = 0;
