@@ -46,10 +46,12 @@
 static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i32;
 static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i32;
 static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i32;
+static const TCGOpcode INDEX_op_guard_tl = INDEX_op_guard_i32;
 #else
 static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i64;
 static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i64;
 static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i64;
+static const TCGOpcode INDEX_op_guard_tl = INDEX_op_guard_i64;
 #endif
 
 /* Illustration on data structures used in local value numbering algorithm:
@@ -100,7 +102,10 @@ typedef struct ValueNumberingEntry {
     TCGTemp *canonical;
     TempOptInfo *info;
     TCGOp *redef_op;
-    QSLIST_HEAD(, BaseAddress) base_addresses;
+    union {
+        QSLIST_HEAD(, BaseAddress) base_addresses;
+        void *state_ptr;
+    };
 } ValueNumberingEntry;
 
 static inline bool ts_is_initialized(TCGTemp *ts)
@@ -183,6 +188,7 @@ static inline ValueNumberingEntry *num2vne(uint16_t number)
 {
     /* Zero is used to indicate uninitialized variable.  */
     tcg_debug_assert(number != 0);
+    tcg_debug_assert(number <= tcg_ctx->num2value->len);
     return &g_array_index(tcg_ctx->num2value, ValueNumberingEntry, number - 1);
 }
 
@@ -607,6 +613,71 @@ static bool tcg_opt_extract_tag_finalize(TCGOp *op)
     op->opc = INDEX_op_and_tl;
     op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK | a_mask);
     return rewind_needed;
+}
+
+/* Lump of random logic that is failed to be named properly. Aims
+ * at pulling out several things by traversing backward the value
+ * use-define relationship, including:
+ * 1. The constant OFFSET behind the TAG -- used by TLB_CHECK or
+ *    GUARD -- which is calculated by masking either an addition
+ *    with a constant offset or just a plain address.
+ * 2. The value-number of the BASE to which previously mentioned
+ *    ADDITION is made.
+ * 3. The MASK used to calculate the TAG.  */
+static uint16_t value_aa_constant_offset(TCGOp *op, int64_t *poffset,
+                                         int64_t *pmask)
+{
+    TCGOp *value_and, *value_add;
+
+    tcg_debug_assert(op->opc == INDEX_op_tlb_check ||
+                     op->opc == INDEX_op_guard_tl);
+
+    /* {TLB_CHECK, GUARD}    entry, TAG, ...  */
+    value_and = num2vne(op->numbers[1])->info->value;
+    /* This TAG should be calculated by AND_TL operation, and should
+     * not be a constant for the time being.  */
+    tcg_debug_assert(value_and);
+    tcg_debug_assert(value_and->opc == INDEX_op_and_tl);
+    if (pmask) {
+        /* Abuse to get the mask used by the guard.  */
+        tcg_debug_assert(value_has_constant_offset(value_and, pmask, false));
+    }
+
+    /* AND_TL    tag, PADDED_ADDR, mask  */
+    value_add = num2vne(value_and->numbers[0])->info->value;
+    /* Padded by ADD_TL or just plain address.  */
+    if (value_has_constant_offset(value_add, poffset, true)) {
+        return value_add->numbers[0];
+    } else {
+        return value_and->numbers[0];
+    }
+}
+
+static void tcg_opt_tlb_check_finalize(TCGOp *op)
+{
+    op->numbers[0] = ts_number(arg_temp(op->args[0]));
+    op->numbers[1] = ts_number(arg_temp(op->args[1]));
+
+    if (arg_info(op->args[2])->reassociated) {
+        op->opc = INDEX_op_guard_tl;
+        /* From: tlb_check entry, tag, addr, _oi
+         * To:   guard     entry, tag, _oi  */
+        op->args[2] = op->args[3];
+    } else if (arg_temp(op->args[2])->kind != TEMP_CONST) {
+        /* Unutterably disgraceful and extremely stupid hack, only to make sure
+         * BASE of the access can be found in future guard hoisting pass. Again,
+         * this is because we don't have SSA-form of IR.  */
+        TCGTemp *base = num2var(value_aa_constant_offset(op, NULL, NULL));
+        const TCGOpDef *def = &tcg_op_defs[INDEX_op_tlb_check];
+
+        tcg_debug_assert(def->nb_args == 4);
+        /* Abuse these empty slots to store information to be used by further
+         * guard optimization pass. Really UGLY.  */
+        op->args[4] = temp_arg(base);
+        op->args[5] = ts_number(base);
+    } else {
+        /* Constant address ignored for the time being.  */
+    }
 }
 
 static void tcg_opt_encode_offset(TCGOp *op)
@@ -1117,7 +1188,7 @@ static bool swap_commutative2(TCGArg *p1, TCGArg *p2)
     return false;
 }
 
-void tcg_optimize(TCGContext *s)
+static void tcg_opt_value_numbering(TCGContext *s)
 {
     TCGOp *op, *op_next, *prev_mb = NULL;
     size_t i;
@@ -1166,18 +1237,12 @@ void tcg_optimize(TCGContext *s)
                 op_next = QTAILQ_PREV(op, link);
                 continue;
             }
+            /* Reload `opc` and `def` since the op has been rewritten.  */
             opc = op->opc;
+            def = &tcg_op_defs[opc];
             break;
         case INDEX_op_tlb_check:
-            if (arg_info(op->args[2])->reassociated) {
-                op->opc = TARGET_LONG_BITS == 32 ? INDEX_op_guard_i32
-                                                 : INDEX_op_guard_i64;
-                /* From: tlb_check entry, tag, addr, _oi
-                 * To:   guard     entry, tag, _oi  */
-                op->args[2] = op->args[3];
-            }
-            op->numbers[0] = ts_number(arg_temp(op->args[0]));
-            op->numbers[1] = ts_number(arg_temp(op->args[1]));
+            tcg_opt_tlb_check_finalize(op);
             continue;
         CASE_OP_32_64(ld8u):
         CASE_OP_32_64(ld8s):
@@ -2108,4 +2173,196 @@ done_algebraic_simplifying_and_constant_folding:
             prev_mb = op;
         }
     }
+}
+
+typedef struct GuardHoistingInfo {
+    TCGOp *op;
+    int64_t initial_offset;
+    int64_t offset_max;
+    int64_t offset_min;
+    bool has_load;
+    bool has_store;
+} GuardHoistingInfo;
+
+static inline GuardHoistingInfo *vne_guard_info(ValueNumberingEntry *vne)
+{
+    return vne->state_ptr;
+}
+
+static inline void vne_set_guard_info(ValueNumberingEntry *vne,
+                                      GuardHoistingInfo *info)
+{
+    vne->state_ptr = info;
+}
+
+static void init_vne_guard_info(ValueNumberingEntry *vne, TCGOp *op)
+{
+    GuardHoistingInfo *info = tcg_malloc(sizeof(GuardHoistingInfo));
+
+    tcg_debug_assert(op->opc == INDEX_op_tlb_check);
+    tcg_debug_assert(!vne_guard_info(vne));
+
+    /* After which further guards are to be inserted.  */
+    info->op = op;
+
+    /* Record the offset checked by TLB_CHECK itself. See
+     * tcg_opt_tlb_check_finalize for these args[5] hacks.  */
+    tcg_debug_assert(value_aa_constant_offset(op, &info->initial_offset, NULL)
+                     == op->args[5]);
+    info->offset_min = info->offset_max = info->initial_offset;
+
+    info->has_load = info->has_store = false;
+    vne_set_guard_info(vne, info);
+}
+
+static inline GuardHoistingInfo *op_guard_info(TCGOp *op)
+{
+    ValueNumberingEntry *vne = num2vne(op->numbers[0]);
+    GuardHoistingInfo *info;
+
+    /* Constant address ignored for the time being.  */
+    if (arg_temp(op->args[1])->kind == TEMP_CONST) {
+        return NULL;
+    }
+
+    switch (op->opc) {
+    case INDEX_op_tlb_check:
+        init_vne_guard_info(vne, op);
+        break;
+    CASE_OP_32_64(guard):
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    tcg_debug_assert((info = vne_guard_info(vne)));
+    return info;
+}
+
+static void tcg_opt_insert_guard_after(TCGOp *op, int64_t offset)
+{
+    TCGArg arg = temp_arg(tcg_opt_temp_new(TCG_TYPE_TL)), padded_addr;
+    TCGOp *add, *and, *guard;
+
+    if (likely(offset != 0)) {
+        add = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_tl);
+        add->args[0] = padded_addr = arg;
+        add->args[1] = op->args[4];
+        add->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, offset);
+    } else {
+        /* Algebraic simplification and copy propagation, manually.  */
+        add = op;
+        padded_addr = op->args[4];
+    }
+
+    and = tcg_op_insert_after(tcg_ctx, add, INDEX_op_and_tl);
+    and->args[0] = arg;
+    and->args[1] = padded_addr;
+    and->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK);
+
+    guard = tcg_op_insert_after(tcg_ctx, and, INDEX_op_guard_tl);
+    guard->args[0] = op->args[0];
+    guard->args[1] = arg;
+    guard->args[2] = op->args[3];
+}
+
+static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
+{
+    tcg_debug_assert(!(info->has_load && info->has_store));
+
+    if (info->offset_max > info->initial_offset) {
+        tcg_opt_insert_guard_after(info->op, info->offset_max);
+    }
+
+    if (info->offset_min < info->initial_offset) {
+        tcg_opt_insert_guard_after(info->op, info->offset_min);
+    }
+}
+
+static void tcg_opt_guard_hoisting(TCGContext *s)
+{
+    TCGOp *op, *op_next, *prev_reassociate = NULL;
+    GuardHoistingInfo *info;
+    size_t i;
+    int64_t offset, mask;
+    TCGMemOpIdx _oi;
+
+    for (i = 1; i <= s->num2value->len; i++) {
+        vne_set_guard_info(num2vne(i), NULL);
+    }
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, op_next) {
+        switch (op->opc) {
+        case INDEX_op_reassociate_address:
+            prev_reassociate = op;
+            break;
+        case INDEX_op_tlb_check:
+            if (!(info = op_guard_info(op))) {
+                break;
+            }
+            _oi = op->args[3];
+            goto is_load_or_store;
+        CASE_OP_32_64(guard):
+            if (!(info = op_guard_info(op))) {
+                break;
+            }
+
+            /* BASE used by TLB_CHECK and corresponding GUARDs should be the
+             * same. However, as we do NOT have SSA to work on, this can not
+             * be checked by directly comparing TCGTemps used in each guard.
+             * See tcg_opt_tlb_check_finalize() for this SHIT.  */
+            tcg_debug_assert(value_aa_constant_offset(op, &offset, &mask)
+                             == info->op->args[5]);
+
+            if (mask != TARGET_PAGE_MASK) {
+                /* The guard also requires certain kinds of alignment,
+                 * skip to keep implementation simple.  */
+                continue;
+            }
+
+            if (offset < info->offset_min) {
+                info->offset_min = offset;
+            } else if (offset > info->offset_max) {
+                info->offset_max = offset;
+            }
+
+            _oi = op->args[2];
+
+            /* Record either load or store ONLY for a base address,
+             * for the time being.  */
+            if (((_oi & (MO_STORE << 4)) && info->has_load) ||
+                (!(_oi & (MO_STORE << 4)) && info->has_store))
+            {
+                break;
+            }
+
+            /* Remove encountered GUARD and REASSOCIATION operation.  */
+            tcg_op_remove(s, prev_reassociate);
+            tcg_op_remove(s, op);
+
+        is_load_or_store:
+            if (_oi & (MO_STORE << 4)) {
+                info->has_store = true;
+            } else {
+                info->has_load = true;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* Hoist removed GUARDs to the corresponding TLB_CHECK.  */
+    for (i = 1; i <= s->num2value->len; i++) {
+        if (!(info = vne_guard_info(num2vne(i)))) {
+            continue;
+        }
+        tcg_opt_do_guard_hoisting(info);
+    }
+}
+
+void tcg_optimize(TCGContext *s)
+{
+    tcg_opt_value_numbering(s);
+    tcg_opt_guard_hoisting(s);
 }
