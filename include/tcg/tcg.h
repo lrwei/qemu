@@ -565,7 +565,8 @@ typedef struct TCGOp {
     unsigned life   : 16;       /* 32 */
 
     /* Value number or (signed) constant of inputs. Operations with
-     * more than 2 input arguments will not numbered.  */
+     * more than 2 input arguments will not numbered. Zeroed at op
+     * initialization to catch uninitialized use of value numbers.  */
     uint16_t numbers[2];        /* 64 */
 
     /* Next and previous opcodes.  */

@@ -2187,7 +2187,7 @@ done_algebraic_simplifying_and_constant_folding:
 
 typedef struct GuardHoistingInfo {
     TCGOp *op;
-    int64_t initial_offset;
+    int64_t offset_initial;
     int64_t offset_max;
     int64_t offset_min;
     bool has_load;
@@ -2217,9 +2217,9 @@ static void init_vne_guard_info(ValueNumberingEntry *vne, TCGOp *op)
 
     /* Record the offset checked by TLB_CHECK itself. See
      * tcg_opt_tlb_check_finalize for these args[5] hacks.  */
-    tcg_debug_assert(value_aa_constant_offset(op, &info->initial_offset, NULL)
+    tcg_debug_assert(value_aa_constant_offset(op, &info->offset_initial, NULL)
                      == op->args[5]);
-    info->offset_min = info->offset_max = info->initial_offset;
+    info->offset_min = info->offset_max = info->offset_initial;
 
     info->has_load = info->has_store = false;
     vne_set_guard_info(vne, info);
@@ -2249,11 +2249,15 @@ static inline GuardHoistingInfo *op_guard_info(TCGOp *op)
     return info;
 }
 
-static void tcg_opt_insert_guard_after(TCGOp *op, int64_t offset)
+/* Insert GUARD as well as other necessary ops to calculate TAG needed by GUARD,
+ * after the corresponding TLB_CHECK op. Note that all op inserted here are not
+ * numbered, and may therefore introduce common subexpressions. What a pity.  */
+static void tcg_opt_insert_guard_after(TCGOp *op, int64_t offset, TCGArg _oi)
 {
     TCGArg arg = temp_arg(tcg_opt_temp_new(TCG_TYPE_TL)), padded_addr;
     TCGOp *add, *and, *guard;
 
+    /* op->args[4] (i.e. BASE) is guaranteed to be available here.  */
     if (likely(offset != 0)) {
         add = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_tl);
         add->args[0] = padded_addr = arg;
@@ -2273,19 +2277,59 @@ static void tcg_opt_insert_guard_after(TCGOp *op, int64_t offset)
     guard = tcg_op_insert_after(tcg_ctx, and, INDEX_op_guard_tl);
     guard->args[0] = op->args[0];
     guard->args[1] = arg;
-    guard->args[2] = op->args[3];
+    guard->args[2] = _oi;
 }
 
 static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
 {
-    tcg_debug_assert(!(info->has_load && info->has_store));
+    TCGOp *op = info->op;
+    TCGMemOpIdx _oi = op->args[3];
+    /* For GUARD, the only meaningful part of `_oi` is the _MO_STORE bit.  */
+    TCGMemOpIdx _oi_inversed = _oi ^ (MO_STORE << 4);
 
-    if (info->offset_max > info->initial_offset) {
-        tcg_opt_insert_guard_after(info->op, info->offset_max);
-    }
+    if (!(info->has_load && info->has_store)) {
+        /* Only load (store) are associated with the base address,
+         * one needs to check:
+         *   1. both of the accesses fall on the same page
+         * This can be achieved by checking the both lower and the upper
+         * bound (if necessary) of the collected accesses, using _oi in
+         * corresponding TLB_CHECK.  */
+        tcg_debug_assert(info->has_load || info->has_store);
+        if (info->offset_max > info->offset_initial) {
+            tcg_opt_insert_guard_after(op, info->offset_max, _oi);
+        }
+        if (info->offset_min < info->offset_initial) {
+            tcg_opt_insert_guard_after(op, info->offset_min, _oi);
+        }
+    } else {
+        /* This implies neither `offset_max` nor `offset_min` has ever
+         * been changed, and therefore must equal to `offset_initial`.  */
+        if (info->offset_max == info->offset_min) {
+            TCGOp *guard = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guard_tl);
 
-    if (info->offset_min < info->initial_offset) {
-        tcg_opt_insert_guard_after(info->op, info->offset_min);
+            guard->args[0] = op->args[0];
+            /* Common subexpression elimination, manually. op->args[1]
+             * (i.e. TAG) is guaranteed to be available here.  */
+            guard->args[1] = op->args[1];
+            guard->args[2] = _oi_inversed;
+
+        /* Both load and store are associated with the base address,
+         * one needs to check:
+         *   1. both of the accesses fall on the same page, and
+         *   2. the page is both readable and writable
+         * As with the case of checking for load or store only, we emit
+         * GUARDs to check both of the bounds of the collected accesses,
+         * but using both the original _oi and the inversed version.
+         * The above conditions hold iff all these GUARDs get passed.  */
+        } else if (info->offset_max > info->offset_initial &&
+                   info->offset_min < info->offset_initial) {
+            tcg_opt_insert_guard_after(op, info->offset_max, _oi);
+            tcg_opt_insert_guard_after(op, info->offset_min, _oi_inversed);
+        } else if (info->offset_max > info->offset_initial) {
+            tcg_opt_insert_guard_after(op, info->offset_max, _oi_inversed);
+        } else {
+            tcg_opt_insert_guard_after(op, info->offset_min, _oi_inversed);
+        }
     }
 }
 
@@ -2337,14 +2381,6 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
             }
 
             _oi = op->args[2];
-
-            /* Record either load or store ONLY for a base address,
-             * for the time being.  */
-            if (((_oi & (MO_STORE << 4)) && info->has_load) ||
-                (!(_oi & (MO_STORE << 4)) && info->has_store))
-            {
-                break;
-            }
 
             /* Remove encountered GUARD and REASSOCIATION operation.  */
             tcg_op_remove(s, prev_reassociate);
