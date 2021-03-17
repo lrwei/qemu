@@ -2285,7 +2285,7 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
     TCGOp *op = info->op;
     TCGMemOpIdx _oi = op->args[3];
     /* For GUARD, the only meaningful part of `_oi` is the _MO_STORE bit.  */
-    TCGMemOpIdx _oi_inversed = _oi ^ (MO_STORE << 4);
+    TCGMemOpIdx _oi_inversed = _oi ^ _MO_STORE;
 
     if (!(info->has_load && info->has_store)) {
         /* Only load (store) are associated with the base address,
@@ -2387,7 +2387,7 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
             tcg_op_remove(s, op);
 
         is_load_or_store:
-            if (_oi & (MO_STORE << 4)) {
+            if (_oi & _MO_STORE) {
                 info->has_store = true;
             } else {
                 info->has_load = true;

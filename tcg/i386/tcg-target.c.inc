@@ -1996,7 +1996,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     TCGLabelTlbCheck *l = spl->tlbck;
-    TCGMemOpIdx oi = l->_oi & ~(MO_STORE << 4);
+    TCGMemOpIdx oi = l->_oi & ~_MO_STORE;
 
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
@@ -2366,8 +2366,8 @@ static void tcg_out_tlb_check(TCGContext *s, TCGArg entry, TCGArg arg,
                               TCGArg addr, const BackendValType *arg_types,
                               int rexw, TCGMemOpIdx _oi)
 {
-    intptr_t offset = _oi & (MO_STORE << 4) ? offsetof(CPUTLBEntry, addr_write)
-                                            : offsetof(CPUTLBEntry, addr_read);
+    intptr_t offset = _oi & _MO_STORE ? offsetof(CPUTLBEntry, addr_write)
+                                      : offsetof(CPUTLBEntry, addr_read);
 
     tcg_out_cmpm(s, entry, offset, arg, arg_types[1], rexw);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
@@ -2394,8 +2394,8 @@ static void add_guard_label(TCGContext *s, tcg_insn_unit *raddr,
 static void tcg_out_guard(TCGContext *s, TCGArg entry, TCGArg arg,
                           BackendValType arg_type, int rexw, TCGMemOpIdx _oi)
 {
-    intptr_t offset = _oi & (MO_STORE << 4) ? offsetof(CPUTLBEntry, addr_write)
-                                            : offsetof(CPUTLBEntry, addr_read);
+    intptr_t offset = _oi & _MO_STORE ? offsetof(CPUTLBEntry, addr_write)
+                                      : offsetof(CPUTLBEntry, addr_read);
 
     tcg_out_cmpm(s, entry, offset, arg, arg_type, rexw);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
