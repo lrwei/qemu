@@ -2027,7 +2027,7 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     return true;
 }
 
-static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
@@ -2035,7 +2035,7 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
 
 #ifdef CONFIG_DEBUG_TCG
-    TCGLabelGuard *l = spl->guard;
+    TCGLabelGuardM *l = spl->guardm;
 
     if (likely(l->arg != tcg_target_call_iarg_regs[2])) {
         tcg_out_ld(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[2], l->entry,
@@ -2377,12 +2377,12 @@ static void tcg_out_tlb_check(TCGContext *s, TCGArg entry, TCGArg arg,
                         _oi);
 }
 
-static void add_guard_label(TCGContext *s, tcg_insn_unit *raddr,
-                            tcg_insn_unit *label_ptr, TCGReg arg, TCGReg entry,
-                            intptr_t offset)
+static void add_guardm_label(TCGContext *s, tcg_insn_unit *raddr,
+                             tcg_insn_unit *label_ptr, TCGReg arg, TCGReg entry,
+                             intptr_t offset)
 {
     __attribute__((unused))
-    TCGLabelGuard *label = new_guard_label(s, raddr, label_ptr);
+    TCGLabelGuardM *label = new_guardm_label(s, raddr, label_ptr);
 
 #ifdef CONFIG_DEBUG_TCG
     label->arg = arg;
@@ -2391,8 +2391,8 @@ static void add_guard_label(TCGContext *s, tcg_insn_unit *raddr,
 #endif
 }
 
-static void tcg_out_guard(TCGContext *s, TCGArg entry, TCGArg arg,
-                          BackendValType arg_type, int rexw, TCGMemOpIdx _oi)
+static void tcg_out_guardm(TCGContext *s, TCGArg entry, TCGArg arg,
+                           BackendValType arg_type, int rexw, TCGMemOpIdx _oi)
 {
     intptr_t offset = _oi & _MO_STORE ? offsetof(CPUTLBEntry, addr_write)
                                       : offsetof(CPUTLBEntry, addr_read);
@@ -2404,7 +2404,7 @@ static void tcg_out_guard(TCGContext *s, TCGArg entry, TCGArg arg,
 #ifdef CONFIG_DEBUG_TCG
     tcg_debug_assert(arg_type == BACKEND_REG);
 #endif
-    add_guard_label(s, s->code_ptr, s->code_ptr - 4, arg, entry, offset);
+    add_guardm_label(s, s->code_ptr, s->code_ptr - 4, arg, entry, offset);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2786,8 +2786,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
         tcg_out_tlb_check(s, a0, a1, a2, arg_types, rexw, args[3]);
         break;
-    OP_32_64(guard):
-        tcg_out_guard(s, a0, a1, arg_types[1], rexw, a2);
+    case INDEX_op_guardm:
+        rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+        tcg_out_guardm(s, a0, a1, arg_types[1], rexw, a2);
         break;
 #endif
 
@@ -3324,15 +3325,14 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
                 = { .args_ct_str = { "T", "re", "re" } };
             return &tlb_check;
         }
-    case INDEX_op_guard_i32:
-    case INDEX_op_guard_i64:
+    case INDEX_op_guardm:
     #ifdef CONFIG_DEBUG_TCG
         return &r_r;
     #else
         {
-            static const TCGTargetOpDef guard
+            static const TCGTargetOpDef guardm
                 = { .args_ct_str = { "r", "re" } };
-            return &guard;
+            return &guardm;
         }
     #endif
 

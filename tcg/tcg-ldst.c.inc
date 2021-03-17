@@ -36,18 +36,18 @@ typedef struct TCGLabelTlbCheck {
     TCGMemOpIdx _oi;
 } TCGLabelTlbCheck;
 
-typedef struct TCGLabelGuard {
+typedef struct TCGLabelGuardM {
 #ifdef CONFIG_DEBUG_TCG
     TCGReg arg;
     TCGReg entry;
     intptr_t offset;
 #endif
-} TCGLabelGuard;
+} TCGLabelGuardM;
 
 typedef enum TCGLabelSlowPathType {
     QemuLdst,
     TlbCheck,
-    Guard,
+    GuardM,
 } TCGLabelSlowPathType;
 
 typedef struct TCGLabelSlowPath {
@@ -58,7 +58,7 @@ typedef struct TCGLabelSlowPath {
     union {
         TCGLabelQemuLdst *ldst;
         TCGLabelTlbCheck *tlbck;
-        TCGLabelGuard *guard;
+        TCGLabelGuardM *guardm;
     };
     QSIMPLEQ_ENTRY(TCGLabelSlowPath) next;
 } TCGLabelSlowPath;
@@ -71,7 +71,7 @@ typedef struct TCGLabelSlowPath {
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
-static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
+static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
 static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
@@ -82,8 +82,8 @@ static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
                : tcg_out_qemu_st_slow_path(s, spl);
     case TlbCheck:
         return tcg_out_tlb_check_slow_path(s, spl);
-    case Guard:
-        return tcg_out_guard_slow_path(s, spl);
+    case GuardM:
+        return tcg_out_guardm_slow_path(s, spl);
     default:
         g_assert_not_reached();
     }
@@ -146,6 +146,6 @@ static inline TCGLabel##subtype *new_##field##_label(TCGContext *s,            \
 
 DEFINE_NEW_LABEL_FUNC(QemuLdst, ldst)
 DEFINE_NEW_LABEL_FUNC(TlbCheck, tlbck)
-DEFINE_NEW_LABEL_FUNC(Guard, guard)
+DEFINE_NEW_LABEL_FUNC(GuardM, guardm)
 
 #undef DEFINE_NEW_LABEL_FUNC

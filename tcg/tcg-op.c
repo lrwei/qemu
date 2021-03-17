@@ -2830,7 +2830,7 @@ static void tcg_gen_reassociate_address(TCGv_ptr base, TCGv_ptr offset,
      * `addr == _base + _offset` holds by definition, but applying
      * `ext[u]_i32_i64` to each term may render it, and therfore
      * `addend + addr == addend + base + offset` a false statement.
-     * Thankfully, the `guard` instruction before this calculation
+     * Thankfully, the `guardm` instruction before this calculation
      * (which checks whether `base` and `base + offset` are within
      * the same page) guarantees all the above statement holds, so
      * we are still safe.  */

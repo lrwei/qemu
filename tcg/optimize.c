@@ -46,12 +46,10 @@
 static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i32;
 static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i32;
 static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i32;
-static const TCGOpcode INDEX_op_guard_tl = INDEX_op_guard_i32;
 #else
 static const TCGOpcode INDEX_op_mov_tl = INDEX_op_mov_i64;
 static const TCGOpcode INDEX_op_add_tl = INDEX_op_add_i64;
 static const TCGOpcode INDEX_op_and_tl = INDEX_op_and_i64;
-static const TCGOpcode INDEX_op_guard_tl = INDEX_op_guard_i64;
 #endif
 
 /* Illustration on data structures used in local value numbering algorithm:
@@ -640,7 +638,7 @@ static uint16_t value_aa_constant_offset(TCGOp *op, int64_t *poffset,
     TCGOp *value_and, *value_add;
 
     tcg_debug_assert(op->opc == INDEX_op_tlb_check ||
-                     op->opc == INDEX_op_guard_tl);
+                     op->opc == INDEX_op_guardm);
 
     /* {TLB_CHECK, GUARD}    entry, TAG, ...  */
     value_and = num2vne(op->numbers[1])->info->value;
@@ -669,9 +667,9 @@ static void tcg_opt_tlb_check_finalize(TCGOp *op)
     op->numbers[1] = ts_number(arg_temp(op->args[1]));
 
     if (arg_info(op->args[2])->reassociated) {
-        op->opc = INDEX_op_guard_tl;
+        op->opc = INDEX_op_guardm;
         /* From: tlb_check entry, tag, addr, _oi
-         * To:   guard     entry, tag, _oi  */
+         * To:   guardm    entry, tag, _oi  */
         op->args[2] = op->args[3];
     } else if (arg_temp(op->args[2])->kind != TEMP_CONST) {
         /* Unutterably disgraceful and extremely stupid hack, only to make sure
@@ -2239,7 +2237,7 @@ static inline GuardHoistingInfo *op_guard_info(TCGOp *op)
     case INDEX_op_tlb_check:
         init_vne_guard_info(vne, op);
         break;
-    CASE_OP_32_64(guard):
+    case INDEX_op_guardm:
         break;
     default:
         g_assert_not_reached();
@@ -2274,7 +2272,7 @@ static void tcg_opt_insert_guard_after(TCGOp *op, int64_t offset, TCGArg _oi)
     and->args[1] = padded_addr;
     and->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK);
 
-    guard = tcg_op_insert_after(tcg_ctx, and, INDEX_op_guard_tl);
+    guard = tcg_op_insert_after(tcg_ctx, and, INDEX_op_guardm);
     guard->args[0] = op->args[0];
     guard->args[1] = arg;
     guard->args[2] = _oi;
@@ -2305,7 +2303,7 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
         /* This implies neither `offset_max` nor `offset_min` has ever
          * been changed, and therefore must equal to `offset_initial`.  */
         if (info->offset_max == info->offset_min) {
-            TCGOp *guard = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guard_tl);
+            TCGOp *guard = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guardm);
 
             guard->args[0] = op->args[0];
             /* Common subexpression elimination, manually. op->args[1]
@@ -2356,7 +2354,7 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
             }
             _oi = op->args[3];
             goto is_load_or_store;
-        CASE_OP_32_64(guard):
+        case INDEX_op_guardm:
             if (!(info = op_guard_info(op))) {
                 break;
             }
