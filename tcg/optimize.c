@@ -505,7 +505,6 @@ static void tcg_opt_base_address_new(uint16_t number_of_this_address,
     QSLIST_INSERT_HEAD(&vne->base_addresses, address, next);
 }
 
-#define SPECULATION_THRESHOLD           (1 << (TARGET_PAGE_BITS - 2))
 static void tcg_opt_reassociate_address_finalize(TCGOp *op)
 {
     TCGTemp *addr = arg_temp(op->args[2]);
@@ -539,7 +538,12 @@ static void tcg_opt_reassociate_address_finalize(TCGOp *op)
     QSLIST_FOREACH(address, &vne->base_addresses, next) {
         /* Calculate `addr`'s offset with respect to `address`.  */
         offset2 = offset - address->offset;
-        if (llabs(offset2) <= SPECULATION_THRESHOLD || ts_is_const(addr)) {
+
+        /* We do NOT really have any nontrivial heuristic at compile time
+         * to handle those accesses that are closed to page boundary. So,
+         * we might as well check here using the most aggressive threshold,
+         * leaving all hard work to the poor (programmer of) runtime.  */
+        if (llabs(offset2) < TARGET_PAGE_SIZE) {
             /* Prevent associating memory access with different TLB index,
              * e.g. user and kernel access to the same address, IF ANY.  */
             if (unlikely(op->args[3] != address->mem_index)) {
