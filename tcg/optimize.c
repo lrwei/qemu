@@ -646,10 +646,9 @@ static uint16_t value_aa_constant_offset(TCGOp *op, int64_t *poffset,
 
     /* {TLB_CHECK, GUARD}    entry, TAG, ...  */
     value_and = num2vne(op->numbers[1])->info->value;
-    /* This TAG should be calculated by AND_TL operation, and should
-     * not be a constant for the time being.  */
-    tcg_debug_assert(value_and);
-    tcg_debug_assert(value_and->opc == INDEX_op_and_tl);
+    /* This TAG should be calculated by AND_TL operation, constant
+     * tags do not obey this rule and will be handled differently.  */
+    tcg_debug_assert(value_and && value_and->opc == INDEX_op_and_tl);
     if (pmask) {
         /* Abuse to get the mask used by the guard.  */
         tcg_debug_assert(value_has_constant_offset(value_and, pmask, false));
@@ -675,7 +674,7 @@ static void tcg_opt_tlb_check_finalize(TCGOp *op)
         /* From: tlb_check entry, tag, addr, _oi
          * To:   guardm    entry, tag, _oi  */
         op->args[2] = op->args[3];
-    } else if (arg_temp(op->args[2])->kind != TEMP_CONST) {
+    } else if (!arg_is_const(op->args[1])) {
         /* Unutterably disgraceful and extremely stupid hack, only to make sure
          * BASE of the access can be found in future guard hoisting pass. Again,
          * this is because we don't have SSA-form of IR.  */
@@ -688,7 +687,7 @@ static void tcg_opt_tlb_check_finalize(TCGOp *op)
         op->args[4] = temp_arg(base);
         op->args[5] = ts_number(base);
     } else {
-        /* Constant address ignored for the time being.  */
+        /* Nothing needs to be done for constant address.  */
     }
 }
 
@@ -2189,11 +2188,17 @@ done_algebraic_simplifying_and_constant_folding:
 
 typedef struct GuardHoistingInfo {
     TCGOp *op;
-    int64_t offset_initial;
-    int64_t offset_max;
-    int64_t offset_min;
     bool has_load;
     bool has_store;
+    bool is_constant;
+    union {
+        struct {
+            int64_t offset_initial;
+            int64_t offset_max;
+            int64_t offset_min;
+        };
+        bool guard_exist;
+    };
 } GuardHoistingInfo;
 
 static inline GuardHoistingInfo *vne_guard_info(ValueNumberingEntry *vne)
@@ -2217,11 +2222,19 @@ static void init_vne_guard_info(ValueNumberingEntry *vne, TCGOp *op)
     /* After which further guards are to be inserted.  */
     info->op = op;
 
-    /* Record the offset checked by TLB_CHECK itself. See
-     * tcg_opt_tlb_check_finalize for these args[5] hacks.  */
-    tcg_debug_assert(value_aa_constant_offset(op, &info->offset_initial, NULL)
-                     == op->args[5]);
-    info->offset_min = info->offset_max = info->offset_initial;
+    if (unlikely(arg_is_const(op->args[1]))) {
+        info->is_constant = true;
+        /* No extra data is needed for constant GUARD, see also
+         * tcg_opt_do_guard_hoisting for detailed explanation.  */
+        info->guard_exist = false;
+    } else {
+        info->is_constant = false;
+        /* Record the offset checked by TLB_CHECK itself. See
+         * tcg_opt_tlb_check_finalize for these args[5] hacks.  */
+        tcg_debug_assert(value_aa_constant_offset(op, &info->offset_initial,
+                                                  NULL) == op->args[5]);
+        info->offset_min = info->offset_max = info->offset_initial;
+    }
 
     info->has_load = info->has_store = false;
     vne_set_guard_info(vne, info);
@@ -2231,11 +2244,6 @@ static inline GuardHoistingInfo *op_guard_info(TCGOp *op)
 {
     ValueNumberingEntry *vne = num2vne(op->numbers[0]);
     GuardHoistingInfo *info;
-
-    /* Constant address ignored for the time being.  */
-    if (arg_temp(op->args[1])->kind == TEMP_CONST) {
-        return NULL;
-    }
 
     switch (op->opc) {
     case INDEX_op_tlb_check:
@@ -2288,6 +2296,24 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
     TCGMemOpIdx _oi = op->args[3];
     /* For GUARD, the only meaningful part of `_oi` is the _MO_STORE bit.  */
     TCGMemOpIdx _oi_inversed = _oi ^ _MO_STORE;
+
+    if (unlikely(info->is_constant)) {
+        if (info->guard_exist) {
+            TCGOp *guard = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guardm);
+
+            guard->args[0] = op->args[0];
+            /* This is a double check using THE SAME TAG as with the TLB_CHECK
+             * itself, its necessity is justified by the following nasty cases,
+             * where address lies in area:
+             * 1. of which protection is enforced in unit smaller than a page,
+             * 2. to which every write invalidate the overlapping TB,
+             * 3. implementing weird attribute like s390x's PAGE_WRITE_INV.  */
+            guard->args[1] = op->args[1];
+            guard->args[2] = info->has_load && info->has_store ? _oi_inversed
+                                                               : _oi;
+        }
+        return;
+    }
 
     if (!(info->has_load && info->has_store)) {
         /* Only load (store) are associated with the base address,
@@ -2353,35 +2379,57 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
             prev_reassociate = op;
             break;
         case INDEX_op_tlb_check:
-            if (!(info = op_guard_info(op))) {
-                break;
-            }
+            info = op_guard_info(op);
             _oi = op->args[3];
             goto is_load_or_store;
         case INDEX_op_guardm:
-            if (!(info = op_guard_info(op))) {
-                break;
+            info = op_guard_info(op);
+            if (unlikely(info->is_constant)) {
+                uint64_t tag = arg_value(op->args[1]);
+                uint64_t _tag = arg_value(info->op->args[1]);
+
+                /* Unaligned access will never pass TLB_CHECK, of which the
+                 * original requirement for aligned-ness (i.e. a_mask) will
+                 * not be touched as in tcg_opt_extract_tag_finalize. So we
+                 * are safe to clear the low bits here.  */
+                _tag &= TARGET_PAGE_MASK;
+
+                /* Note that unlike the case for non-constant, constant
+                 * access not satisfying aligned-ness requirement will
+                 * result in bailing out from slow path, DEFINITELY.  */
+                if (unlikely(tag & ~TARGET_PAGE_MASK)) {
+                    continue;
+
+                /* Reassociation process of constant addresses guarantees
+                 * that the access must START from the same page (IF ANY)
+                 * as with its base address, but NOT the last. This will
+                 * result in a cross-page access, and in turn bailing out
+                 * from slow path, DEFINITELY.  */
+                } else if (unlikely(tag != _tag)) {
+                    continue;
+                }
+                info->guard_exist = true;
+            } else {
+                /* BASE used by TLB_CHECK and corresponding GUARDs should
+                 * be the same. However, as we do NOT have SSA to work on,
+                 * this can not be checked by directly comparing TCGTemps
+                 * used in each guard. See tcg_opt_tlb_check_finalize()
+                 * for this SHIT.  */
+                tcg_debug_assert(value_aa_constant_offset(op, &offset, &mask)
+                                 == info->op->args[5]);
+
+                if (mask != TARGET_PAGE_MASK) {
+                    /* Accesses with aligned-ness requirement are skipped
+                     * to keep implementation simple.  */
+                    continue;
+                }
+
+                if (offset < info->offset_min) {
+                    info->offset_min = offset;
+                } else if (offset > info->offset_max) {
+                    info->offset_max = offset;
+                }
             }
-
-            /* BASE used by TLB_CHECK and corresponding GUARDs should be the
-             * same. However, as we do NOT have SSA to work on, this can not
-             * be checked by directly comparing TCGTemps used in each guard.
-             * See tcg_opt_tlb_check_finalize() for this SHIT.  */
-            tcg_debug_assert(value_aa_constant_offset(op, &offset, &mask)
-                             == info->op->args[5]);
-
-            if (mask != TARGET_PAGE_MASK) {
-                /* The guard also requires certain kinds of alignment,
-                 * skip to keep implementation simple.  */
-                continue;
-            }
-
-            if (offset < info->offset_min) {
-                info->offset_min = offset;
-            } else if (offset > info->offset_max) {
-                info->offset_max = offset;
-            }
-
             _oi = op->args[2];
 
             /* Remove encountered GUARD and REASSOCIATION operation.  */
