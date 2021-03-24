@@ -3601,6 +3601,12 @@ static TCGReg tcg_reg_alloc(TCGContext *s, TCGRegSet required_regs,
                 reg = order[i];
                 if (tcg_regset_test_reg(reg_ct[j], reg)) {
                     tcg_debug_assert((ts2 = s->reg_to_temp[reg]) != NULL);
+                    /* Reloading of the spilled temporary is inevitable, but
+                     * choosing the mem_coherent one may save us a store.  */
+                    if (ts2->mem_coherent) {
+                        ts = ts2;
+                        break;
+                    }
                     /* Choose the temporary with later (i.e. numerically
                      * smaller) .next_use to spill.  */
                     if (!ts || ts_next_use(ts2) < ts_next_use(ts)) {
