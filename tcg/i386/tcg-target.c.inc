@@ -1845,7 +1845,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_insn_unit **label_ptr = &spl->label_ptr;
     int rexw = (l->type == TCG_TYPE_I64 ? P_REXW : 0);
 
-    /* resolve label address */
+    /* Resolve label address.  */
     tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
     if (TARGET_LONG_BITS > TCG_TARGET_REG_BITS) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
@@ -1931,7 +1931,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_insn_unit **label_ptr = &spl->label_ptr;
     TCGReg retaddr;
 
-    /* resolve label address */
+    /* Resolve label address.  */
     tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
     if (TARGET_LONG_BITS > TCG_TARGET_REG_BITS) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
@@ -1998,7 +1998,7 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
-    /* resolve label address */
+    /* Resolve label address.  */
     tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
 
     /* Signature of the helper to be called:
@@ -2045,11 +2045,24 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
 static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
-    __attribute__((unused)) TCGLabelGuardM *l = spl->guardm;
+    TCGLabelGuardM *l = spl->guardm;
 
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
-    /* resolve label address */
+    if (l->prev_spl
+#ifdef CONFIG_DEBUG_TCG
+        && likely(l->entry == l->prev_spl->guardm->entry)
+#endif
+    ) {
+        uint32_t offset = *(uint32_t *) l->prev_spl->label_ptr;
+
+        /* Re-resolve label address.  */
+        offset += l->prev_spl->label_ptr - spl->label_ptr;
+        tcg_patch32(spl->label_ptr, offset);
+        return true;
+    }
+
+    /* Resolve label address.  */
     tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
 
     /* Signature of the helper to be called:
@@ -2398,15 +2411,18 @@ static void tcg_out_tlb_check(TCGContext *s, TCGArg entry, TCGArg arg,
 }
 
 static void add_guardm_label(TCGContext *s, tcg_insn_unit *raddr,
-                             tcg_insn_unit *label_ptr, TCGReg entry)
+                             tcg_insn_unit *label_ptr, TCGReg entry,
+                             uint32_t num_insns)
 {
     TCGLabelGuardM *label = new_guardm_label(s, raddr, label_ptr);
 
     label->entry = entry;
+    label->num_insns = num_insns;
 }
 
 static void tcg_out_guardm(TCGContext *s, TCGArg entry, TCGArg arg,
-                           BackendValType arg_type, int rexw, TCGMemOpIdx _oi)
+                           BackendValType arg_type, int rexw, TCGMemOpIdx _oi,
+                           uint32_t num_insns)
 {
     intptr_t offset = _oi & _MO_STORE ? offsetof(CPUTLBEntry, addr_write)
                                       : offsetof(CPUTLBEntry, addr_read);
@@ -2415,7 +2431,7 @@ static void tcg_out_guardm(TCGContext *s, TCGArg entry, TCGArg arg,
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    add_guardm_label(s, s->code_ptr, s->code_ptr - 4, entry);
+    add_guardm_label(s, s->code_ptr, s->code_ptr - 4, entry, num_insns);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2799,7 +2815,7 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     case INDEX_op_guardm:
         rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
-        tcg_out_guardm(s, a0, a1, arg_types[1], rexw, a2);
+        tcg_out_guardm(s, a0, a1, arg_types[1], rexw, a2, args[3]);
         break;
 #endif
 

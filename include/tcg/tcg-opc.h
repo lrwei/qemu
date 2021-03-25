@@ -214,7 +214,7 @@ DEF(qemu_st_i64, 0, TLADDR_ARGS + DATA64_ARGS, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_64BIT)
 
 DEF(tlb_check, 0, 3, 1, TCG_OPF_CALL_CLOBBER | IMPL64)
-DEF(guardm, 0, 2, 1, IMPL64)
+DEF(guardm, 0, 2, 2, IMPL64)
 
 /* Host vector support.  */
 

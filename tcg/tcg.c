@@ -4787,6 +4787,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
                 break;
             }
             goto do_default;
+        case INDEX_op_guardm:
+            /* All GUARD lie in between 2 consecutive INSN_STARTs can share
+             * the same slow path.  */
+            op->args[3] = num_insns;
+            goto do_default;
         default:
         do_default:
             /* Sanity check that we've not introduced any unhandled opcodes. */

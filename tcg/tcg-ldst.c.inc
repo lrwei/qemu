@@ -20,6 +20,8 @@
  * THE SOFTWARE.
  */
 
+typedef struct TCGLabelSlowPath TCGLabelSlowPath;
+
 typedef struct TCGLabelQemuLdst {
     bool is_ld;             /* qemu_ld: true, qemu_st: false */
     TCGMemOpIdx oi;
@@ -39,6 +41,8 @@ typedef struct TCGLabelTlbCheck {
 
 typedef struct TCGLabelGuardM {
     TCGReg entry;
+    uint32_t num_insns;
+    TCGLabelSlowPath *prev_spl;
 } TCGLabelGuardM;
 
 typedef enum TCGLabelSlowPathType {
@@ -70,29 +74,37 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
-static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
-{
-    switch (spl->type) {
-    case QemuLdst:
-        return spl->ldst->is_ld
-               ? tcg_out_qemu_ld_slow_path(s, spl)
-               : tcg_out_qemu_st_slow_path(s, spl);
-    case TlbCheck:
-        return tcg_out_tlb_check_slow_path(s, spl);
-    case GuardM:
-        return tcg_out_guardm_slow_path(s, spl);
-    default:
-        g_assert_not_reached();
-    }
-}
-
 static int tcg_out_slow_path_finalize(TCGContext *s)
 {
-    TCGLabelSlowPath *spl;
+    TCGLabelSlowPath *spl, *prev_spl = NULL;
+    uint32_t num_insns = -1;
+    bool ok;
 
-    /* Dispatch slow paths.  */
+    /* Dispatch slow path labels.  */
     QSIMPLEQ_FOREACH(spl, &s->slow_path_labels, next) {
-        if (!tcg_dispatch_slow_path_label(s, spl)) {
+        switch (spl->type) {
+        case QemuLdst:
+            ok = spl->ldst->is_ld
+                    ? tcg_out_qemu_ld_slow_path(s, spl)
+                    : tcg_out_qemu_st_slow_path(s, spl);
+            break;
+        case TlbCheck:
+            ok = tcg_out_tlb_check_slow_path(s, spl);
+            break;
+        case GuardM:
+            if (num_insns != spl->guardm->num_insns) {
+                prev_spl = spl;
+                num_insns = spl->guardm->num_insns;
+                spl->guardm->prev_spl = NULL;
+            } else {
+                spl->guardm->prev_spl = prev_spl;
+            }
+            ok = tcg_out_guardm_slow_path(s, spl);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        if (!ok) {
             return -2;
         }
 
