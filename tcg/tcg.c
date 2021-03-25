@@ -2715,10 +2715,10 @@ static void la_bb_sync(TCGContext *s, size_t ng, size_t nt)
 }
 
 /* Liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, size_t nt, bool tlb_check)
+static void la_cross_call(TCGContext *s, size_t nt, TCGTemp *tlb_check_first_ts)
 {
-    TCGRegSet mask = ~(tlb_check ? tcg_target_tlb_check_clobber_regs
-                                 : tcg_target_call_clobber_regs);
+    TCGRegSet mask = ~(tlb_check_first_ts ? tcg_target_tlb_check_clobber_regs
+                                          : tcg_target_call_clobber_regs);
 
     for (size_t i = 0; i < nt; i++) {
         TCGTemp *ts = &s->temps[i];
@@ -2726,6 +2726,15 @@ static void la_cross_call(TCGContext *s, size_t nt, bool tlb_check)
         if (!(ts->state & TS_DEAD)) {
             TCGRegSet *pset = la_temp_pref(ts);
             TCGRegSet set = *pset;
+
+            /* The first argument of TLB_CHECK won't be clobbered by this
+             * particular op, so we leave `ts->state` untouched here.  */
+            if (ts == tlb_check_first_ts) {
+                /* Prefer using designated register to avoid data movement
+                 * in slow path.  */
+                *pset = tcg_regset_from_reg(tcg_target_call_oarg_regs[0]);
+                continue;
+            }
 
             set &= mask;
             /* If the combination is not possible, restart.  */
@@ -2843,7 +2852,7 @@ static void liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps, false);
+                la_cross_call(s, nb_temps, NULL);
 
                 /* Record arguments that die or may clobbered in this call.  */
                 for (i = nb_oargs; i < nb_iargs + nb_oargs; i++) {
@@ -2896,6 +2905,11 @@ static void liveness_pass_1(TCGContext *s)
         case INDEX_op_reassociate_address:
             la_global_sync(s, nb_globals);
             break;
+        case INDEX_op_tlb_check:
+            nb_oargs = 0;
+            nb_iargs = 3;
+            la_cross_call(s, nb_temps, arg_temp(op->args[0]));
+            goto do_not_remove2;
 
         case INDEX_op_add2_i32:
             opc_new = INDEX_op_add_i32;
@@ -3021,9 +3035,10 @@ static void liveness_pass_1(TCGContext *s)
                 la_global_sync(s, nb_globals);
             }
             if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                la_cross_call(s, nb_temps, opc == INDEX_op_tlb_check);
+                la_cross_call(s, nb_temps, NULL);
             }
 
+        do_not_remove2:
             /* Record arguments that die or may clobbered in this opcode.  */
             for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                 ts = arg_temp(op->args[i]);
@@ -4061,6 +4076,64 @@ static inline void temp_finalize(TCGContext *s, const TCGOp *op, uint8_t i,
     }
 }
 
+static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
+{
+    const TCGOpDef * const def = &tcg_op_defs[op->opc];
+    uint8_t nb_iargs;
+    TCGRegSet allocated_regs = s->reserved_regs;
+    size_t i;
+    const TCGArgConstraint *arg_ct;
+    TCGTemp *ts;
+    TCGArg new_args[TCG_MAX_OP_ARGS];
+    BackendValType arg_types[TCG_MAX_OP_ARGS];
+
+    tcg_debug_assert(def->nb_oargs == 0);
+    tcg_debug_assert(def->nb_cargs == 1);
+    tcg_debug_assert((nb_iargs = def->nb_iargs) == 3);
+
+    /* Copy the only constant.  */
+    new_args[nb_iargs] = op->args[nb_iargs];
+
+    /* Satisfy input constraints.  */
+    for (i = 0; i < nb_iargs; i++) {
+        arg_ct = &def->args_ct[i];
+        ts = arg_temp(op->args[i]);
+
+        if (ts_val_type(ts) == TEMP_VAL_CONST
+            && tcg_target_const_match(ts->val, ts->type, arg_ct)) {
+            /* Constant is OK for the instruction.  */
+            arg_types[i] = BACKEND_CONST;
+            new_args[i] = ts->val;
+            continue;
+        }
+
+        temp_load(s, ts, arg_ct->regs & ~allocated_regs, 0);
+        tcg_debug_assert(tcg_regset_test_reg(arg_ct->regs, ts->reg));
+
+        new_args[i] = ts->reg;
+        arg_types[i] = BACKEND_REG;
+        tcg_regset_set_reg(allocated_regs, ts->reg);
+    }
+
+    for (i = 0; i < nb_iargs; i++) {
+        temp_finalize(s, op, i, false);
+    }
+
+    for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
+            /* Slow path of TLB_CHECK doesn't clobber its first argument.  */
+            if (i == new_args[0]) {
+                continue;
+            }
+            /* Liveness analysis should have ensured that temporaries
+             * using registers clobbered by this op be freed.  */
+            tcg_debug_assert(!s->reg_to_temp[i]);
+        }
+    }
+
+    tcg_out_op(s, op->opc, new_args, arg_types);
+}
+
 static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 {
     uint8_t nb_iargs, nb_oargs;
@@ -4168,17 +4241,6 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_cbranch(s);
     } else if (def->flags & TCG_OPF_BB_END) {
         tcg_reg_alloc_bb_end(s);
-    } else if (op->opc == INDEX_op_tlb_check) {
-        for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-            if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
-                /* Liveness analysis should have ensured that temporaries
-                 * using registers clobbered by this op be freed.  */
-                tcg_debug_assert(!s->reg_to_temp[i]);
-            }
-        }
-        tcg_debug_assert(nb_oargs == 0);
-        tcg_out_op(s, INDEX_op_tlb_check, new_args, arg_types);
-        return;
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
             /* XXX: Permit generic clobber register list?  */
@@ -4703,6 +4765,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             break;
         case INDEX_op_call:
             tcg_reg_alloc_call(s, op);
+            break;
+        case INDEX_op_tlb_check:
+            tcg_reg_alloc_tlb_check(s, op);
             break;
         case INDEX_op_dup2_vec:
             if (tcg_reg_alloc_dup2(s, op)) {

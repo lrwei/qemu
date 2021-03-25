@@ -319,6 +319,13 @@ static inline CPUTLBEntry *tlb_entry(CPUArchState *env, uintptr_t mmu_idx,
     return &env_tlb(env)->f[mmu_idx].table[tlb_index(env, mmu_idx, addr)];
 }
 
+/* Find the TLB index corresponding to the mmu_idx + TLB entry pair.  */
+static inline uintptr_t tlb_entry_index(CPUArchState *env, uintptr_t mmu_idx,
+                                        CPUTLBEntry *entry)
+{
+    return entry - env_tlb(env)->f[mmu_idx].table;
+}
+
 uint32_t cpu_ldub_mmuidx_ra(CPUArchState *env, abi_ptr addr,
                             int mmu_idx, uintptr_t ra);
 int cpu_ldsb_mmuidx_ra(CPUArchState *env, abi_ptr addr,

@@ -31,6 +31,7 @@ typedef struct TCGLabelQemuLdst {
 } TCGLabelQemuLdst;
 
 typedef struct TCGLabelTlbCheck {
+    TCGReg entry;
     TCGArg addr;
     BackendValType addr_type;
     TCGMemOpIdx _oi;

@@ -2622,11 +2622,10 @@ void cpu_stq_le_data(CPUArchState *env, target_ulong ptr, uint64_t val)
 
 static inline void QEMU_ALWAYS_INLINE
 tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
-                 uintptr_t retaddr, bool is_load)
+                 uintptr_t retaddr, CPUTLBEntry *entry, bool is_load)
 {
     uintptr_t mmu_idx = get_mmuidx(oi);
-    uintptr_t index = tlb_index(env, mmu_idx, addr);
-    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+    uintptr_t index = tlb_entry_index(env, mmu_idx, entry);
     target_ulong tlb_addr = is_load ? entry->addr_read : tlb_addr_write(entry);
     size_t tlb_off = is_load ? offsetof(CPUTLBEntry, addr_read)
                              : offsetof(CPUTLBEntry, addr_write);
@@ -2642,8 +2641,17 @@ tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                              mmu_idx, retaddr);
     }
 
-    /* If the TLB entry is for a different page, reload and try again.  */
-    if (!tlb_hit(tlb_addr, addr)) {
+    /* Handle slow unaligned access (it spans two pages or IO).  */
+    if (size > 1
+        && unlikely((addr & ~TARGET_PAGE_MASK) + size - 1
+                              >= TARGET_PAGE_SIZE)) {
+        goto bailout;
+    }
+
+    /* If the TLB entry is for a different page, reload and try again,
+     * usually this would be the case. But still there's a fair amount
+     * of bailout caused by writing pages with TLB_NOTDIRTY.  */
+    if (likely(!tlb_hit(tlb_addr, addr))) {
         if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
                             addr & TARGET_PAGE_MASK)) {
             int64_t window_begin_ns = desc->window_begin_ns;
@@ -2651,20 +2659,10 @@ tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
             tlb_fill(env_cpu(env), addr, size, access_type, mmu_idx, retaddr);
             /* Translation blocks compiled with CF_MONOLITHIC unset can not
              * be returned to if TLB is flushed or resized here.  */
-            if (unlikely(window_begin_ns != desc->window_begin_ns)) {
-                g_assert_not_reached();
-                goto bailout;
-            }
+            tcg_debug_assert(window_begin_ns == desc->window_begin_ns);
         }
         tlb_addr = is_load ? entry->addr_read : tlb_addr_write(entry);
         tlb_addr &= ~TLB_INVALID_MASK;
-    }
-
-    /* Handle slow unaligned access (it spans two pages or IO).  */
-    if (size > 1
-        && unlikely((addr & ~TARGET_PAGE_MASK) + size - 1
-                              >= TARGET_PAGE_SIZE)) {
-        goto bailout;
     }
 
     /* Handle anything that isn't just a straight memory access.  */
@@ -2690,38 +2688,47 @@ bailout:
 #define RESTORE_REG(reg)                                \
     asm ("movq %0, %%" #reg :: "rm" (reg) : #reg);
 
-
-void helper_tlb_check_ld(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
-                         uintptr_t retaddr)
-{
-    RESERVE_REG(r8)
-    RESERVE_REG(r9)
-    RESERVE_REG(r10)
+#define EXTRA_PROLOGUE  \
+    RESERVE_REG(rbp)    \
+    RESERVE_REG(rax)    \
+    RESERVE_REG(rcx)    \
+    RESERVE_REG(r8)     \
+    RESERVE_REG(r9)     \
+    RESERVE_REG(r10)    \
     RESERVE_REG(r11)
 
-    tlb_check_helper(env, addr, oi, retaddr, true);
-
+#define EXTRA_EPILOGUE  \
+    RESTORE_REG(rax)    \
+    RESTORE_REG(rcx)    \
+    RESTORE_REG(r8)     \
+    RESTORE_REG(r9)     \
+    RESTORE_REG(r10)    \
     RESTORE_REG(r11)
-    RESTORE_REG(r10)
-    RESTORE_REG(r9)
-    RESTORE_REG(r8)
-}
 
-void helper_tlb_check_st(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
-                         uintptr_t retaddr)
+/* Passing argument through %rbp requires the ordinary frame pointer updating
+ * sequence (i.e. pushq %rbp; movq %rsp, %rbp) be omitted.  */
+__attribute__((optimize("-fomit-frame-pointer")))
+void helper_tlb_check_ld(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 {
-    RESERVE_REG(r8)
-    RESERVE_REG(r9)
-    RESERVE_REG(r10)
-    RESERVE_REG(r11)
-
-    tlb_check_helper(env, addr, oi, retaddr, false);
-
-    RESTORE_REG(r11)
-    RESTORE_REG(r10)
-    RESTORE_REG(r9)
-    RESTORE_REG(r8)
+    EXTRA_PROLOGUE
+    tlb_check_helper((CPUArchState *) rbp, addr, oi, retaddr,
+                     (CPUTLBEntry *) rax, true);
+    EXTRA_EPILOGUE
 }
+
+__attribute__((optimize("-fomit-frame-pointer")))
+void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
+{
+    EXTRA_PROLOGUE
+    tlb_check_helper((CPUArchState *) rbp, addr, oi, retaddr,
+                     (CPUTLBEntry *) rax, false);
+    EXTRA_EPILOGUE
+}
+
+#undef RESREVE_REG
+#undef RESTORE_REG
+#undef EXTRA_PROLOGUE
+#undef EXTRA_EPILOGUE
 
 #ifdef CONFIG_DEBUG_TCG
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr,

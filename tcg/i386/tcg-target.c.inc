@@ -159,10 +159,6 @@ static const char *target_parse_constraint(TCGArgConstraint *ct,
         tcg_regset_reset_reg(ct->regs, TCG_REG_L0);
         tcg_regset_reset_reg(ct->regs, TCG_REG_L1);
         break;
-        /* Constraint for tlb_entry used by tlb_check.  */
-    case 'T':
-        ct->regs = ALL_GENERAL_REGS & ~tcg_target_tlb_check_clobber_regs;
-        break;
 
     case 'e':
         ct->ct |= (type == TCG_TYPE_I32 ? TCG_CT_CONST : TCG_CT_CONST_S32);
@@ -1997,6 +1993,8 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     TCGLabelTlbCheck *l = spl->tlbck;
     TCGMemOpIdx oi = l->_oi & ~_MO_STORE;
+    void *_tlb_check_helper = oi == l->_oi ? helper_tlb_check_ld
+                                           : helper_tlb_check_st;
 
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
@@ -2006,24 +2004,42 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     /* Signature of the helper to be called:
      *
      * void
-     * helper_tlb_check_{ld, st}(CPUArchState *env, target_ulong addr,
-     *                           TCGMemOpIdx oi, uintptr_t retaddr);  */
+     * helper_tlb_check_{ld, st}(target_ulong addr, TCGMemOpIdx oi,
+     *                           uintptr_t retaddr, CPUArchState *rbp,
+     *                           CPUTLBEntry *rax);
+     * Note that these functions implement nonstandard calling convention,
+     * in the sense that the last 2 arguments are passed through registers
+     * specified by the corresponding argument name.  */
+
     if (l->addr_type == BACKEND_REG) {
-        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+        if (likely(l->entry != tcg_target_call_iarg_regs[0])) {
+            tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[0], l->addr);
+            tcg_out_mov(s, TCG_TYPE_PTR, TCG_REG_RAX, l->entry);
+        } else if (l->addr != TCG_REG_RAX) {
+            tcg_out_mov(s, TCG_TYPE_PTR, TCG_REG_RAX, l->entry);
+            tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[0], l->addr);
+        } else {
+            tcg_out_xchg(s, TCG_REG_RAX, tcg_target_call_iarg_regs[0], P_REXW);
+        }
     } else {
         tcg_debug_assert(l->addr_type == BACKEND_CONST);
-        tcg_out_movi(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->addr);
+        tcg_out_mov(s, TCG_TYPE_PTR, TCG_REG_RAX, l->entry);
+        tcg_out_movi(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[0], l->addr);
     }
-    /* So as to avoid clobbering RDI when l->addr uses it.  */
-    tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
-    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], oi);
-    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[3],
+    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], oi);
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[2],
                  (uintptr_t) spl->raddr);
 
-    /* "Tail call" to the helper, with the return address back inline.  */
-    tcg_out_push(s, tcg_target_call_iarg_regs[3]);
-    tcg_out_jmp(s, (tcg_insn_unit *) (oi == l->_oi ? helper_tlb_check_ld
-                                                   : helper_tlb_check_st));
+    if (unlikely(l->entry != TCG_REG_RAX &&
+        tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, l->entry))) {
+        tcg_out_call(s, _tlb_check_helper);
+        tcg_out_mov(s, TCG_TYPE_PTR, l->entry, TCG_REG_RAX);
+        tcg_out_jmp(s, (tcg_insn_unit *) spl->raddr);
+    } else {
+        /* "Tail call" to the helper, with the return address back inline.  */
+        tcg_out_push(s, tcg_target_call_iarg_regs[2]);
+        tcg_out_jmp(s, _tlb_check_helper);
+    }
     return true;
 }
 
@@ -2352,11 +2368,13 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is64)
 }
 
 static void add_tlb_check_label(TCGContext *s, tcg_insn_unit *raddr,
-                                tcg_insn_unit *label_ptr, TCGArg addr,
-                                BackendValType addr_type, TCGMemOpIdx _oi)
+                                tcg_insn_unit *label_ptr, TCGReg entry,
+                                TCGArg addr, BackendValType addr_type,
+                                TCGMemOpIdx _oi)
 {
     TCGLabelTlbCheck *label = new_tlbck_label(s, raddr, label_ptr);
 
+    label->entry = entry;
     label->addr = addr;
     label->addr_type = addr_type;
     label->_oi = _oi;
@@ -2373,8 +2391,8 @@ static void tcg_out_tlb_check(TCGContext *s, TCGArg entry, TCGArg arg,
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    add_tlb_check_label(s, s->code_ptr, s->code_ptr - 4, addr, arg_types[2],
-                        _oi);
+    add_tlb_check_label(s, s->code_ptr, s->code_ptr - 4, entry, addr,
+                        arg_types[2], _oi);
 }
 
 static void add_guardm_label(TCGContext *s, tcg_insn_unit *raddr,
@@ -3322,7 +3340,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_tlb_check:
         {
             static const TCGTargetOpDef tlb_check
-                = { .args_ct_str = { "T", "re", "re" } };
+                = { .args_ct_str = { "r", "re", "re" } };
             return &tlb_check;
         }
     case INDEX_op_guardm:
@@ -4170,7 +4188,6 @@ static void tcg_target_init(TCGContext *s)
     tcg_target_call_clobber_regs = ALL_VECTOR_REGS;
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EAX);
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EDX);
-    tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_ECX);
     if (TCG_TARGET_REG_BITS == 64) {
 #if !defined(_WIN64)
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_RDI);
@@ -4178,7 +4195,7 @@ static void tcg_target_init(TCGContext *s)
 #else
 #error Calling convention of _WIN64 has not been supported.
 #endif
-        /* tlb_check won't clobber r8 - r11.  */
+        /* tlb_check won't clobber r8 - r11, and rcx.  */
         tcg_target_tlb_check_clobber_regs = tcg_target_call_clobber_regs;
 
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R8);
@@ -4186,6 +4203,7 @@ static void tcg_target_init(TCGContext *s)
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R10);
         tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_R11);
     }
+    tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_ECX);
 
     s->reserved_regs = 0;
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_CALL_STACK);
