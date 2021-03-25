@@ -2730,9 +2730,6 @@ static void la_cross_call(TCGContext *s, size_t nt, TCGTemp *tlb_check_first_ts)
             /* The first argument of TLB_CHECK won't be clobbered by this
              * particular op, so we leave `ts->state` untouched here.  */
             if (ts == tlb_check_first_ts) {
-                /* Prefer using designated register to avoid data movement
-                 * in slow path.  */
-                *pset = tcg_regset_from_reg(tcg_target_call_oarg_regs[0]);
                 continue;
             }
 
@@ -2910,6 +2907,10 @@ static void liveness_pass_1(TCGContext *s)
             nb_iargs = 3;
             la_cross_call(s, nb_temps, arg_temp(op->args[0]));
             goto do_not_remove2;
+        case INDEX_op_guardm:
+            nb_oargs = 0;
+            nb_iargs = 2;
+            goto do_not_remove2;
 
         case INDEX_op_add2_i32:
             opc_new = INDEX_op_add_i32;
@@ -3070,7 +3071,13 @@ static void liveness_pass_1(TCGContext *s)
                         = *la_temp_pref(arg_temp(op->args[1]));
                 }
                 break;
-
+            case INDEX_op_tlb_check:
+            case INDEX_op_guardm:
+                /* Prefer using designated register to avoid data movement
+                 * in slow path.  */
+                *la_temp_pref(arg_temp(op->args[0])) =
+                    tcg_regset_from_reg(tcg_target_call_oarg_regs[0]);
+                /* Fall through.  */
             default:
                 for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                     const TCGArgConstraint *ct = &def->args_ct[i];

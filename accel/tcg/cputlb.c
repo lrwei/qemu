@@ -2725,24 +2725,24 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
     EXTRA_EPILOGUE
 }
 
-#undef RESREVE_REG
 #undef RESTORE_REG
 #undef EXTRA_PROLOGUE
 #undef EXTRA_EPILOGUE
 
-#ifdef CONFIG_DEBUG_TCG
-void helper_guard_failure(CPUArchState *env, uintptr_t retaddr,
-                          target_ulong a0, target_ulong a1)
-{
-    qemu_log_mask(CPU_LOG_MMU, "Guard failure: a0: " TARGET_FMT_lx
-                  " a1: " TARGET_FMT_lx " retaddr: %p\n",
-                  a0, a1, (void *) retaddr);
-#else
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
 {
+#ifdef CONFIG_DEBUG_TCG
+    RESERVE_REG(rax)
+    CPUTLBEntry *entry = (CPUTLBEntry *) rax;
+
+    qemu_log_mask(CPU_LOG_MMU, "Guard failure: addr_read: " TARGET_FMT_lx
+                  " addr_write: " TARGET_FMT_lx " retaddr: %p\n",
+                  entry->addr_read, tlb_addr_write(entry), (void *) retaddr);
 #endif
     cpu_speculation_recompile(env_cpu(env), retaddr);
 }
+
+#undef RESREVE_REG
 
 /* First set of helpers allows passing in of OI and RETADDR.  This makes
    them callable from other helpers.  */

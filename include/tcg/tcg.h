@@ -1378,13 +1378,7 @@ void helper_be_stq_mmu(CPUArchState *env, target_ulong addr, uint64_t val,
 
 void helper_tlb_check_ld(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr);
 void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr);
-
-#ifdef CONFIG_DEBUG_TCG
-void helper_guard_failure(CPUArchState *env, uintptr_t retaddr,
-                          target_ulong a0, target_ulong a1);
-#else
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr);
-#endif
 
 /* Temporary aliases until backends are converted.  */
 #ifdef TARGET_WORDS_BIGENDIAN

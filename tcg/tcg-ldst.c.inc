@@ -38,11 +38,7 @@ typedef struct TCGLabelTlbCheck {
 } TCGLabelTlbCheck;
 
 typedef struct TCGLabelGuardM {
-#ifdef CONFIG_DEBUG_TCG
-    TCGReg arg;
     TCGReg entry;
-    intptr_t offset;
-#endif
 } TCGLabelGuardM;
 
 typedef enum TCGLabelSlowPathType {
