@@ -890,11 +890,19 @@ size_t tcg_code_size(void);
 size_t tcg_code_capacity(void);
 
 void tcg_tb_insert(TranslationBlock *tb);
-void tcg_tb_remove(TranslationBlock *tb);
 size_t tcg_tb_phys_invalidate_count(void);
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr);
 void tcg_tb_foreach(GTraverseFunc func, gpointer user_data);
 size_t tcg_nb_tbs(void);
+
+typedef struct TCGRestoreData {
+    uintptr_t retaddr;
+    TranslationBlock *tb_from, *tb_to;
+    target_ulong data[TARGET_INSN_START_WORDS];
+} TCGRestoreData;
+
+void tcg_restore_data_insert(uintptr_t retaddr, TCGRestoreData *restore_data);
+TCGRestoreData *tcg_restore_data_lookup(uintptr_t retaddr);
 
 /* user-mode: Called with mmap_lock held.  */
 static inline void *tcg_malloc(int size)

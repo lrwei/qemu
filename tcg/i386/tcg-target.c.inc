@@ -2082,8 +2082,9 @@ static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
                  (uintptr_t) spl->raddr);
 
-    /* Guard failure never returns.  */
-    tcg_out_jmp(s, (tcg_insn_unit *) helper_guard_failure);
+    /* Guard failure never returns, and will exit by returning to the
+     * to-be-modified return address.  */
+    tcg_out_call(s, (tcg_insn_unit *) helper_guard_failure);
     return true;
 }
 

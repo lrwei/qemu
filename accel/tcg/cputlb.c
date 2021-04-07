@@ -2731,6 +2731,9 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 
 void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
 {
+    uintptr_t tc_ptr;
+    volatile uintptr_t *frame_address = __builtin_frame_address(0);
+
 #ifdef CONFIG_DEBUG_TCG
     RESERVE_REG(rax)
     CPUTLBEntry *entry = (CPUTLBEntry *) rax;
@@ -2739,7 +2742,15 @@ void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
                   " addr_write: " TARGET_FMT_lx " retaddr: %p\n",
                   entry->addr_read, tlb_addr_write(entry), (void *) retaddr);
 #endif
-    cpu_speculation_recompile(env_cpu(env), retaddr);
+    tc_ptr = cpu_restore_state_from_guard_failure(env_cpu(env), retaddr);
+    /* Stack frame of current function should come right after its return
+     * address, as is specified by x86_64 System-V ABI.  */
+    *++frame_address = tc_ptr;
+    /* With the return address modified above, this function actually behaves
+     * like a NORETURN function, and will cause nasty problems if the caller
+     * is not aware of that. However the caller here (i.e. slow path of GUARD
+     * instruction) does know its noreturn-ness, and pends no further work.  */
+    return;
 }
 
 #undef RESREVE_REG

@@ -331,29 +331,20 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
     return p - block;
 }
 
-/* The cpu state corresponding to 'searched_pc' is restored.
- * When reset_icount is true, current TB will be interrupted and
- * icount should be recalculated.
- */
-static int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
-                                     uintptr_t searched_pc, bool reset_icount)
+static bool reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
+                                  uintptr_t searched_pc, uint16_t *pnum_insns,
+                                  target_ulong data[TARGET_INSN_START_WORDS])
 {
-    target_ulong data[TARGET_INSN_START_WORDS] = { tb->pc };
-    uintptr_t host_pc = (uintptr_t)tb->tc.ptr;
-    CPUArchState *env = cpu->env_ptr;
+    uintptr_t host_pc = (uintptr_t) tb->tc.ptr;
     uint8_t *p = tb->tc.ptr + tb->tc.size;
     int i, j, num_insns = tb->icount;
-#ifdef CONFIG_PROFILER
-    TCGProfile *prof = &tcg_ctx->prof;
-    int64_t ti = profile_getclock();
-#endif
-
     searched_pc -= GETPC_ADJ;
 
     if (searched_pc < host_pc) {
-        return -1;
+        return false;
     }
 
+    data[0] = tb->pc;
     /* Reconstruct the stored insn data while looking for the point at
        which the end of the insn exceeds the searched_pc.  */
     for (i = 0; i < num_insns; ++i) {
@@ -362,17 +353,37 @@ static int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
         }
         host_pc += decode_sleb128(&p);
         if (host_pc > searched_pc) {
-            goto found;
+            *pnum_insns = i;
+            return true;
         }
     }
-    return -1;
+    return false;
+}
 
- found:
+/* The cpu state corresponding to 'searched_pc' is restored.
+ * When reset_icount is true, current TB will be interrupted and
+ * icount should be recalculated.
+ */
+static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+                                      uintptr_t searched_pc, bool reset_icount)
+{
+    target_ulong data[TARGET_INSN_START_WORDS] = { };
+    CPUArchState *env = cpu->env_ptr;
+    uint16_t icount, num_insns = tb->icount;
+#ifdef CONFIG_PROFILER
+    TCGProfile *prof = &tcg_ctx->prof;
+    int64_t ti = profile_getclock();
+#endif
+
+    if (!reconstruct_insn_data(cpu, tb, searched_pc, &icount, data)) {
+        return false;
+    }
+
     if (reset_icount && (tb_cflags(tb) & CF_USE_ICOUNT)) {
         assert(icount_enabled());
         /* Reset the cycle counter to the start of the block
            and shift if to the number of actually executed instructions */
-        cpu_neg(cpu)->icount_decr.u16.low += num_insns - i;
+        cpu_neg(cpu)->icount_decr.u16.low += num_insns - icount;
     }
     restore_state_to_opc(env, tb, data);
 
@@ -381,7 +392,7 @@ static int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
                 prof->restore_time + profile_getclock() - ti);
     qatomic_set(&prof->restore_count, prof->restore_count + 1);
 #endif
-    return 0;
+    return true;
 }
 
 void tb_destroy(TranslationBlock *tb)
@@ -2290,6 +2301,68 @@ void cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr)
                            "to " TARGET_FMT_lx "\n", tb->pc);
 
     cpu_loop_exit_noexc(cpu);
+}
+
+uintptr_t cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr)
+{
+    TCGRestoreData *restore_data;
+    CPUArchState *env = cpu->env_ptr;
+    TranslationBlock *tb_from, *tb_to;
+
+    /* Bailout from this GUARD for the first time.  */
+    if (unlikely(!(restore_data = tcg_restore_data_lookup(retaddr)))) {
+        target_ulong data[TARGET_INSN_START_WORDS] = { };
+        target_ulong pc, cs_base;
+        uint32_t flags, cflags;
+        uint16_t icount;
+
+        tcg_debug_assert((tb_from = tcg_tb_lookup(retaddr)));
+        tcg_debug_assert(reconstruct_insn_data(cpu, tb_from, retaddr, &icount,
+                                               data));
+        restore_state_to_opc(env, tb_from, data);
+
+        cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+        /* All cpu_state except for pc should be the same as that of tb_from,
+         * as any state-changing operation (especially ones that could affect
+         * code-gen) should have ended the current TB immediately.  */
+        tcg_debug_assert(cs_base == tb_from->cs_base);
+        tcg_debug_assert(flags == tb_from->flags);
+
+        /* Make sure new TB is covered by `tb_from` to guarantee the validity
+         * of the execution.  */
+        icount = tb_from->icount - icount;
+        cflags = curr_cflags(cpu) | CF_BAILOUT | CF_MONOLITHIC | icount;
+        /* This may cause cpu_loop_exit due to code buffer overflow. Delay
+         * the allocation of TCGRestoreData to avoid memory leaking.  */
+        tb_to = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+
+        restore_data = g_new(TCGRestoreData, 1);
+        restore_data->tb_from = tb_from;
+        restore_data->tb_to = tb_to;
+        memcpy(restore_data->data, data, sizeof(data));
+        /* Note that the lookup and insertion of TCGRestoreData is not atomic
+         * as a whole, so there could be cases where multiple threads try to
+         * insert with the same RETADDR. This is fine because:
+         * 1. tb_gen_code() will always return with the first TB successfully
+         *    inserted into the QHT, and drop all the successors.
+         * 2. g_tree_insert() with existing key will call key_destroy_func on
+         *    the passed key, so the already inserted TCGRestoreData (Yes, as
+         *    KEY) will still retain its validity.  */
+        tcg_restore_data_insert(retaddr, restore_data);
+    } else {
+        tb_from = restore_data->tb_from;
+        tb_to = restore_data->tb_to;
+        restore_state_to_opc(env, tb_from, restore_data->data);
+    }
+
+    /* TB_FROM covers TB_TO in guest's address space, so it must be:
+     * 1. Page-crossing if the later crosses pages,
+     * 2. Invalidated if the later is invalidated.
+     * So, it should be safe to jump to the later in a goto_tb manner.  */
+    tcg_debug_assert(tb_to->page_addr[1] == -1 ||
+                     tb_to->page_addr[1] == tb_from->page_addr[1]);
+    tcg_debug_assert(!(tb_cflags(restore_data->tb_to) & CF_INVALID));
+    return (uintptr_t) tb_to->tc.ptr;
 }
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)

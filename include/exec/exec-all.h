@@ -67,6 +67,7 @@ bool cpu_restore_state(CPUState *cpu, uintptr_t searched_pc, bool will_exit);
 void QEMU_NORETURN cpu_loop_exit_noexc(CPUState *cpu);
 void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 void QEMU_NORETURN cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr);
+uintptr_t cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr);
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               target_ulong pc, target_ulong cs_base,
                               uint32_t flags,
@@ -464,11 +465,27 @@ struct TranslationBlock {
 #define CF_USE_ICOUNT  0x00020000
 #define CF_INVALID     0x00040000 /* TB is stale. Set with @jmp_lock held */
 #define CF_PARALLEL    0x00080000 /* Generate code for a parallel context */
+    /* Explanation of the design choice of CF_MONOLITHIC and CF_BAILOUT:
+     *
+     * 1. TBs without CF_MONOLITHIC will use optimizable memory access
+     *    sequence, i.e. TLB_CHECK + GUARDM, but can't handle accesses
+     *    that are actually MMIO, cross-page access, and so on.
+     * 2. To avoid repeated bailout from !CF_MONOLITHIC TBs in case of
+     *    the un-handlable access, the original TB should be "REPLACED"
+     *    by a CF_MONOLITHIC one. This also demands that all further
+     *    execution be redirected to the newly generated TB, which in
+     *    turn requires that CF_MONOLITHIC be excluded from CF_HASH_MASK.
+     *    For otherwise the main loop will still try to find a TB that
+     *    is compiled without CF_MONOLITHIC.
+     * 3. CF_BAILOUT is used to have TBs with and without CF_MONOLITHIC
+     *    to "COEXIST" with each other, this is necessitated by GUARD's
+     *    different nature from TLB_CHECK: GUARD failure are in most time
+     *    temporary, and should not cause the TB to be invalidated.  */
+#define CF_BAILOUT     0x00100000 /* TB to be used in bailout procedure only */
 #define CF_CLUSTER_MASK 0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
 /* cflags' mask for hashing/comparison, basically ignore CF_INVALID */
 #define CF_HASH_MASK   (~CF_INVALID)
-
     /* Per-vCPU dynamic tracing state used to generate this TB */
     uint32_t trace_vcpu_dstate;
 

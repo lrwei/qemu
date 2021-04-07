@@ -190,12 +190,18 @@ struct tcg_region_state {
 };
 
 static struct tcg_region_state region;
+
+typedef enum {
+    REGION_TREE_PRIMARY,
+    REGION_TREE_RESTORE,
+    NB_REGION_TREE_TYPES,
+} TCGRegionTreeType;
 /*
  * This is an array of struct tcg_region_tree's, with padding.
  * We use void * to simplify the computation of region_trees[i]; each
  * struct is found every tree_size bytes.
  */
-static void *region_trees;
+static void *region_trees[NB_REGION_TREE_TYPES];
 static size_t tree_size;
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
@@ -354,7 +360,7 @@ static int ptr_cmp_tb_tc(const void *ptr, const struct tb_tc *s)
     return 0;
 }
 
-static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp)
+static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp, gpointer _)
 {
     const struct tb_tc *a = ap;
     const struct tb_tc *b = bp;
@@ -385,21 +391,48 @@ static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp)
     return ptr_cmp_tb_tc(b->ptr, a);
 }
 
-static void tcg_region_trees_init(void)
+static gint restore_data_cmp(gconstpointer ap, gconstpointer bp, gpointer _)
 {
-    size_t i;
+    uintptr_t retaddr_a = ((TCGRestoreData *) ap)->retaddr;
+    uintptr_t retaddr_b = ((TCGRestoreData *) bp)->retaddr;
 
-    tree_size = ROUND_UP(sizeof(struct tcg_region_tree), qemu_dcache_linesize);
-    region_trees = qemu_memalign(qemu_dcache_linesize, region.n * tree_size);
-    for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
-
-        qemu_mutex_init(&rt->lock);
-        rt->tree = g_tree_new(tb_tc_cmp);
+    if (retaddr_a < retaddr_b) {
+        return -1;
+    } else if (retaddr_a > retaddr_b) {
+        return 1;
+    } else {
+        return 0;
     }
 }
 
-static struct tcg_region_tree *tc_ptr_to_region_tree(void *p)
+static void tcg_region_trees_init(void)
+{
+    size_t i, j;
+    static const GCompareDataFunc compare_func[NB_REGION_TREE_TYPES] = {
+        tb_tc_cmp, restore_data_cmp,
+    };
+    static const GDestroyNotify destroy_func[NB_REGION_TREE_TYPES][2] = {
+        { NULL, (void (*)(gpointer)) tb_destroy },
+        { g_free, NULL },
+    };
+
+    tree_size = ROUND_UP(sizeof(struct tcg_region_tree), qemu_dcache_linesize);
+    for (i = 0; i < NB_REGION_TREE_TYPES; i++) {
+        region_trees[i] = qemu_memalign(qemu_dcache_linesize,
+                                        region.n * tree_size);
+        for (j = 0; j < region.n; j++) {
+            struct tcg_region_tree *rt = region_trees[i] + j * tree_size;
+            qemu_mutex_init(&rt->lock);
+            /* Supply key_destroy_func for region_trees[REGION_TREE_RESTORE] to
+             * enforce proper memory deallocation on duplicated insertion.  */
+            rt->tree = g_tree_new_full(compare_func[i], NULL, destroy_func[i][0],
+                                       destroy_func[i][1]);
+        }
+    }
+}
+
+static struct tcg_region_tree *ptr_to_region_tree(TCGRegionTreeType type,
+                                                  const void *p)
 {
     size_t region_idx;
 
@@ -414,24 +447,15 @@ static struct tcg_region_tree *tc_ptr_to_region_tree(void *p)
             region_idx = offset / region.stride;
         }
     }
-    return region_trees + region_idx * tree_size;
+    return region_trees[type] + region_idx * tree_size;
 }
 
 void tcg_tb_insert(TranslationBlock *tb)
 {
-    struct tcg_region_tree *rt = tc_ptr_to_region_tree(tb->tc.ptr);
-
+    struct tcg_region_tree *rt = ptr_to_region_tree(REGION_TREE_PRIMARY,
+                                                    tb->tc.ptr);
     qemu_mutex_lock(&rt->lock);
     g_tree_insert(rt->tree, &tb->tc, tb);
-    qemu_mutex_unlock(&rt->lock);
-}
-
-void tcg_tb_remove(TranslationBlock *tb)
-{
-    struct tcg_region_tree *rt = tc_ptr_to_region_tree(tb->tc.ptr);
-
-    qemu_mutex_lock(&rt->lock);
-    g_tree_remove(rt->tree, &tb->tc);
     qemu_mutex_unlock(&rt->lock);
 }
 
@@ -442,9 +466,10 @@ void tcg_tb_remove(TranslationBlock *tb)
  */
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
 {
-    struct tcg_region_tree *rt = tc_ptr_to_region_tree((void *)tc_ptr);
+    struct tcg_region_tree *rt = ptr_to_region_tree(REGION_TREE_PRIMARY,
+                                                    (void *) tc_ptr);
     TranslationBlock *tb;
-    struct tb_tc s = { .ptr = (void *)tc_ptr };
+    struct tb_tc s = { .ptr = (void *) tc_ptr };
 
     qemu_mutex_lock(&rt->lock);
     tb = g_tree_lookup(rt->tree, &s);
@@ -452,24 +477,59 @@ TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
     return tb;
 }
 
-static void tcg_region_tree_lock_all(void)
+void tcg_restore_data_insert(uintptr_t retaddr, TCGRestoreData *restore_data)
+{
+    struct tcg_region_tree *rt = ptr_to_region_tree(REGION_TREE_RESTORE,
+                                                    (void *) retaddr);
+    /* Pack the real KEY into TCGRestoreData, see also restore_data_cmp().  */
+    restore_data->retaddr = retaddr;
+    qemu_mutex_lock(&rt->lock);
+    /* GTree would always replace the old VALUE with the new one while
+     * destroy the passed KEY on insertion with an existing KEY. So we
+     * pass TCGRestoreData as key to mimic QHT's behavior of returning
+     * existing VALUE on duplicated insertion.
+     * We could save sizeof(uintptr_t) bytes in TCGRestoreData if GTree
+     * would preserve the old VALUE, but it just doesn't work that way,
+     * and can free TCGRestoreData (if inserted as VALUE) being used by
+     * someone else.  */
+    g_tree_insert(rt->tree, restore_data, NULL);
+    qemu_mutex_unlock(&rt->lock);
+}
+
+/* RETADDR is required to be laid at offset zero of TCGRestoreData,
+ * so that we can simply pass its address as pointer to a partially
+ * constructed TCGRestoreData search key.  */
+QEMU_BUILD_BUG_ON(offsetof(TCGRestoreData, retaddr) != 0);
+
+TCGRestoreData *tcg_restore_data_lookup(uintptr_t retaddr)
+{
+    struct tcg_region_tree *rt = ptr_to_region_tree(REGION_TREE_RESTORE,
+                                                    (void *) retaddr);
+    TCGRestoreData *restore_data = NULL;
+
+    qemu_mutex_lock(&rt->lock);
+    g_tree_lookup_extended(rt->tree, &retaddr, (gpointer *) &restore_data,
+                           NULL);
+    qemu_mutex_unlock(&rt->lock);
+    return restore_data;
+}
+
+static void tcg_region_tree_lock_all(void *trees)
 {
     size_t i;
 
     for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
-
+        struct tcg_region_tree *rt = trees + i * tree_size;
         qemu_mutex_lock(&rt->lock);
     }
 }
 
-static void tcg_region_tree_unlock_all(void)
+static void tcg_region_tree_unlock_all(void *trees)
 {
     size_t i;
 
     for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
-
+        struct tcg_region_tree *rt = trees + i * tree_size;
         qemu_mutex_unlock(&rt->lock);
     }
 }
@@ -477,53 +537,47 @@ static void tcg_region_tree_unlock_all(void)
 void tcg_tb_foreach(GTraverseFunc func, gpointer user_data)
 {
     size_t i;
+    void *trees = region_trees[REGION_TREE_PRIMARY];
 
-    tcg_region_tree_lock_all();
+    tcg_region_tree_lock_all(trees);
     for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
-
+        struct tcg_region_tree *rt = trees + i * tree_size;
         g_tree_foreach(rt->tree, func, user_data);
     }
-    tcg_region_tree_unlock_all();
+    tcg_region_tree_unlock_all(trees);
 }
 
 size_t tcg_nb_tbs(void)
 {
     size_t nb_tbs = 0;
     size_t i;
+    void *trees = region_trees[REGION_TREE_PRIMARY];
 
-    tcg_region_tree_lock_all();
+    tcg_region_tree_lock_all(trees);
     for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
-
+        struct tcg_region_tree *rt = trees + i * tree_size;
         nb_tbs += g_tree_nnodes(rt->tree);
     }
-    tcg_region_tree_unlock_all();
+    tcg_region_tree_unlock_all(trees);
     return nb_tbs;
-}
-
-static gboolean tcg_region_tree_traverse(gpointer k, gpointer v, gpointer data)
-{
-    TranslationBlock *tb = v;
-
-    tb_destroy(tb);
-    return FALSE;
 }
 
 static void tcg_region_tree_reset_all(void)
 {
-    size_t i;
+    size_t i, j;
 
-    tcg_region_tree_lock_all();
-    for (i = 0; i < region.n; i++) {
-        struct tcg_region_tree *rt = region_trees + i * tree_size;
+    for (i = 0; i < NB_REGION_TREE_TYPES; i++) {
+        void *trees = region_trees[i];
 
-        g_tree_foreach(rt->tree, tcg_region_tree_traverse, NULL);
-        /* Increment the refcount first so that destroy acts as a reset */
-        g_tree_ref(rt->tree);
-        g_tree_destroy(rt->tree);
+        tcg_region_tree_lock_all(trees);
+        for (j = 0; j < region.n; j++) {
+            struct tcg_region_tree *rt = trees + j * tree_size;
+            /* Increment the refcount first so that destroy acts as a reset */
+            g_tree_ref(rt->tree);
+            g_tree_destroy(rt->tree);
+        }
+        tcg_region_tree_unlock_all(trees);
     }
-    tcg_region_tree_unlock_all();
 }
 
 static void tcg_region_bounds(size_t curr_region, void **pstart, void **pend)
