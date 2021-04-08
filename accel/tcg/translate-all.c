@@ -1482,9 +1482,9 @@ static void tb_phys_invalidate__locked(TranslationBlock *tb)
  *
  * Called with mmap_lock held in user-mode.
  */
-void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
+void tb_phys_invalidate(TranslationBlock *tb, bool locked)
 {
-    if (page_addr == -1 && tb->page_addr[0] != -1) {
+    if (!locked && tb->page_addr[0] != -1) {
         page_lock_tb(tb);
         do_tb_phys_invalidate(tb, true);
         page_unlock_tb(tb);
@@ -2163,7 +2163,7 @@ static bool tb_invalidate_phys_page(tb_page_addr_t addr, uintptr_t pc)
                                  &current_flags);
         }
 #endif /* TARGET_HAS_PRECISE_SMC */
-        tb_phys_invalidate(tb, addr);
+        tb_phys_invalidate(tb, true);
     }
     p->first_tb = (uintptr_t)NULL;
 #ifdef TARGET_HAS_PRECISE_SMC
@@ -2189,7 +2189,7 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
     if (tb) {
         /* We can use retranslation to find the PC.  */
         cpu_restore_state_from_tb(cpu, tb, retaddr, true);
-        tb_phys_invalidate(tb, -1);
+        tb_phys_invalidate(tb, false);
     } else {
         /* The exception probably happened in a helper.  The CPU state should
            have been saved before calling it. Fetch the PC from there.  */
