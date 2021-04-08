@@ -3885,6 +3885,11 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots, TCGTemp *ts,
     if (NEED_SYNC_ARG(0)) {
         temp_sync_internal(s, ots, IS_DEAD_ARG(0), s->reserved_regs,
                            preferred_regs);
+        /* Register may need to be allocated to SYNC the constant, which
+         * might happen to be in the clobber list.  */
+        if (unlikely(DO_CLOBBER_ARG(0, ots))) {
+            temp_clobber(s, ots);
+        }
     } else {
         /* Mov to a non-saved dead register makes no sense.  */
         tcg_debug_assert(!IS_DEAD_ARG(0));
