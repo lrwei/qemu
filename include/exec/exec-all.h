@@ -70,8 +70,7 @@ void QEMU_NORETURN cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr);
 uintptr_t cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr);
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               target_ulong pc, target_ulong cs_base,
-                              uint32_t flags,
-                              int cflags);
+                              uint32_t flags, uint32_t cflags);
 
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);
