@@ -2132,7 +2132,26 @@ done_algebraic_simplifying_and_constant_folding:
                  * properly handle goto_tb and goto_ptr. For now, just reset
                  * everything.  */
                 for (i = 0; i < s->nb_temps; i++) {
-                    ts_set_uninitialized(&s->temps[i]);
+                    ts = &s->temps[i];
+                    if (temp_readonly(ts) && ts_is_initialized(ts)) {
+                        ValueNumberingEntry *vne = num2vne(ts_number(ts));
+                        /* Read-only temps can last for the entire TB, but
+                         * we do have to restore its reassociation status.
+                         * For otherwise further guard hoisting procedure
+                         * will complain about GUARD's GuardHoistingInfo's
+                         * not being initialized:
+                         *
+                         * tlb_check tag, constant_0, ...
+                         * # Reset of non-read-only temps.
+                         * call xxx
+                         * # Ouch, tag' is not initialized by tlb_check.
+                         * guard tag', constant_0, ...
+                         */
+                        ts_info(ts)->reassociated = false;
+                        QSLIST_INIT(&vne->base_addresses);
+                        continue;
+                    }
+                    ts_set_uninitialized(ts);
                 }
                 /* Keep numbers that is already assigned to values, so that
                  * further transformation can leverage those information.  */
