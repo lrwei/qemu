@@ -19,11 +19,12 @@
 /* Might cause an exception, so have a longjmp destination ready */
 static inline TranslationBlock *
 tb_lookup__cpu_state(CPUState *cpu, target_ulong *pc, target_ulong *cs_base,
-                     uint32_t *flags, uint32_t cf_mask)
+                     uint32_t *flags, uint32_t cflags)
 {
     CPUArchState *env = (CPUArchState *)cpu->env_ptr;
     TranslationBlock *tb;
     uint32_t hash;
+    uint32_t cf_mask = cflags & CF_HASH_MASK;
 
     cpu_get_tb_cpu_state(env, pc, cs_base, flags);
     hash = tb_jmp_cache_hash_func(*pc);

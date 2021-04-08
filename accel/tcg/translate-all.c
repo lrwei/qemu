@@ -1650,7 +1650,7 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               target_ulong pc, target_ulong cs_base,
-                              uint32_t flags, int cflags)
+                              uint32_t flags, uint32_t cflags)
 {
     CPUArchState *env = cpu->env_ptr;
     TranslationBlock *tb, *existing_tb;
