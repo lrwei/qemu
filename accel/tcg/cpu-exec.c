@@ -208,7 +208,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
     TranslationBlock *tb;
     target_ulong cs_base, pc;
     uint32_t flags;
-    uint32_t cf_mask = (curr_cflags(cpu) & ~CF_PARALLEL) | 1;
+    uint32_t cf_mask = (curr_cflags(cpu) & ~CF_PARALLEL) | CF_MONOLITHIC | 1;
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
         start_exclusive();
@@ -729,6 +729,11 @@ int cpu_exec(CPUState *cpu)
             if (cflags == -1) {
                 cflags = curr_cflags(cpu);
             } else {
+                /* CF_MONOLITHIC is added to all {translation, execution}
+                 * request using cpu->cflags_next_tb. Hopefully this will
+                 * reduce incompatibility issues of tlb_check with other
+                 * operating mode.  */
+                cflags |= CF_MONOLITHIC;
                 cpu->cflags_next_tb = -1;
             }
 

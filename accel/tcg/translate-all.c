@@ -2282,16 +2282,19 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 
 void cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr)
 {
+#if defined(TARGET_MIPS) || defined(TARGET_SH4)
+    /* On MIPS and SH, delay slot instructions can only be restarted if
+     * they were already the first instruction in the TB.  */
+    g_assert_not_reached();
+#endif
     TranslationBlock *tb;
 
     tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
     cpu_restore_state_from_tb(cpu, tb, retaddr, true);
 
-    /* On MIPS and SH, delay slot instructions can only be restarted if
-     * they were already the first instruction in the TB.  */
-#if defined(TARGET_MIPS) || defined(TARGET_SH4)
-    g_assert_not_reached();
-#endif
+    /* The original TB should be compiled using default CFLAGS, for
+     * otherwise it will never bailout like this.  */
+    tcg_debug_assert((tb_cflags(tb) & ~CF_INVALID) == curr_cflags(cpu));
 
     /* Generate a new TB capable of doing full qemu_{ld, st}.  */
     cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
