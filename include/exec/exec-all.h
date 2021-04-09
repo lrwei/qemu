@@ -483,8 +483,24 @@ struct TranslationBlock {
 #define CF_BAILOUT     0x00100000 /* TB to be used in bailout procedure only */
 #define CF_CLUSTER_MASK 0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
-/* cflags' mask for hashing/comparison, basically ignore CF_INVALID */
-#define CF_HASH_MASK   (~CF_INVALID)
+    /* Explanation of the design choice of CF_{}_MASK:
+     *
+     * 1. The reason why CF_MONOLITHIC is ignored in CF_{HASH, LOOKUP}_MASK
+     *    has been illustrated above -- to make the main loop to be able to
+     *    pick CF_MONOLITHIC TB using default CFLAGS.
+     * 2. The reason why CF_INVALID is ignored in CF_{HASH, INSERT}_MASK is
+     *    that the bit is a "status" of a TB, rather than a "characteristic",
+     *    and is never set on insertion.
+     * 3. The reason why CF_INVALID is included in CF_LOOKUP_MASK is that
+     *    execution loop does not want to pick invalidated TBs, tracking
+     *    CF_INVALID fulfill this objective as the input CF_MASK never sets
+     *    this bit.
+     * 4. The reason why CF_MONOLITHIC is included in CF_INSERT_MASK is that
+     *    they do characterize the nature of a TB, as well as guarantees the
+     *    insertion of CF_MONOLITHIC TB in cpu_speculation_recompile().  */
+#define CF_HASH_MASK    ~(CF_INVALID | CF_MONOLITHIC)
+#define CF_LOOKUP_MASK  (CF_HASH_MASK | CF_INVALID)
+#define CF_INSERT_MASK  (CF_HASH_MASK | CF_MONOLITHIC)
     /* Per-vCPU dynamic tracing state used to generate this TB */
     uint32_t trace_vcpu_dstate;
 

@@ -274,7 +274,7 @@ static bool tb_lookup_cmp(const void *p, const void *d)
         tb->cs_base == desc->cs_base &&
         tb->flags == desc->flags &&
         tb->trace_vcpu_dstate == desc->trace_vcpu_dstate &&
-        (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == desc->cf_mask) {
+        (tb_cflags(tb) & CF_LOOKUP_MASK) == desc->cf_mask) {
         /* check next page if needed */
         if (tb->page_addr[1] == -1) {
             return true;

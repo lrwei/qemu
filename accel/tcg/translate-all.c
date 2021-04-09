@@ -1138,7 +1138,7 @@ static bool tb_cmp(const void *ap, const void *bp)
     return a->pc == b->pc &&
         a->cs_base == b->cs_base &&
         a->flags == b->flags &&
-        (tb_cflags(a) & CF_HASH_MASK) == (tb_cflags(b) & CF_HASH_MASK) &&
+        (tb_cflags(a) & CF_INSERT_MASK) == (tb_cflags(b) & CF_INSERT_MASK) &&
         a->trace_vcpu_dstate == b->trace_vcpu_dstate &&
         a->page_addr[0] == b->page_addr[0] &&
         a->page_addr[1] == b->page_addr[1];
@@ -1629,6 +1629,7 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
         tb->page_addr[1] = -1;
     }
 
+    tcg_debug_assert(!(tb->cflags & CF_INVALID));
     /* add in the hash table */
     h = tb_hash_func(phys_pc, tb->pc, tb->flags, tb->cflags & CF_HASH_MASK,
                      tb->trace_vcpu_dstate);
@@ -2287,22 +2288,46 @@ void cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr)
      * they were already the first instruction in the TB.  */
     g_assert_not_reached();
 #endif
-    TranslationBlock *tb;
+    TranslationBlock *tb, *tb2;
+    uint32_t cflags = curr_cflags(cpu) | CF_MONOLITHIC;
 
     tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
-    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
 
     /* The original TB should be compiled using default CFLAGS, for
      * otherwise it will never bailout like this.  */
     tcg_debug_assert((tb_cflags(tb) & ~CF_INVALID) == curr_cflags(cpu));
 
-    /* Generate a new TB capable of doing full qemu_{ld, st}.  */
-    cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
+    /* Create a new TB using old indices except for CFLAGS, THEN invalidate
+     * the old one, the reason for this order is documented below.  */
+    tb2 = tb_gen_code(cpu, tb->pc, tb->cs_base, tb->flags, cflags);
+
+    /* The TB (may or may not be created by this thread) with desired CFLAGS
+     * should have been inserted into QHT, despite of the existence of the
+     * not-yet-invalidated !CF_MONOLITHIC counterpart. See also tb_cmp().  */
+    tcg_debug_assert((tb_cflags(tb2) & ~CF_INVALID) == cflags);
+
+    /* Invalidating the original TB after the setting up of the new one has
+     * the merit of wasting no code buffer space -- only the thread succeed
+     * in inserting the new TB actually commits the code cache it allocates.  */
+    tb_phys_invalidate(tb, false);
+
+    /* This instruct cpu_exec() to execute the TB we just generated, if the
+     * bailout happens within the first instruction of the original TB. Or,
+     * if the bailout happens in the middle of that TB, it could proceed in
+     * the following 2 ways:
+     * 1. No existing TB starts from here, so we end up generating a new
+     *    one capable of doing full qemu_{ld, st}.
+     * 2. There already exists a damn TB compiled with !CF_MONOLITHIC, as
+     *    we mask CF_MONOLITHIC out in tb_lookup_cmp(), that one will get
+     *    picked, and invalidate immediately.
+     * Note that cpu_exec() adds CF_MONOLITHIC for all execution using
+     * cflags_next_tb, but still we keep it here for informational purpose.  */
+    cpu->cflags_next_tb = cflags;
 
     qemu_log_mask_and_addr(CPU_LOG_EXEC, tb->pc,
                            "cpu_speculation_recompile: rewound execution of TB "
                            "to " TARGET_FMT_lx "\n", tb->pc);
-
     cpu_loop_exit_noexc(cpu);
 }
 
