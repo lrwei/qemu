@@ -2729,10 +2729,32 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 #undef EXTRA_PROLOGUE
 #undef EXTRA_EPILOGUE
 
-void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
+QEMU_ALWAYS_INLINE static inline uintptr_t
+cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr)
 {
+    TCGRestoreData *restore_data;
+    CPUArchState *env = cpu->env_ptr;
+
+    if (unlikely(!(restore_data = tcg_restore_data_lookup(retaddr)))) {
+        /* Bailout from this GUARD for the first time.  */
+        return cpu_restore_state_from_guard_failure__slowpath(cpu, retaddr);
+    }
+    restore_state_to_opc(env, restore_data->tb_from, restore_data->data);
+    return (uintptr_t) restore_data->tb_to->tc.ptr;
+}
+
+/* Declare the function to be __attribute__((naked)) to prevent GCC
+ * from altering the stack pointer. NOTE THAT GCC DOCUMENTS THE USAGE
+ * AS NOT SUPPORTED, so this is nasty hack once again:
+ * "[6.33.35 x86 Function Attributes - naked] While using extended asm
+ * or a mixture of basic asm and C code may appear to work, they cannot
+ * be depended upon to work reliably and are not supported".  */
+QEMU_NORETURN __attribute__((naked))
+void helper_guard_failure(uintptr_t retaddr)
+{
+    RESERVE_REG(rbp)
+    CPUArchState *env = (CPUArchState *) rbp;
     uintptr_t tc_ptr;
-    volatile uintptr_t *frame_address = __builtin_frame_address(0);
 
 #ifdef CONFIG_DEBUG_TCG
     RESERVE_REG(rax)
@@ -2743,14 +2765,10 @@ void helper_guard_failure(CPUArchState *env, uintptr_t retaddr)
                   entry->addr_read, tlb_addr_write(entry), (void *) retaddr);
 #endif
     tc_ptr = cpu_restore_state_from_guard_failure(env_cpu(env), retaddr);
-    /* Stack frame of current function should come right after its return
-     * address, as is specified by x86_64 System-V ABI.  */
-    *++frame_address = tc_ptr;
-    /* With the return address modified above, this function actually behaves
-     * like a NORETURN function, and will cause nasty problems if the caller
-     * is not aware of that. However the caller here (i.e. slow path of GUARD
-     * instruction) does know its noreturn-ness, and pends no further work.  */
-    return;
+    /* Jump directly to the entry point of the corrsponding bailout TB,
+     * STACK POINTER MUST NOT BE ALTERED BY THE COMPILER, or execution
+     * can't return to the runtime correctly.  */
+    tcg_target_jmp(tc_ptr);
 }
 
 #undef RESREVE_REG

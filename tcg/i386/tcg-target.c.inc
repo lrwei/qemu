@@ -2067,24 +2067,22 @@ static bool tcg_out_guardm_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
     /* Signature of the helper to be called:
      *
-     * void
-     * helper_guard_failure(CPUArchState *env, uintptr_t retaddr,
-     *                      CPUTLBEntry *rax);
+     * QEMU_NORETURN
+     * void helper_guard_failure(uintptr_t retaddr, CPUArchState *rbp,
+     *                           CPUTLBEntry *rax);
      * Note that the function implements nonstandard calling convention,
-     * in the sense that the last argument is passed through register
+     * in the sense that certain arguments are passed through registers
      * specified by the corresponding argument name.  */
 
 #ifdef CONFIG_DEBUG_TCG
     /* CPUTLBEntry* is needed only for debugging purpose.  */
     tcg_out_mov(s, TCG_TYPE_TL, TCG_REG_RAX, l->entry);
 #endif
-    tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
-    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0],
                  (uintptr_t) spl->raddr);
 
-    /* Guard failure never returns, and will exit by returning to the
-     * to-be-modified return address.  */
-    tcg_out_call(s, (tcg_insn_unit *) helper_guard_failure);
+    /* Guard failure never returns.  */
+    tcg_out_jmp(s, (tcg_insn_unit *) helper_guard_failure);
     return true;
 }
 

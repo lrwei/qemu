@@ -63,11 +63,12 @@ void cpu_gen_init(void);
  * restored and the function returns false.
  */
 bool cpu_restore_state(CPUState *cpu, uintptr_t searched_pc, bool will_exit);
+uintptr_t cpu_restore_state_from_guard_failure__slowpath(CPUState *cpu,
+                                                         uintptr_t retaddr);
 
 void QEMU_NORETURN cpu_loop_exit_noexc(CPUState *cpu);
 void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 void QEMU_NORETURN cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr);
-uintptr_t cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr);
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               target_ulong pc, target_ulong cs_base,
                               uint32_t flags, uint32_t cflags);

@@ -218,6 +218,13 @@ static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
     /* no need to flush icache explicitly */
 }
 
+QEMU_NORETURN QEMU_ALWAYS_INLINE
+static inline void tcg_target_jmp(uintptr_t tc_ptr)
+{
+    asm volatile ("jmp *%0" :: "rm" (tc_ptr));
+    __builtin_unreachable();
+}
+
 /* This defines the natural memory order supported by this
  * architecture before guarantees made by various barrier
  * instructions.

@@ -2331,65 +2331,59 @@ void cpu_speculation_recompile(CPUState *cpu, uintptr_t retaddr)
     cpu_loop_exit_noexc(cpu);
 }
 
-uintptr_t cpu_restore_state_from_guard_failure(CPUState *cpu, uintptr_t retaddr)
+uintptr_t cpu_restore_state_from_guard_failure__slowpath(CPUState *cpu,
+                                                         uintptr_t retaddr)
 {
     TCGRestoreData *restore_data;
     CPUArchState *env = cpu->env_ptr;
     TranslationBlock *tb_from, *tb_to;
+    target_ulong data[TARGET_INSN_START_WORDS] = { };
+    target_ulong pc, cs_base;
+    uint32_t flags, cflags;
+    uint16_t icount;
 
-    /* Bailout from this GUARD for the first time.  */
-    if (unlikely(!(restore_data = tcg_restore_data_lookup(retaddr)))) {
-        target_ulong data[TARGET_INSN_START_WORDS] = { };
-        target_ulong pc, cs_base;
-        uint32_t flags, cflags;
-        uint16_t icount;
+    tcg_debug_assert((tb_from = tcg_tb_lookup(retaddr)));
+    tcg_debug_assert(reconstruct_insn_data(cpu, tb_from, retaddr, &icount,
+                                           data));
+    restore_state_to_opc(env, tb_from, data);
 
-        tcg_debug_assert((tb_from = tcg_tb_lookup(retaddr)));
-        tcg_debug_assert(reconstruct_insn_data(cpu, tb_from, retaddr, &icount,
-                                               data));
-        restore_state_to_opc(env, tb_from, data);
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    /* All cpu_state except for pc should be the same as that of tb_from,
+     * as any state-changing operation (especially ones that could affect
+     * code-gen) should have ended the current TB immediately.  */
+    tcg_debug_assert(cs_base == tb_from->cs_base);
+    tcg_debug_assert(flags == tb_from->flags);
 
-        cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
-        /* All cpu_state except for pc should be the same as that of tb_from,
-         * as any state-changing operation (especially ones that could affect
-         * code-gen) should have ended the current TB immediately.  */
-        tcg_debug_assert(cs_base == tb_from->cs_base);
-        tcg_debug_assert(flags == tb_from->flags);
+    /* Make sure new TB is covered by `tb_from` to guarantee the validity
+     * of the execution.  */
+    icount = tb_from->icount - icount;
+    cflags = curr_cflags(cpu) | CF_BAILOUT | CF_MONOLITHIC | icount;
+    /* This may cause cpu_loop_exit due to code buffer overflow. Delay
+     * the allocation of TCGRestoreData to avoid memory leaking.  */
+    tb_to = tb_gen_code(cpu, pc, cs_base, flags, cflags);
 
-        /* Make sure new TB is covered by `tb_from` to guarantee the validity
-         * of the execution.  */
-        icount = tb_from->icount - icount;
-        cflags = curr_cflags(cpu) | CF_BAILOUT | CF_MONOLITHIC | icount;
-        /* This may cause cpu_loop_exit due to code buffer overflow. Delay
-         * the allocation of TCGRestoreData to avoid memory leaking.  */
-        tb_to = tb_gen_code(cpu, pc, cs_base, flags, cflags);
-
-        restore_data = g_new(TCGRestoreData, 1);
-        restore_data->tb_from = tb_from;
-        restore_data->tb_to = tb_to;
-        memcpy(restore_data->data, data, sizeof(data));
-        /* Note that the lookup and insertion of TCGRestoreData is not atomic
-         * as a whole, so there could be cases where multiple threads try to
-         * insert with the same RETADDR. This is fine because:
-         * 1. tb_gen_code() will always return with the first TB successfully
-         *    inserted into the QHT, and drop all the successors.
-         * 2. g_tree_insert() with existing key will call key_destroy_func on
-         *    the passed key, so the already inserted TCGRestoreData (Yes, as
-         *    KEY) will still retain its validity.  */
-        tcg_restore_data_insert(retaddr, restore_data);
-    } else {
-        tb_from = restore_data->tb_from;
-        tb_to = restore_data->tb_to;
-        restore_state_to_opc(env, tb_from, restore_data->data);
-    }
+    restore_data = g_new(TCGRestoreData, 1);
+    restore_data->tb_from = tb_from;
+    restore_data->tb_to = tb_to;
+    memcpy(restore_data->data, data, sizeof(data));
+    /* Note that the lookup and insertion of TCGRestoreData is not atomic
+     * as a whole, so there could be cases where multiple threads try to
+     * insert with the same RETADDR. This is fine because:
+     * 1. tb_gen_code() will always return with the first TB successfully
+     *    inserted into the QHT, and drop all the successors.
+     * 2. g_tree_insert() with existing key will call key_destroy_func on
+     *    the passed key, so the already inserted TCGRestoreData (Yes, as
+     *    KEY) will still retain its validity.  */
+    tcg_restore_data_insert(retaddr, restore_data);
 
     /* TB_FROM covers TB_TO in guest's address space, so it must be:
      * 1. Page-crossing if the later crosses pages,
-     * 2. Invalidated if the later is invalidated.
+     * 2. Invalidated if the later is invalidated, however, plain checking
+     *    either here or in the fast path doesn't quite make sense, as TBs
+     *    can be invalidated by another thread at any time.
      * So, it should be safe to jump to the later in a goto_tb manner.  */
     tcg_debug_assert(tb_to->page_addr[1] == -1 ||
                      tb_to->page_addr[1] == tb_from->page_addr[1]);
-    tcg_debug_assert(!(tb_cflags(restore_data->tb_to) & CF_INVALID));
     return (uintptr_t) tb_to->tc.ptr;
 }
 
