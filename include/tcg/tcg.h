@@ -491,15 +491,18 @@ typedef enum TCGTempKind {
 } TCGTempKind;
 
 typedef struct TCGTemp {
-    TCGReg reg:8;
-    TCGType base_type:8;
-    TCGType type:8;
-    TCGTempKind kind:3;
-    unsigned int indirect_reg:1;
-    unsigned int indirect_base:1;
-    unsigned int mem_coherent:1;
-    unsigned int mem_allocated:1;
-    unsigned int temp_allocated:1;
+    TCGReg reg          : 8;
+    TCGType base_type   : 8;
+    TCGType type        : 8;
+    TCGTempKind kind    : 3;
+    bool temp_allocated : 1;
+    bool mem_allocated  : 1;
+    bool mem_coherent   : 1;
+    bool indirect_reg   : 1;
+    bool indirect_base  : 1;
+
+    /* Field up to this point are reset at tcg_temp_alloc().  */
+    struct {} end_reset_fields;
 
     /* 32-bit slot */
 
@@ -587,11 +590,11 @@ typedef struct TCGProfile {
 struct TCGContext {
     uint8_t *pool_cur, *pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
-    int nb_labels;
-    int nb_globals;
-    int nb_temps;
-    int nb_indirects;
-    int nb_ops;
+    uint32_t nb_temps;
+    uint32_t nb_globals;
+    uint32_t nb_indirects;
+    uint16_t nb_ops;
+    uint16_t nb_labels;
 
     /* goto_tb support */
     tcg_insn_unit *code_buf;
@@ -665,7 +668,6 @@ struct TCGContext {
 #endif
 
     GHashTable *const_table[TCG_TYPE_COUNT];
-    TCGTempSet free_temps[TCG_TYPE_COUNT * 2];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
 
     QTAILQ_HEAD(, TCGOp) ops, free_ops;
@@ -887,7 +889,7 @@ void tcg_set_frame(TCGContext *s, TCGReg reg, intptr_t start, intptr_t size);
 
 TCGTemp *tcg_global_mem_new_internal(TCGType, TCGv_ptr,
                                      intptr_t, const char *);
-TCGTemp *tcg_temp_new_internal(TCGType, bool);
+TCGTemp *tcg_temp_new_internal(TCGType, TCGTempKind);
 void tcg_temp_free_internal(TCGTemp *);
 TCGv_vec tcg_temp_new_vec(TCGType type);
 TCGv_vec tcg_temp_new_vec_matching(TCGv_vec match);
@@ -921,13 +923,13 @@ static inline TCGv_i32 tcg_global_mem_new_i32(TCGv_ptr reg, intptr_t offset,
 
 static inline TCGv_i32 tcg_temp_new_i32(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I32, false);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I32, TEMP_NORMAL);
     return temp_tcgv_i32(t);
 }
 
 static inline TCGv_i32 tcg_temp_local_new_i32(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I32, true);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I32, TEMP_LOCAL);
     return temp_tcgv_i32(t);
 }
 
@@ -940,13 +942,13 @@ static inline TCGv_i64 tcg_global_mem_new_i64(TCGv_ptr reg, intptr_t offset,
 
 static inline TCGv_i64 tcg_temp_new_i64(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I64, false);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I64, TEMP_NORMAL);
     return temp_tcgv_i64(t);
 }
 
 static inline TCGv_i64 tcg_temp_local_new_i64(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I64, true);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_I64, TEMP_LOCAL);
     return temp_tcgv_i64(t);
 }
 
@@ -959,13 +961,13 @@ static inline TCGv_ptr tcg_global_mem_new_ptr(TCGv_ptr reg, intptr_t offset,
 
 static inline TCGv_ptr tcg_temp_new_ptr(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_PTR, false);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_NORMAL);
     return temp_tcgv_ptr(t);
 }
 
 static inline TCGv_ptr tcg_temp_local_new_ptr(void)
 {
-    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_PTR, true);
+    TCGTemp *t = tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_LOCAL);
     return temp_tcgv_ptr(t);
 }
 
@@ -1068,16 +1070,20 @@ TCGv_vec tcg_const_ones_vec_matching(TCGv_vec);
  * Locate or create a read-only temporary that is a constant.
  * This kind of temporary need not and should not be freed.
  */
-TCGTemp *tcg_constant_internal(TCGType type, int64_t val);
+bool tcg_constant_internal(TCGType type, int64_t val, TCGTemp **pts);
 
 static inline TCGv_i32 tcg_constant_i32(int32_t val)
 {
-    return temp_tcgv_i32(tcg_constant_internal(TCG_TYPE_I32, val));
+    TCGTemp *ts;
+    tcg_constant_internal(TCG_TYPE_I32, val, &ts);
+    return temp_tcgv_i32(ts);
 }
 
 static inline TCGv_i64 tcg_constant_i64(int64_t val)
 {
-    return temp_tcgv_i64(tcg_constant_internal(TCG_TYPE_I64, val));
+    TCGTemp *ts;
+    tcg_constant_internal(TCG_TYPE_I64, val, &ts);
+    return temp_tcgv_i64(ts);
 }
 
 TCGv_vec tcg_constant_vec(TCGType type, unsigned vece, int64_t val);

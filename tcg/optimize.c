@@ -244,7 +244,12 @@ static void tcg_opt_gen_movi(TCGContext *s, TCGTempSet *temps_used,
     }
 
     /* Convert movi to mov with constant temp. */
-    tv = tcg_constant_internal(type, val);
+    if (tcg_constant_internal(type, val, &tv)) {
+        /* Given that tcg_temp_alloc() no longer clears all of TCGTemp,
+         * one has to clear .STATE_PTR manually to prevent init_ts_info()
+         * from being disturbed by garbage value.  */
+        tv->state_ptr = NULL;
+    }
     init_ts_info(temps_used, tv);
     tcg_opt_gen_mov(s, op, dst, temp_arg(tv));
 }
