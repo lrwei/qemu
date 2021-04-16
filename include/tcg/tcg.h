@@ -477,59 +477,6 @@ static inline TCGCond tcg_high_cond(TCGCond c)
     }
 }
 
-typedef enum TCGTempKind {
-    /* Temp is dead at the end of all basic blocks. */
-    TEMP_NORMAL,
-    /* Temp is saved across basic blocks but dead at the end of TBs. */
-    TEMP_LOCAL,
-    /* Temp is saved across both basic blocks and translation blocks. */
-    TEMP_GLOBAL,
-    /* Temp is in a fixed register. */
-    TEMP_FIXED,
-    /* Temp is a fixed constant. */
-    TEMP_CONST,
-} TCGTempKind;
-
-typedef struct TCGTemp {
-    /* No BASE_TYPE (including vector types) except for TCG_TYPE_I64
-     * on 32-bit hosts is still implemented using a different TYPE,
-     * of which support will be dropped as we move to 64-bit hosts.  */
-    union {
-        /* uint8_t instead of original enum type is used to let the
-         * compiler pack fields better.  */
-        uint8_t base_type;      /* TCGType */
-        uint8_t type;           /* TCGType */
-    };
-    uint8_t kind        : 3;    /* TCGTempKind */
-    bool temp_allocated : 1;
-    bool mem_allocated  : 1;
-    bool mem_coherent   : 1;
-    bool indirect_reg   : 1;
-    bool indirect_base  : 1;
-    /* Field up to this point are reset at tcg_temp_alloc().  */
-    struct {} end_reset_fields;
-    uint16_t reg;               /* TCGReg */
-
-    /* 32-bit slot */
-
-    int64_t val;
-    struct TCGTemp *mem_base;
-    intptr_t mem_offset;
-    const char *name;
-
-    /* Pass-specific information that can be stored for a temporary.
-       One word worth of integer data, and one pointer to data
-       allocated separately.  */
-    uintptr_t state;
-    void *state_ptr;
-} TCGTemp;
-
-typedef struct TCGContext TCGContext;
-
-typedef struct TCGTempSet {
-    unsigned long l[BITS_TO_LONGS(TCG_MAX_TEMPS)];
-} TCGTempSet;
-
 /* While we limit helpers to 6 arguments, for 32-bit hosts, with padding,
    this imples a max of 6*2 (64-bit in) + 2 (64-bit out) = 14 operands.
    There are never more than 2 outputs, which means that we can store all
@@ -572,6 +519,58 @@ typedef struct TCGOp {
 /* Make sure operands fit in the bitfields above.  */
 QEMU_BUILD_BUG_ON(NB_OPS > (1 << 8));
 
+typedef enum TCGTempKind {
+    /* Temp is dead at the end of all basic blocks. */
+    TEMP_NORMAL,
+    /* Temp is saved across basic blocks but dead at the end of TBs. */
+    TEMP_LOCAL,
+    /* Temp is saved across both basic blocks and translation blocks. */
+    TEMP_GLOBAL,
+    /* Temp is in a fixed register. */
+    TEMP_FIXED,
+    /* Temp is a fixed constant. */
+    TEMP_CONST,
+} TCGTempKind;
+
+typedef struct TCGTemp {
+    /* No BASE_TYPE (including vector types) except for TCG_TYPE_I64
+     * on 32-bit hosts is still implemented using a different TYPE,
+     * of which support will be dropped as we move to 64-bit hosts.  */
+    union {
+        /* uint8_t instead of original enum type is used to let the
+         * compiler pack fields better.  */
+        uint8_t base_type;      /* TCGType */
+        uint8_t type;           /* TCGType */
+    };
+    uint8_t kind        : 3;    /* TCGTempKind */
+    bool temp_allocated : 1;
+    bool mem_allocated  : 1;
+    bool mem_coherent   : 1;
+    bool indirect_reg   : 1;
+    bool indirect_base  : 1;
+    /* Field up to this point are reset at tcg_temp_alloc().  */
+    struct {} end_reset_fields;
+    uint16_t reg;               /* TCGReg */
+
+    /* 32-bit slot */
+
+    int64_t val;
+    struct TCGTemp *mem_base;
+    intptr_t mem_offset;
+    union {
+        const char *name;
+        /* Defining OP of CANONICAL VARIABLEs to be filled in
+         * tcg_optimize(), valid only for TEMP_NORMALs.  */
+        TCGOp *defining_op;
+    };
+
+    /* Pass-specific information that can be stored for a temporary.
+       One word worth of integer data, and one pointer to data
+       allocated separately.  */
+    uintptr_t state;
+    void *state_ptr;
+} TCGTemp;
+
 typedef struct TCGProfile {
     int64_t cpu_exec_time;
     int64_t tb_count1;
@@ -593,7 +592,7 @@ typedef struct TCGProfile {
     int64_t table_op_count[NB_OPS];
 } TCGProfile;
 
-struct TCGContext {
+typedef struct TCGContext {
     uint8_t *pool_cur, *pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     uint32_t nb_temps;
@@ -688,11 +687,25 @@ struct TCGContext {
 
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;
-};
+} TCGContext;
 
 static inline bool temp_readonly(TCGTemp *ts)
 {
     return ts->kind >= TEMP_FIXED;
+}
+
+static inline bool temp_phi(TCGTemp *ts)
+{
+    return ts->kind == TEMP_LOCAL || ts->kind == TEMP_GLOBAL;
+}
+
+static inline TCGOp *temp_definition(TCGTemp *ts)
+{
+    if (temp_readonly(ts)) {
+        return NULL;
+    }
+    tcg_debug_assert(ts->kind == TEMP_NORMAL);
+    return ts->defining_op;
 }
 
 extern TCGContext tcg_init_ctx;

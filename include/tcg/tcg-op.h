@@ -340,6 +340,7 @@ void tcg_gen_abs_i32(TCGv_i32, TCGv_i32);
 
 static inline void tcg_gen_discard_i32(TCGv_i32 arg)
 {
+    tcg_debug_assert(temp_phi(tcgv_i32_temp(arg)));
     tcg_gen_op1_i32(INDEX_op_discard, arg);
 }
 
@@ -537,6 +538,7 @@ void tcg_gen_abs_i64(TCGv_i64, TCGv_i64);
 #if TCG_TARGET_REG_BITS == 64
 static inline void tcg_gen_discard_i64(TCGv_i64 arg)
 {
+    tcg_debug_assert(temp_phi(tcgv_i64_temp(arg)));
     tcg_gen_op1_i64(INDEX_op_discard, arg);
 }
 
