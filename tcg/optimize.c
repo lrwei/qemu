@@ -713,7 +713,7 @@ static bool swap_commutative2(TCGArg *p1, TCGArg *p2)
     return false;
 }
 
-void tcg_optimize(TCGContext *s)
+static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s)
 {
     TCGOp *op, *op_next, *prev_mb = NULL;
     size_t i;
@@ -1646,4 +1646,74 @@ done_algebraic_simplifying_and_constant_folding:
     done_this_op:
         ;
     }
+}
+
+// #define DEBUG_TCG_SSA
+
+#ifdef DEBUG_TCG_SSA
+static void tcg_opt_check_ssa(TCGContext *s)
+{
+    TCGOp *op;
+    size_t i;
+
+    for (i = 0; i < s->nb_temps; i++) {
+        s->temps[i].state = 0;
+    }
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        uint8_t nb_oargs, nb_iargs;
+        TCGTemp *ts;
+
+        if (op->opc == INDEX_op_call) {
+            nb_oargs = TCGOP_CALLO(op);
+            nb_iargs = TCGOP_CALLI(op);
+        } else {
+            const TCGOpDef *def = &tcg_op_defs[op->opc];
+            nb_oargs = def->nb_oargs;
+            nb_iargs = def->nb_iargs;
+        }
+
+        for (i = 0; i < nb_oargs; i++) {
+            ts = arg_temp(op->args[i]);
+            switch (ts->kind) {
+            case TEMP_NORMAL:
+                tcg_debug_assert(temp_definition(ts) == op);
+                tcg_debug_assert(++ts->state == 1);
+                break;
+            case TEMP_LOCAL:
+            case TEMP_GLOBAL:
+                tcg_debug_assert(op->opc == type_to_mov_opc(ts->type) ||
+                                 op->opc == INDEX_op_discard);
+                break;
+            default:
+                g_assert_not_reached();
+            }
+        }
+        for ( ; i < nb_oargs + nb_iargs; i++) {
+            ts = arg_temp(op->args[i]);
+            switch (ts->kind) {
+            case TEMP_NORMAL:
+                tcg_debug_assert(ts->state == 1);
+                break;
+            case TEMP_LOCAL:
+            case TEMP_GLOBAL:
+                tcg_debug_assert(op->opc == type_to_mov_opc(ts->type));
+                break;
+            case TEMP_FIXED:
+            case TEMP_CONST:
+                break;
+            default:
+                g_assert_not_reached();
+            }
+        }
+    }
+}
+#endif
+
+void tcg_optimize(TCGContext *s)
+{
+    tcg_opt_convert_to_ssa_and_peephole(s);
+#ifdef DEBUG_TCG_SSA
+    tcg_opt_check_ssa(s);
+#endif
 }
