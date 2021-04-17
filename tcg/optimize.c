@@ -365,6 +365,53 @@ static bool args_are_copies(TCGArg iarg1, TCGArg iarg2)
     return iarg1 == iarg2;
 }
 
+static void tcg_opt_aggregate_offset(TCGOp *op)
+{
+    TCGOp *def_op = temp_definition(arg_temp(op->args[1]));
+    int64_t offset;
+
+    switch (op->opc) {
+    CASE_OP_32_64(add):
+        offset = arg_value(op->args[2]);
+        break;
+    case INDEX_op_sub_i32:
+        op->opc = INDEX_op_add_i32;
+        /* subi<i32>(constant<i32>) <=> addi<i32>(neg<i32>(constant<i32>))
+         * holds for all constant<i32> /in [-2**31, 2**31).  */
+        offset = -((int32_t) arg_value(op->args[2]));
+        break;
+    case INDEX_op_sub_i64:
+        op->opc = INDEX_op_add_i64;
+        offset = -arg_value(op->args[2]);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (def_op) {
+        switch (def_op->opc) {
+        CASE_OP_32_64(add):
+            if (arg_is_const(def_op->args[2])) {
+                offset += arg_value(def_op->args[2]);
+                op->args[1] = def_op->args[1];
+            }
+            if (def_op->opc == INDEX_op_add_i32
+                && unlikely(offset != (int32_t) offset)) {
+                offset = (int32_t) offset;
+            }
+            break;
+        CASE_OP_32_64(sub):
+            /* Previous SUBI operations should have been transformed
+             * into ADDIs.  */
+            tcg_debug_assert(!arg_is_const(def_op->args[2]));
+            break;
+        default:
+            break;
+        }
+    }
+    op->args[2] = tcg_opt_constant_new(arg_temp(op->args[2])->type, offset);
+}
+
 static uint64_t do_constant_folding_2(TCGOpcode op, uint64_t x, uint64_t y)
 {
     uint64_t l64, h64;
@@ -1048,6 +1095,11 @@ static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s)
 
         CASE_OP_32_64(add):
         CASE_OP_32_64(sub):
+            if (!arg_is_const(op->args[1]) && arg_is_const(op->args[2])) {
+                tcg_opt_aggregate_offset(op);
+                opc = op->opc;
+                break;
+            }
         CASE_OP_32_64(mul):
         CASE_OP_32_64(or):
         CASE_OP_32_64(and):
