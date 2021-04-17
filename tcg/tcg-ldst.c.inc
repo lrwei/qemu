@@ -24,10 +24,8 @@ typedef struct TCGLabelQemuLdst {
     bool is_ld;             /* qemu_ld: true, qemu_st: false */
     TCGMemOpIdx oi;
     TCGType type;           /* result type of a load */
-    TCGReg addrlo_reg;      /* reg index for low word of guest virtual addr */
-    TCGReg addrhi_reg;      /* reg index for high word of guest virtual addr */
-    TCGReg datalo_reg;      /* reg index for low word to be loaded or stored */
-    TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
+    TCGReg data_reg;        /* reg index for data to be loaded or stored */
+    TCGReg addr_reg;        /* reg index for guest virtual addr */
 } TCGLabelQemuLdst;
 
 typedef enum TCGLabelSlowPathType {
