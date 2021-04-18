@@ -789,6 +789,8 @@ void tcg_register_thread(void)
             s->temps[i].mem_base = &s->temps[b];
         }
     }
+    /* Relink frame_temp.  */
+    s->frame_temp = &s->temps[tcg_init_ctx.frame_temp - tcg_init_ctx.temps];
 
     /* Claim an entry in tcg_ctxs */
     n = qatomic_fetch_inc(&n_tcg_ctxs);
