@@ -218,6 +218,7 @@ static inline bool tcg_target_const_match(tcg_target_long val, TCGType type,
 
 #define OPC_ARITH_EvIz	(0x81)
 #define OPC_ARITH_EvIb	(0x83)
+#define OPC_ARITH_EvGv	(0x01)		/* ... plus (ARITH_FOO << 3) */
 #define OPC_ARITH_GvEv	(0x03)		/* ... plus (ARITH_FOO << 3) */
 #define OPC_ANDN        (0xf2 | P_EXT38)
 #define OPC_ADD_GvEv	(OPC_ARITH_GvEv | (ARITH_ADD << 3))
@@ -228,6 +229,7 @@ static inline bool tcg_target_const_match(tcg_target_long val, TCGType type,
 #define OPC_BSWAP	(0xc8 | P_EXT)
 #define OPC_CALL_Jz	(0xe8)
 #define OPC_CMOVCC      (0x40 | P_EXT)  /* ... plus condition code */
+#define OPC_CMP_EvGv	(OPC_ARITH_EvGv | (ARITH_CMP << 3))
 #define OPC_CMP_GvEv	(OPC_ARITH_GvEv | (ARITH_CMP << 3))
 #define OPC_DEC_r32	(0x48)
 #define OPC_IMUL_GvEv	(0xaf | P_EXT)
@@ -1268,6 +1270,29 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, int small)
     }
 }
 
+__attribute__((unused))
+static void tcg_out_cmpm(TCGContext *s, TCGArg base, intptr_t offset,
+                         TCGArg arg, BackendValType arg_type, int rexw)
+{
+    if (arg_type == BACKEND_REG) {
+        /* cmp %arg, offset(base) */
+        tcg_out_modrm_offset(s, OPC_CMP_EvGv + rexw, arg, base, offset);
+    } else {
+        /* cmp $arg, offset(base) */
+        tcg_debug_assert(arg_type == BACKEND_CONST);
+        if (arg == (int8_t) arg) {
+            tcg_out_modrm_offset(s, OPC_ARITH_EvIb + rexw, ARITH_CMP, base,
+                                 offset);
+            tcg_out8(s, arg);
+        } else {
+            tcg_debug_assert(arg == (int32_t) arg);
+            tcg_out_modrm_offset(s, OPC_ARITH_EvIz + rexw, ARITH_CMP, base,
+                                 offset);
+            tcg_out32(s, arg);
+        }
+    }
+}
+
 static void tcg_out_cmp(TCGContext *s, TCGArg arg1, TCGArg arg2,
                         BackendValType arg2_type, int rexw)
 {
@@ -1276,9 +1301,11 @@ static void tcg_out_cmp(TCGContext *s, TCGArg arg1, TCGArg arg2,
             /* test r, r */
             tcg_out_modrm(s, OPC_TESTL + rexw, arg1, arg1);
         } else {
+            /* cmp $arg2, %arg1 */
             tgen_arithi(s, ARITH_CMP + rexw, arg1, arg2, 0);
         }
     } else {
+        /* cmp %arg2, %arg1 */
         tgen_arithr(s, ARITH_CMP + rexw, arg1, arg2);
     }
 }
