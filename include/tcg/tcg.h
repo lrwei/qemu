@@ -491,18 +491,24 @@ typedef enum TCGTempKind {
 } TCGTempKind;
 
 typedef struct TCGTemp {
-    TCGReg reg          : 8;
-    TCGType base_type   : 8;
-    TCGType type        : 8;
-    TCGTempKind kind    : 3;
+    /* No BASE_TYPE (including vector types) except for TCG_TYPE_I64
+     * on 32-bit hosts is still implemented using a different TYPE,
+     * of which support will be dropped as we move to 64-bit hosts.  */
+    union {
+        /* uint8_t instead of original enum type is used to let the
+         * compiler pack fields better.  */
+        uint8_t base_type;      /* TCGType */
+        uint8_t type;           /* TCGType */
+    };
+    uint8_t kind        : 3;    /* TCGTempKind */
     bool temp_allocated : 1;
     bool mem_allocated  : 1;
     bool mem_coherent   : 1;
     bool indirect_reg   : 1;
     bool indirect_base  : 1;
-
     /* Field up to this point are reset at tcg_temp_alloc().  */
     struct {} end_reset_fields;
+    uint16_t reg;               /* TCGReg */
 
     /* 32-bit slot */
 

@@ -1146,26 +1146,30 @@ void tcg_func_start(TCGContext *s)
     QSIMPLEQ_INIT(&s->labels);
 }
 
-static TCGTemp *tcg_temp_alloc(TCGContext *s)
+static TCGTemp *tcg_temp_alloc(TCGContext *s, TCGType type, TCGTempKind kind)
 {
     uint32_t n = s->nb_temps++;
+    TCGTemp *ts = &s->temps[n];
 
     if (unlikely(n >= TCG_MAX_TEMPS)) {
         /* Signal overflow, starting over with fewer guest insns.  */
         siglongjmp(s->jmp_trans, -2);
     }
-    return memset(&s->temps[n], 0, offsetof(TCGTemp, end_reset_fields));
+    memset(ts, 0, offsetof(TCGTemp, end_reset_fields));
+    ts->type = type;
+    ts->kind = kind;
+    return ts;
 }
 
-static TCGTemp *tcg_global_alloc(TCGContext *s)
+static TCGTemp *tcg_global_alloc(TCGContext *s, TCGType type, bool fixed)
 {
     TCGTemp *ts;
+    TCGTempKind kind = fixed ? TEMP_FIXED : TEMP_GLOBAL;
 
     tcg_debug_assert(s->nb_globals == s->nb_temps);
     tcg_debug_assert(s->nb_globals < TCG_MAX_TEMPS);
     s->nb_globals++;
-    ts = tcg_temp_alloc(s);
-    ts->kind = TEMP_GLOBAL;
+    ts = tcg_temp_alloc(s, type, kind);
     return ts;
 }
 
@@ -1174,14 +1178,9 @@ static TCGTemp *tcg_global_reg_new_internal(TCGContext *s, TCGType type,
 {
     TCGTemp *ts;
 
-    if (TCG_TARGET_REG_BITS == 32 && type != TCG_TYPE_I32) {
-        tcg_abort();
-    }
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
 
-    ts = tcg_global_alloc(s);
-    ts->base_type = type;
-    ts->type = type;
-    ts->kind = TEMP_FIXED;
+    ts = tcg_global_alloc(s, type, true);
     ts->reg = reg;
     ts->name = name;
     tcg_regset_set_reg(s->reserved_regs, reg);
@@ -1201,72 +1200,32 @@ TCGTemp *tcg_global_mem_new_internal(TCGType type, TCGv_ptr base,
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *base_ts = tcgv_ptr_temp(base);
-    TCGTemp *ts = tcg_global_alloc(s);
-    bool indirect_reg = false, bigendian = false;
-#ifdef HOST_WORDS_BIGENDIAN
-    bigendian = true;
-#endif
+    bool indirect_reg = false;
+    TCGTemp *ts;
 
-    switch (base_ts->kind) {
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    switch (__builtin_expect(base_ts->kind, TEMP_FIXED)) {
     case TEMP_FIXED:
         break;
     case TEMP_GLOBAL:
         /* We do not support double-indirect registers.  */
         tcg_debug_assert(!base_ts->indirect_reg);
         base_ts->indirect_base = true;
-        s->nb_indirects += (TCG_TARGET_REG_BITS == 32 && type == TCG_TYPE_I64
-                            ? 2 : 1);
+        s->nb_indirects++;
         indirect_reg = true;
         break;
     default:
         g_assert_not_reached();
     }
 
-    if (TCG_TARGET_REG_BITS == 32 && type == TCG_TYPE_I64) {
-        TCGTemp *ts2 = tcg_global_alloc(s);
-        char buf[64];
-
-        ts->base_type = TCG_TYPE_I64;
-        ts->type = TCG_TYPE_I32;
-        ts->indirect_reg = indirect_reg;
-        ts->mem_allocated = true;
-        ts->mem_base = base_ts;
-        ts->mem_offset = offset + bigendian * 4;
-        pstrcpy(buf, sizeof(buf), name);
-        pstrcat(buf, sizeof(buf), "_0");
-        ts->name = strdup(buf);
-
-        tcg_debug_assert(ts2 == ts + 1);
-        ts2->base_type = TCG_TYPE_I64;
-        ts2->type = TCG_TYPE_I32;
-        ts2->indirect_reg = indirect_reg;
-        ts2->mem_allocated = true;
-        ts2->mem_base = base_ts;
-        ts2->mem_offset = offset + (1 - bigendian) * 4;
-        pstrcpy(buf, sizeof(buf), name);
-        pstrcat(buf, sizeof(buf), "_1");
-        ts2->name = strdup(buf);
-    } else {
-        ts->base_type = type;
-        ts->type = type;
-        ts->indirect_reg = indirect_reg;
-        ts->mem_allocated = true;
-        ts->mem_base = base_ts;
-        ts->mem_offset = offset;
-        ts->name = name;
-    }
+    ts = tcg_global_alloc(s, type, false);
+    ts->indirect_reg = indirect_reg;
+    ts->mem_allocated = true;
+    ts->mem_base = base_ts;
+    ts->mem_offset = offset;
+    ts->name = name;
     return ts;
-}
-
-static inline void tcg_temp_initialize(TCGTemp *ts, TCGType base_type,
-                                       TCGType type, TCGTempKind kind)
-{
-    ts->base_type = base_type;
-    ts->type = type;
-    ts->kind = kind;
-#ifdef CONFIG_DEBUG_TCG
-    ts->temp_allocated = true;
-#endif
 }
 
 TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind)
@@ -1274,18 +1233,9 @@ TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind)
     TCGContext *s = tcg_ctx;
     TCGTemp *ts;
 
-    ts = tcg_temp_alloc(s);
-    if (TCG_TARGET_REG_BITS == 32 && type == TCG_TYPE_I64) {
-        TCGTemp *ts2 = tcg_temp_alloc(s);
-
-        tcg_debug_assert(ts2 == ts + 1);
-        tcg_temp_initialize(ts, TCG_TYPE_I64, TCG_TYPE_I32, kind);
-        tcg_temp_initialize(ts2, TCG_TYPE_I64, TCG_TYPE_I32, kind);
-    } else {
-        tcg_temp_initialize(ts, type, type, kind);
-    }
-
+    ts = tcg_temp_alloc(s, type, kind);
 #if defined(CONFIG_DEBUG_TCG)
+    ts->temp_allocated = true;
     if (kind <= TEMP_LOCAL) {
         s->temps_in_use++;
     }
@@ -1329,7 +1279,7 @@ TCGv_vec tcg_temp_new_vec_matching(TCGv_vec match)
 
 void tcg_temp_free_internal(TCGTemp *ts)
 {
-    /* In order to simplify users of tcg_constant_*, silently ignore free. */
+    /* In order to simplify users of tcg_constant_*, silently ignore free.  */
     if (ts->kind == TEMP_CONST) {
         return;
     }
@@ -1339,11 +1289,8 @@ void tcg_temp_free_internal(TCGTemp *ts)
     if (tcg_ctx->temps_in_use < 0) {
         fprintf(stderr, "More temporaries freed than allocated!\n");
     }
-#endif
-
     tcg_debug_assert(ts->kind < TEMP_GLOBAL);
     tcg_debug_assert(ts->temp_allocated);
-#ifdef CONFIG_DEBUG_TCG
     ts->temp_allocated = false;
 #endif
 }
@@ -1363,18 +1310,7 @@ bool tcg_constant_internal(TCGType type, int64_t val, TCGTemp **pts)
     ts = g_hash_table_lookup(h, &val);
     if ((not_found = ts == NULL)) {
         ts = tcg_temp_new_internal(type, TEMP_CONST);
-        if (TCG_TARGET_REG_BITS == 32 && type == TCG_TYPE_I64) {
-            TCGTemp *ts2 = ts + 1;
-            /*
-             * Retain the full value of the 64-bit constant in the low
-             * part, so that the hash table works.  Actual uses will
-             * truncate the value to the low part.
-             */
-            ts->val = val;
-            ts2->val = val >> 32;
-        } else {
-            ts->val = val;
-        }
+        ts->val = val;
         g_hash_table_insert(h, &ts->val, ts);
     }
     *pts = ts;
@@ -2957,9 +2893,7 @@ static bool liveness_pass_2(TCGContext *s)
     for (i = 0; i < nb_globals; ++i) {
         TCGTemp *its = &s->temps[i];
         if (its->indirect_reg) {
-            TCGTemp *dts = tcg_temp_alloc(s);
-            dts->type = its->type;
-            dts->base_type = its->base_type;
+            TCGTemp *dts = tcg_temp_alloc(s, its->type, TEMP_NORMAL);
             its->state_ptr = dts;
         } else {
             its->state_ptr = NULL;
