@@ -1387,9 +1387,8 @@ int tcg_check_temp_count(void)
 }
 #endif
 
-/* Return true if OP may appear in the opcode stream.
-   Test the runtime variable that controls each opcode.  */
-bool tcg_op_supported(TCGOpcode op)
+/* Return true if codegen of OP should be handled by tcg_reg_alloc_op().  */
+static bool tcg_op_supported_by_backend(TCGOpcode op)
 {
     const bool have_vec
         = TCG_TARGET_HAS_v64 | TCG_TARGET_HAS_v128 | TCG_TARGET_HAS_v256;
@@ -1398,9 +1397,15 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_discard:
     case INDEX_op_set_label:
     case INDEX_op_call:
+    case INDEX_op_insn_start:
+    case INDEX_op_mov_i32:
+    case INDEX_op_mov_i64:
+    case INDEX_op_mov_vec:
+    case INDEX_op_dup_vec:
+        return false;
+
     case INDEX_op_br:
     case INDEX_op_mb:
-    case INDEX_op_insn_start:
     case INDEX_op_exit_tb:
     case INDEX_op_goto_tb:
     case INDEX_op_qemu_ld_i32:
@@ -1412,7 +1417,6 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_goto_ptr:
         return TCG_TARGET_HAS_goto_ptr;
 
-    case INDEX_op_mov_i32:
     case INDEX_op_setcond_i32:
     case INDEX_op_brcond_i32:
     case INDEX_op_ld8u_i32:
@@ -1505,7 +1509,6 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_setcond2_i32:
         return TCG_TARGET_REG_BITS == 32;
 
-    case INDEX_op_mov_i64:
     case INDEX_op_setcond_i64:
     case INDEX_op_brcond_i64:
     case INDEX_op_ld8u_i64:
@@ -1609,8 +1612,6 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_mulsh_i64:
         return TCG_TARGET_HAS_mulsh_i64;
 
-    case INDEX_op_mov_vec:
-    case INDEX_op_dup_vec:
     case INDEX_op_dupm_vec:
     case INDEX_op_ld_vec:
     case INDEX_op_st_vec:
@@ -4410,7 +4411,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             /* fall through */
         default:
             /* Sanity check that we've not introduced any unhandled opcodes. */
-            tcg_debug_assert(tcg_op_supported(opc));
+            tcg_debug_assert(tcg_op_supported_by_backend(opc));
             /* Note: in order to speed up the code, it would be much
                faster to have specialized register allocator functions for
                some common argument patterns */
