@@ -203,6 +203,8 @@ DEF(qemu_ld_i64, 1, 1, 1,
 DEF(qemu_st_i64, 0, 2, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_64BIT)
 
+DEF(side_effect, 0, 0, 0, TCG_OPF_SIDE_EFFECTS | TCG_OPF_NOT_PRESENT)
+
 /* Host vector support.  */
 
 #define IMPLVEC  TCG_OPF_VECTOR | IMPL(TCG_TARGET_MAYBE_vec)

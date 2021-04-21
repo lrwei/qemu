@@ -1402,6 +1402,7 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_mov_i64:
     case INDEX_op_mov_vec:
     case INDEX_op_dup_vec:
+    case INDEX_op_side_effect:
         return false;
 
     case INDEX_op_br:
@@ -2691,6 +2692,12 @@ static void liveness_pass_1(TCGContext *s)
             ts = arg_temp(op->args[0]);
             ts->state = TS_DEAD;
             la_reset_pref(ts);
+            break;
+        case INDEX_op_side_effect:
+            /* Sync all TEMP_GLOBALs back to their canonical locations within
+             * CPUArchState, JUST in case of the execution bailout due to the
+             * ridiculous possibility of triggering memory exceptions.  */
+            la_global_sync(s, nb_globals);
             break;
 
         case INDEX_op_add2_i32:
@@ -4408,8 +4415,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             if (tcg_reg_alloc_dup2(s, op)) {
                 break;
             }
-            /* fall through */
+            goto do_default;
+        case INDEX_op_side_effect:
+            sync_globals(s);
+            break;
         default:
+        do_default:
             /* Sanity check that we've not introduced any unhandled opcodes. */
             tcg_debug_assert(tcg_op_supported_by_backend(opc));
             /* Note: in order to speed up the code, it would be much
