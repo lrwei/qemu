@@ -2704,6 +2704,28 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
     tlb_check_helper(TCG_TARGET_AREG0, addr, oi, retaddr, false);
 }
 
+/* Declare the function to be __attribute__((naked)) to prevent GCC
+ * from altering the stack pointer. BE AWARE THAT GCC DOCUMENTS THE
+ * USAGE AS NOT SUPPORTED, so this is nasty hack once again:
+ * "[6.33.35 x86 Function Attributes - naked]:
+ * While using extended asm or a mixture of basic asm and C code may
+ * appear to work, they cannot be depended upon to work reliably and
+ * are not supported."
+ * One can get rid of this hack simply by using cpu_loop_exit_noexc()
+ * instead of tcg_target_jmp(), with tiny little bit of extra runtime
+ * overhead.  */
+QEMU_NORETURN __attribute__((naked))
+void helper_guard_failure(CPUArchState *_, uintptr_t retaddr)
+{
+    CPUState *cpu = env_cpu(TCG_TARGET_AREG0);
+
+    cpu_rescue_speculation_failure(cpu, retaddr);
+    /* Jump directly to the epilogue of TCG code cache, STACK POINTER
+     * MUST NOT BE ALTERED BY THE COMPILER, or execution can't return
+     * to the runtime correctly.  */
+    tcg_target_jmp((uintptr_t) tcg_ctx->code_gen_epilogue);
+}
+
 /* First set of helpers allows passing in of OI and RETADDR.  This makes
    them callable from other helpers.  */
 

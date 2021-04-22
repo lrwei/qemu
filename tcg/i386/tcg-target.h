@@ -218,6 +218,13 @@ static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
     /* no need to flush icache explicitly */
 }
 
+QEMU_NORETURN QEMU_ALWAYS_INLINE
+static inline void tcg_target_jmp(uintptr_t jmp_addr)
+{
+    asm volatile ("jmp *%0" :: "rm" (jmp_addr));
+    __builtin_unreachable();
+}
+
 #define _RESERVE_REG(reg)                               \
     register uint64_t _##reg asm (#reg);                \
     uint64_t reg = _##reg;

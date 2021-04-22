@@ -1536,6 +1536,8 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_extu_i32_i64:
     case INDEX_op_tlb_load:
     case INDEX_op_tlb_check:
+    case INDEX_op_guard_i32:
+    case INDEX_op_guard_i64:
         return TCG_TARGET_REG_BITS == 64;
 
     case INDEX_op_movcond_i64:

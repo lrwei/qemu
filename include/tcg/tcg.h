@@ -1365,6 +1365,7 @@ void helper_be_stq_mmu(CPUArchState *env, target_ulong addr, uint64_t val,
 
 void helper_tlb_check_ld(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr);
 void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr);
+QEMU_NORETURN void helper_guard_failure(CPUArchState *_, uintptr_t retaddr);
 
 /* Temporary aliases until backends are converted.  */
 #ifdef TARGET_WORDS_BIGENDIAN

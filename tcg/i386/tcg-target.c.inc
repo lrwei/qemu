@@ -1892,6 +1892,27 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_jmp(s, helper_tlb_check_);
     return true;
 }
+
+static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    /* Resolve label address.  */
+    tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
+
+    /* Signature of the helper to be called:
+     * QEMU_NORETURN
+     * void helper_guard_failure(CPUArchState *rbp, uintptr_t retaddr);
+     *
+     * Note that the function implements nonstandard calling convention,
+     * in the sense that certain arguments are passed through registers
+     * specified by corresponding argument name.  */
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
+                 (uintptr_t) spl->raddr);
+    /* Guard failure never returns.  */
+    tcg_out_jmp(s, (tcg_insn_unit *) helper_guard_failure);
+    return true;
+}
 #elif TCG_TARGET_REG_BITS == 32
 # define x86_guest_base_seg     0
 # define x86_guest_base_index   -1
@@ -2137,6 +2158,16 @@ static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator_,
 
     add_tlb_check_label(s, s->code_ptr, s->code_ptr - 4, _oi, addr,
                         arg_types[2]);
+}
+
+static void tcg_out_guard(TCGContext *s, TCGReg arg1, TCGArg arg2,
+                          BackendValType arg2_type, int rexw)
+{
+    tcg_out_cmp(s, arg1, arg2, arg2_type, rexw);
+    tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
+    s->code_ptr += 4;
+
+    new_guard_label(s, s->code_ptr, s->code_ptr - 4);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2424,6 +2455,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     case INDEX_op_tlb_check:
         tcg_out_tlb_check(s, a0, a1, a2, arg_types, args[3]);
+        break;
+    OP_32_64(guard):
+        tcg_out_guard(s, a0, a1, arg_types[1], rexw);
         break;
 
     OP_32_64(mulu2):
@@ -3083,6 +3117,14 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
                 .args_ct_str = { "r", "Ce", "re" }
             };
             return &tlb_check;
+        }
+    case INDEX_op_guard_i32:
+    case INDEX_op_guard_i64:
+        {
+            static const TCGTargetOpDef guard = {
+                .args_ct_str = { "r", "re" }
+            };
+            return &guard;
         }
 
     case INDEX_op_brcond2_i32:
