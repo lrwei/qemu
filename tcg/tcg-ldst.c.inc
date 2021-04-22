@@ -21,11 +21,10 @@
  */
 
 typedef struct TCGLabelQemuLdst {
-    bool is_ld;             /* qemu_ld: true, qemu_st: false */
-    TCGMemOpIdx oi;
-    TCGType type;           /* result type of a load */
-    TCGReg data_reg;        /* reg index for data to be loaded or stored */
-    TCGReg addr_reg;        /* reg index for guest virtual addr */
+    TCGMemOpIdx _oi;    /* Pack of IS_LOAD, MEMOP and MEM_INDEX.  */
+    TCGType type;       /* Type of result, used only by QEMU_LD.  */
+    TCGReg data_reg;    /* Register for data to be loaded or stored.  */
+    TCGReg addr_reg;    /* Register for guest virtual address.  */
 } TCGLabelQemuLdst;
 
 typedef enum TCGLabelSlowPathType {
@@ -55,7 +54,7 @@ static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
     switch (spl->type) {
     case QemuLdst:
-        return spl->ldst->is_ld
+        return !!(spl->ldst->_oi & _OI_LOAD)
                ? tcg_out_qemu_ld_slow_path(s, spl)
                : tcg_out_qemu_st_slow_path(s, spl);
     default:

@@ -61,6 +61,9 @@ typedef enum MemOp {
      */
     MO_ASHIFT = 4,
     MO_AMASK = 7 << MO_ASHIFT,
+    MO_LOAD = 8 << MO_ASHIFT,
+    /* Pre-shifted to mask directly on TCGMemOpIdx.  */
+    _OI_LOAD = MO_LOAD << /* width of MMU_IDX field */ 4,
 #ifdef NEED_CPU_H
 #ifdef TARGET_ALIGNED_ONLY
     MO_ALIGN = 0,

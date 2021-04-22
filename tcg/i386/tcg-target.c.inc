@@ -1783,8 +1783,7 @@ static void add_qemu_ldst_label(TCGContext *s, bool is_ld, bool is_64,
 {
     TCGLabelQemuLdst *label = new_ldst_label(s, raddr, label_ptr);
 
-    label->is_ld = is_ld;
-    label->oi = oi;
+    label->_oi = oi | (is_ld ? _OI_LOAD : 0);
     label->type = is_64 ? TCG_TYPE_I64 : TCG_TYPE_I32;
     label->data_reg = data_reg;
     label->addr_reg = addr_reg;
@@ -1796,7 +1795,7 @@ static void add_qemu_ldst_label(TCGContext *s, bool is_ld, bool is_64,
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     TCGLabelQemuLdst *l = spl->ldst;
-    TCGMemOpIdx oi = l->oi;
+    TCGMemOpIdx oi = l->_oi & ~_OI_LOAD;
     MemOp opc = get_memop(oi);
     int rexw = (l->type == TCG_TYPE_I64 ? P_REXW : 0);
 
@@ -1847,7 +1846,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     TCGLabelQemuLdst *l = spl->ldst;
-    TCGMemOpIdx oi = l->oi;
+    TCGMemOpIdx oi = l->_oi & ~_OI_LOAD;
     MemOp opc = get_memop(oi);
     MemOp s_bits = opc & MO_SIZE;
     TCGReg retaddr;
