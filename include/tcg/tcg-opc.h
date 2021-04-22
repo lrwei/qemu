@@ -204,6 +204,7 @@ DEF(qemu_st_i64, 0, 2, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_64BIT)
 
 DEF(side_effect, 0, 0, 0, TCG_OPF_SIDE_EFFECTS | TCG_OPF_NOT_PRESENT)
+DEF(tlb_load, 1, 1, 1, IMPL64)
 
 /* Host vector support.  */
 

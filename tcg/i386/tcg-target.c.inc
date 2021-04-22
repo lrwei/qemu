@@ -1621,6 +1621,59 @@ static void * const qemu_st_helpers[16] = {
     [MO_BEQ]  = helper_be_stq_mmu,
 };
 
+static void tcg_out_tlb_load(TCGContext *s, TCGReg entry, TCGArg addr,
+                             BackendValType addr_type, uint32_t mem_index)
+{
+    intptr_t fast_ofs = TLB_MASK_TABLE_OFS(mem_index);
+    intptr_t mask_ofs = fast_ofs + offsetof(CPUTLBDescFast, mask);
+    intptr_t table_ofs = fast_ofs + offsetof(CPUTLBDescFast, table);
+    int t_rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    if (addr_type == BACKEND_REG) {
+        TCGType tlb_type = TCG_TYPE_I32;
+        int tlb_rexw = 0;
+
+        /* With dynamic TLB enabled, the transformation from memory address to
+         * TLB index consists of:
+         * 1. Right shift the address for TARGET_PAGE_BITS to get page number,
+         * 2. Mask out unwanted bits, with at most CPU_TLB_DYN_MAX_BITS left.
+         * Therefore, only the lower (TARGET_PAGE_BITS + CPU_TLB_DYN_MAX_BITS)
+         * bits are meaningful for the address translation process, if it fits
+         * into a word register, we don't bother using 64-bit operations.  */
+        if (TARGET_PAGE_BITS + CPU_TLB_DYN_MAX_BITS > 32) {
+            /* The above sum never exceeds TARGET_VIRT_ADDR_SPACE_BITS by
+             * definition, which SHOULD never exceeds TARGET_LONG_BITS.  */
+            tcg_debug_assert(TARGET_LONG_BITS == 64);
+            tlb_type = TCG_TYPE_I64;
+            tlb_rexw = P_REXW;
+        }
+
+        tcg_out_mov(s, tlb_type, entry, addr);
+        /* Calculate page number and scale by factor of `sizeof(CPUTLBEntry)`.
+         * See also the BACKEND_CONST case.  */
+        tcg_out_shifti(s, SHIFT_SHR + tlb_rexw, entry,
+                       TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+    } else {
+        tcg_debug_assert(addr_type == BACKEND_CONST);
+        uint64_t mask = (1ull << (TARGET_PAGE_BITS + CPU_TLB_DYN_MAX_BITS)) - 1;
+
+        addr &= mask;
+        addr >>= TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS;
+        /* As stated before, only low bits are meaningful for indexing the TLB,
+         * doing constant folding here hopefully shrinks a full 64-bit address
+         * down to a reasonable size to be encodeded in an ordinary mov op.  */
+        tcg_debug_assert(addr == (uint32_t) addr);
+        tcg_out_movi(s, TCG_TYPE_I32, entry, addr);
+    }
+
+    /* Native pointer on x86_64 should be 64-bit, P_REXW is thus needed.  */
+    tcg_debug_assert(TCG_TYPE_PTR == TCG_TYPE_I64);
+    tcg_out_modrm_offset(s, OPC_AND_GvEv + t_rexw, entry, TCG_AREG0, mask_ofs);
+    tcg_out_modrm_offset(s, OPC_ADD_GvEv + P_REXW, entry, TCG_AREG0, table_ofs);
+}
+
 /* Perform the TLB load and compare.
  *
  * Inputs:
@@ -1640,15 +1693,15 @@ static void * const qemu_st_helpers[16] = {
  *
  * Both of TCG_REG_{L0, L1} is clobbered.  */
 
-static inline void tcg_out_tlb_load(TCGContext *s, TCGReg addr_reg,
-                                    int mem_index, MemOp opc,
-                                    tcg_insn_unit **plabel_ptr, intptr_t which)
+static inline void tcg_out_tlb_load_and_compare(TCGContext *s, TCGReg addr_reg,
+                                                int mem_index, MemOp opc,
+                                                tcg_insn_unit **plabel_ptr,
+                                                intptr_t which)
 {
     const TCGReg r0 = TCG_REG_L0;
     const TCGReg r1 = TCG_REG_L1;
     TCGType ttype = TCG_TYPE_I32;
-    TCGType tlbtype = TCG_TYPE_I32;
-    int trexw = 0, tlbrexw = 0;
+    int trexw = 0;
     unsigned a_bits = get_alignment_bits(opc);
     unsigned s_bits = opc & MO_SIZE;
     unsigned a_mask = (1 << a_bits) - 1;
@@ -1659,24 +1712,10 @@ static inline void tcg_out_tlb_load(TCGContext *s, TCGReg addr_reg,
         ttype = TCG_TYPE_I64;
         trexw = P_REXW;
     }
-    /* Native pointer on x86_64 should be 64-bit.  */
-    tcg_debug_assert(TCG_TYPE_PTR == TCG_TYPE_I64);
-    if (TARGET_PAGE_BITS + CPU_TLB_DYN_MAX_BITS > 32) {
-        tlbtype = TCG_TYPE_I64;
-        tlbrexw = P_REXW;
-    }
 
-    tcg_out_mov(s, tlbtype, r0, addr_reg);
-    tcg_out_shifti(s, SHIFT_SHR + tlbrexw, r0,
-                   TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
-
-    tcg_out_modrm_offset(s, OPC_AND_GvEv + trexw, r0, TCG_AREG0,
-                         TLB_MASK_TABLE_OFS(mem_index) +
-                         offsetof(CPUTLBDescFast, mask));
-
-    tcg_out_modrm_offset(s, OPC_ADD_GvEv + P_REXW, r0, TCG_AREG0,
-                         TLB_MASK_TABLE_OFS(mem_index) +
-                         offsetof(CPUTLBDescFast, table));
+    /* Load pointer to TLB entry corresponding to address in ADDR_REG to R0,
+     * with content of ADDR_REG preserved.  */
+    tcg_out_tlb_load(s, r0, addr_reg, BACKEND_REG, mem_index);
 
     /* If the required alignment is at least as large as the access, simply
      * copy the address and mask. For lesser alignments, check that we don't
@@ -1686,7 +1725,7 @@ static inline void tcg_out_tlb_load(TCGContext *s, TCGReg addr_reg,
     } else {
         tcg_out_modrm_offset(s, OPC_LEA + trexw, r1, addr_reg, s_mask - a_mask);
     }
-    tlb_mask = (target_ulong)TARGET_PAGE_MASK | a_mask;
+    tlb_mask = (target_ulong) TARGET_PAGE_MASK | a_mask;
     tgen_arithi(s, ARITH_AND + trexw, r1, tlb_mask, 0);
 
     /* cmp 0(r0), r1 */
@@ -1938,8 +1977,8 @@ static void tcg_out_qemu_ld(TCGContext *s, TCGReg data_reg, TCGReg addr_reg,
 
     /* Consult TLB for translating GVA to HVA, corresponding host address
      * will be placed in TCG_REG_L1 on TLB Hit. This clobbers TCG_REG_L0.  */
-    tcg_out_tlb_load(s, addr_reg, mem_index, opc, &label_ptr,
-                     offsetof(CPUTLBEntry, addr_read));
+    tcg_out_tlb_load_and_compare(s, addr_reg, mem_index, opc, &label_ptr,
+                                 offsetof(CPUTLBEntry, addr_read));
 
     /* TLB Hit.  */
     tcg_out_qemu_ld_direct(s, data_reg, TCG_REG_L1, -1, 0, 0, is64, opc);
@@ -2018,8 +2057,8 @@ static void tcg_out_qemu_st(TCGContext *s, TCGReg data_reg, TCGReg addr_reg,
 
     /* Consult TLB for translating GVA to HVA, corresponding host address
      * will be placed in TCG_REG_L1 on TLB Hit. This clobbers TCG_REG_L0.  */
-    tcg_out_tlb_load(s, addr_reg, mem_index, opc, &label_ptr,
-                     offsetof(CPUTLBEntry, addr_write));
+    tcg_out_tlb_load_and_compare(s, addr_reg, mem_index, opc, &label_ptr,
+                                 offsetof(CPUTLBEntry, addr_write));
 
     /* TLB Hit.  */
     tcg_out_qemu_st_direct(s, data_reg, TCG_REG_L1, -1, 0, 0, opc);
@@ -2311,6 +2350,10 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     OP_32_64(qemu_st):
         tcg_out_qemu_st(s, a0, a1, a2, rexw == P_REXW);
+        break;
+
+    case INDEX_op_tlb_load:
+        tcg_out_tlb_load(s, a0, a1, arg_types[1], a2);
         break;
 
     OP_32_64(mulu2):
@@ -2953,6 +2996,14 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_qemu_st_i32:
     case INDEX_op_qemu_st_i64:
         return &L_L;
+
+    case INDEX_op_tlb_load:
+        {
+            static const TCGTargetOpDef tlb_load = {
+                .args_ct_str = { "r", "ri" }
+            };
+            return &tlb_load;
+        }
 
     case INDEX_op_brcond2_i32:
         {
