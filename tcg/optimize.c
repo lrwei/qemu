@@ -45,9 +45,13 @@
 #if TARGET_LONG_BITS == 32
 #define INDEX_op_add_tl     INDEX_op_add_i32
 #define INDEX_op_and_tl     INDEX_op_and_i32
+#define INDEX_op_ld_tl      INDEX_op_ld_i32
+#define INDEX_op_guard_tl   INDEX_op_guard_i32
 #else
 #define INDEX_op_add_tl     INDEX_op_add_i64
 #define INDEX_op_and_tl     INDEX_op_and_i64
+#define INDEX_op_ld_tl      INDEX_op_ld_i64
+#define INDEX_op_guard_tl   INDEX_op_guard_i64
 #endif
 
 /* General explanation of how input IR is converted to SSA-form:
@@ -62,8 +66,17 @@
  *    and remove the redefining-OP, updation to CANONICAL VARIABLE only take
  *    effect through copy propagation which examines the INDIRECTION.  */
 
+typedef struct BaseAddress {
+    QSIMPLEQ_ENTRY(BaseAddress) next;
+    TCGTemp *entry;
+    TCGTemp *hva;
+    int64_t offset;
+    uint32_t mmu_idx;
+} BaseAddress;
+
 typedef struct TempOptInfo {
     uint64_t mask;
+    QSIMPLEQ_HEAD(, BaseAddress) addresses;
 } TempOptInfo;
 
 static bool ts_is_const(TCGTemp *ts)
@@ -142,6 +155,7 @@ static void init_ts_info(TCGTemp *ts, TCGOp *op)
             ts->defining_op = op;
         }
     }
+    QSIMPLEQ_INIT(&info->addresses);
 }
 
 static void ts_set_uninitialized(TCGTemp *ts)
@@ -421,6 +435,77 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     op->args[2] = tcg_opt_constant_new(arg_temp(op->args[2])->type, offset);
 }
 
+static BaseAddress *tcg_opt_base_address_new(TempOptInfo *info, int64_t offset,
+                                             uint32_t mmu_idx)
+{
+    BaseAddress *address = tcg_malloc(sizeof(BaseAddress));
+
+    address->offset = offset;
+    address->mmu_idx = mmu_idx;
+    address->entry = address->hva = NULL;
+    /* Always insert new BaseAddress to the tail, in order to guarantee
+     * re-encountered addresses be reassociated to the same BaseAddress
+     * as was previously.  */
+    QSIMPLEQ_INSERT_TAIL(&info->addresses, address, next);
+    return address;
+}
+
+static bool tcg_opt_reassociate_address(TCGTemp *addr, uint32_t mmu_idx,
+                                        BaseAddress **paddress, int64_t *poffset)
+{
+    TempOptInfo *base_info;
+    int64_t offset;
+    BaseAddress *address;
+
+    if (ts_is_const(addr)) {
+        uint64_t page_addr = ts_value(addr) & TARGET_PAGE_MASK;
+
+        base_info = arg_info(tcg_opt_constant_new(TCG_TYPE_TL, page_addr));
+        offset = ts_value(addr) & ~TARGET_PAGE_MASK;
+    } else {
+        TCGOp *def_op = temp_definition(addr);
+
+        /* ADDR should not be TEMP_FIXED.  */
+        tcg_debug_assert(def_op);
+        if (def_op->opc == INDEX_op_add_tl && arg_is_const(def_op->args[2])) {
+            base_info = arg_info(def_op->args[1]);
+            offset = arg_value(def_op->args[2]);
+        } else {
+            base_info = ts_info(addr);
+            offset = 0;
+        }
+        /* TODO: Speculate further on whether the BASE is some known base
+         * address once spilled into memory and gets loaded again.  */
+    }
+
+    /* Scan through the existing addresses to find a possible base. List
+     * heads should have been initialized along with BASE_INFO.  */
+    QSIMPLEQ_FOREACH(address, &base_info->addresses, next) {
+        /* Calculate ADDR's offset with respect to ADDRESS.  */
+        int64_t offset2 = offset - address->offset;
+
+        /* We do NOT really have any nontrivial heuristic at compile time
+         * to handle those accesses that are closed to page boundary. So,
+         * we might as well check here using the most aggressive threshold,
+         * leaving all hard work to the poor (programmer of) runtime.  */
+        if (llabs(offset2) < TARGET_PAGE_SIZE) {
+            /* Prevent associating memory access with different TLB index,
+             * e.g. user and kernel access to the same address, IF ANY.  */
+            if (unlikely(mmu_idx != address->mmu_idx)) {
+                g_assert_not_reached();
+                continue;
+            }
+            *paddress = address;
+            *poffset = offset2;
+            return true;
+        }
+    }
+    /* Not found, register ADDR itself as a new base address.  */
+    *paddress = tcg_opt_base_address_new(base_info, offset, mmu_idx);
+    *poffset = 0;
+    return false;
+}
+
 static TCGOp *tcg_opt_gen_tlb_load(TCGOp *op, TCGTemp *addr, uint32_t mmu_idx)
 {
     TCGTemp *entry = tcg_opt_temp_new(TCG_TYPE_PTR);
@@ -439,7 +524,8 @@ static TCGOp *tcg_opt_gen_tlb_load(TCGOp *op, TCGTemp *addr, uint32_t mmu_idx)
 }
 
 static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
-                                             MemOp memop)
+                                             MemOp memop, int64_t offset,
+                                             bool reassociated)
 {
     uint32_t a_bits = get_alignment_bits(memop);
     uint32_t s_bits = memop & MO_SIZE;
@@ -450,7 +536,7 @@ static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
     if (a_bits >= s_bits) {
         /* Alignment check implies the cross-page check for accesses with
          * natural (or more strict) alignment restrictions.  */
-    } else {
+    } else if (!reassociated || offset >= 0) {
         TCGTemp *padded_addr = tcg_opt_temp_new(TCG_TYPE_TL);
 
         /* Otherwise, we pad the address to the last byte of the access WITH
@@ -461,6 +547,23 @@ static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
         op->args[1] = temp_arg(addr);
         op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, s_mask - a_mask);
         addr = padded_addr;
+    } else {
+        /* Special care must be taken after speculation comes into play,
+         * since a wrong speculation that actually fall on the previous
+         * page (which must have NEGATIVE offset) will pass the guard if
+         * it happens to be a cross-page access.
+         * To address this problem, speculation with negative offset only
+         * checks the aligned-ness requirement, WITH THE ASSUMPTION THE
+         * ADDRESS DOES FALL ON THE SAME PAGE, so that further comparison
+         * fails if EITHER of the requirement is not met.  */
+
+        /* If the negative offset is not large enough to guarantee the
+         * within-ness, then we instead require the access itself to be
+         * natually aligned, which unfortunately is quite unlikely to
+         * hold.  */
+        if (unlikely(offset + s_mask > 0)) {
+            a_mask = s_mask;
+        }
     }
 
     op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_and_tl);
@@ -511,6 +614,24 @@ static TCGOp *tcg_opt_gen_gva_addend(TCGOp *op, TCGTemp *entry, TCGTemp *addr)
     op->args[0] = temp_arg(hva);
     op->args[1] = temp_arg(addr);
     op->args[2] = temp_arg(addend);
+    return op;
+}
+
+static TCGOp *tcg_opt_gen_tlb_guard(TCGOp *op, TCGTemp *entry, bool is_load)
+{
+    TCGTemp *comparator = tcg_opt_temp_new(TCG_TYPE_TL);
+    intptr_t offset_of_comparator = is_load ? offsetof(CPUTLBEntry, addr_read)
+                                            : offsetof(CPUTLBEntry, addr_write);
+
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_ld_tl);
+    op->args[0] = temp_arg(comparator);
+    op->args[1] = temp_arg(entry);
+    op->args[2] = offset_of_comparator;
+
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guard_tl);
+    op->args[0] = temp_arg(comparator);
+    /* comparator_ */
+    op->args[1] = QTAILQ_PREV(QTAILQ_PREV(op, link), link)->args[0];
     return op;
 }
 
@@ -599,7 +720,8 @@ static void tcg_opt_qemu_ldst_finalize(TCGOp *op, bool is_load, bool is_64bit)
     TCGMemOpIdx oi = op->args[2];
     uint32_t mmu_idx = get_mmuidx(oi);
     MemOp memop = get_memop(oi);
-    TCGTemp *entry, *hva;
+    BaseAddress *address;
+    int64_t offset;
 
     /* Host should be 64-bit, with 64-bit pointer types.  */
     tcg_debug_assert(TCG_TYPE_PTR == TCG_TYPE_I64);
@@ -609,27 +731,51 @@ static void tcg_opt_qemu_ldst_finalize(TCGOp *op, bool is_load, bool is_64bit)
      * carrier for the overall TCG_OPF_SIDE_EFFECTS for memory accesses.  */
     op->opc = INDEX_op_side_effect;
 
-    /* Calculate TLB entry for address ADDR.  */
-    op = tcg_opt_gen_tlb_load(op, addr, mmu_idx);
-    entry = arg_temp(op->args[0]);
+    /* Reassociate ADDR with some previously encountered guest address,
+     * and calculate OFFSET between the 2 accesses. Register itself as
+     * a BaseAddress if it can't be associated to existing ones.
+     * BE AWARE THAT WE ARE NOW AHEAD OF COPY PROPAGATION, so ADDR may
+     * not be the right temporary ought to be examined, DEREFERENCE it
+     * (but don't do any PROPAGATION) before trying any reassociation.  */
+    if (!tcg_opt_reassociate_address(ts_indirection(addr), mmu_idx, &address,
+                                     &offset)) {
+        /* Calculate TLB entry for address ADDR.  */
+        op = tcg_opt_gen_tlb_load(op, addr, mmu_idx);
+        address->entry = arg_temp(op->args[0]);
 
-    /* Extract TLB comparator from ADDR, and check to see if:
-     * 1. this is the address cached in TLB, and
-     * 2. this is an aligned, within-page, ordinary RAM access.
-     * Not satisfying the first condition causes an MMU walk and bails out
-     * only if MMU exception is encountered, otherwise, execution returns
-     * with TLB entry refilled.
-     * Execution never returns on violation of the second condition.  */
-    op = tcg_opt_gen_extract_comparator(op, addr, memop);
-    op = tcg_opt_gen_tlb_check(op, entry, addr, oi, is_load);
+        /* Extract TLB comparator from ADDR, and check to see if:
+         * 1. this is the address cached in TLB, and
+         * 2. this is an aligned, within-page, ordinary RAM access.
+         * Not satisfying the first condition causes an MMU walk and bails out
+         * only if MMU exception is encountered, otherwise, execution returns
+         * with TLB entry refilled.
+         * Execution never returns on violation of the second condition.  */
+        tcg_debug_assert(offset == 0);
+        op = tcg_opt_gen_extract_comparator(op, addr, memop, offset, false);
+        op = tcg_opt_gen_tlb_check(op, address->entry, addr, oi, is_load);
 
-    /* TLB hit, load ADDEND from TLB entry and calculate the host address
-     * corresponding to the guest access.  */
-    op = tcg_opt_gen_gva_addend(op, entry, addr);
-    hva = arg_temp(op->args[0]);
+        /* TLB hit, load ADDEND from TLB entry and calculate the host address
+         * corresponding to the guest access.  */
+        op = tcg_opt_gen_gva_addend(op, address->entry, addr);
+        address->hva = arg_temp(op->args[0]);
+    } else {
+        /* With speculation enabled, guard opcode now checks 3 things
+         * at the same time:
+         * 1. Whether the access is aligned?
+         *    -- By keeping low address bits in A_MASK.
+         * 2. Whether the access crosses page boundary?
+         *    -- By PADDING the address to that of the last byte of the
+         *    access before comparison.
+         * 3. Whether the speculation is correct?
+         *    -- By comparing with BASE's TLB entry comparator, this can be
+         *    disturbed by padding made in check 2 in extremely subtle way,
+         *    see also tcg_opt_gen_extract_comparator().  */
+        op = tcg_opt_gen_extract_comparator(op, addr, memop, offset, true);
+        op = tcg_opt_gen_tlb_guard(op, address->entry, is_load);
+    }
 
     /* Perform the actual memory access.  */
-    tcg_opt_gen_ldst(op, value, hva, 0, memop, is_load, is_64bit);
+    tcg_opt_gen_ldst(op, value, address->hva, offset, memop, is_load, is_64bit);
 }
 
 static uint64_t do_constant_folding_2(TCGOpcode op, uint64_t x, uint64_t y)
@@ -1883,6 +2029,16 @@ done_algebraic_simplifying_and_constant_folding:
                     /* Discard any INDIRECTION on GLOBALs.  */
                     if ((ts = &s->temps[i])->kind == TEMP_GLOBAL) {
                         ts_set_indirection(ts, NULL);
+                    }
+                }
+            }
+            if (!(tmp & TCG_CALL_NO_SIDE_EFFECTS)) {
+                /* As the call is NOT side-effect-free, it might very
+                 * well commit changes to guest memory mapping setups,
+                 * rendering all further speculation invalid.  */
+                for (i = s->nb_globals; i < s->nb_temps; i++) {
+                    if (ts_is_canonical((ts = &s->temps[i]))) {
+                        QSIMPLEQ_INIT(&ts_info(ts)->addresses);
                     }
                 }
             }
