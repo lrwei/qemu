@@ -534,6 +534,11 @@ static inline uint32_t curr_cflags(CPUState *cpu)
     return cpu->tcg_cflags;
 }
 
+static inline bool use_monolithic_ldst(void)
+{
+    return unlikely(!!(tcg_ctx->tb_cflags & CF_MONOLITHIC));
+}
+
 /* TranslationBlock invalidate API */
 #if defined(CONFIG_USER_ONLY)
 void tb_invalidate_phys_addr(target_ulong addr);

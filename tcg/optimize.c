@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "tcg/tcg-op.h"
+#include "exec/exec-all.h"
 
 #define CASE_OP_32_64(x)                        \
         glue(glue(case INDEX_op_, x), _i32):    \
@@ -39,6 +40,14 @@
 #error Supporting OVERSIZED GUEST is too heavy a mental burden for      \
        someone who worries about his master degree every day. So,       \
        his program simply refuse to compile.
+#endif
+
+#if TARGET_LONG_BITS == 32
+#define INDEX_op_add_tl     INDEX_op_add_i32
+#define INDEX_op_and_tl     INDEX_op_and_i32
+#else
+#define INDEX_op_add_tl     INDEX_op_add_i64
+#define INDEX_op_and_tl     INDEX_op_and_i64
 #endif
 
 /* General explanation of how input IR is converted to SSA-form:
@@ -412,6 +421,217 @@ static void tcg_opt_aggregate_offset(TCGOp *op)
     op->args[2] = tcg_opt_constant_new(arg_temp(op->args[2])->type, offset);
 }
 
+static TCGOp *tcg_opt_gen_tlb_load(TCGOp *op, TCGTemp *addr, uint32_t mmu_idx)
+{
+    TCGTemp *entry = tcg_opt_temp_new(TCG_TYPE_PTR);
+
+    /* TLB_LOAD operates on TCG_TYPE_TL IARG directly.  */
+    tcg_debug_assert(addr->type == TCG_TYPE_TL);
+
+    /* Calculate page number and scale by factor of sizeof(CPUTLBEntry); Load
+     * mask and TLB base address from env_cpu implicitly; Mask page number to
+     * get TLB index, and eventually the TLB entry. Packed as one TCGOp.  */
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_tlb_load);
+    op->args[0] = temp_arg(entry);
+    op->args[1] = temp_arg(addr);
+    op->args[2] = mmu_idx;
+    return op;
+}
+
+static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
+                                             MemOp memop)
+{
+    uint32_t a_bits = get_alignment_bits(memop);
+    uint32_t s_bits = memop & MO_SIZE;
+    uint32_t a_mask = (1 << a_bits) - 1;
+    uint32_t s_mask = (1 << s_bits) - 1;
+    TCGTemp *comparator_ = tcg_opt_temp_new(TCG_TYPE_TL);
+
+    if (a_bits >= s_bits) {
+        /* Alignment check implies the cross-page check for accesses with
+         * natural (or more strict) alignment restrictions.  */
+    } else {
+        TCGTemp *padded_addr = tcg_opt_temp_new(TCG_TYPE_TL);
+
+        /* Otherwise, we pad the address to the last byte of the access WITH
+         * THE ASSUMPTION THAT THE ADDRESS ITSELF IS ALIGNED, so that further
+         * comparison fails if EITHER of the requirement is not met.  */
+        op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_tl);
+        op->args[0] = temp_arg(padded_addr);
+        op->args[1] = temp_arg(addr);
+        op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, s_mask - a_mask);
+        addr = padded_addr;
+    }
+
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_and_tl);
+    op->args[0] = temp_arg(comparator_);
+    op->args[1] = temp_arg(addr);
+    op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK | a_mask);
+    return op;
+}
+
+static TCGOp *tcg_opt_gen_tlb_check(TCGOp *op, TCGTemp *entry, TCGTemp *addr,
+                                    TCGMemOpIdx oi, bool is_load)
+{
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_tlb_check);
+    op->args[0] = temp_arg(entry);
+    /* comparator_ */
+    op->args[1] = QTAILQ_PREV(op, link)->args[0];
+    op->args[2] = temp_arg(addr);
+    op->args[3] = oi | (is_load ? _OI_LOAD : 0);
+    return op;
+}
+
+static TCGOp *tcg_opt_gen_gva_addend(TCGOp *op, TCGTemp *entry, TCGTemp *addr)
+{
+    TCGTemp *addend = tcg_opt_temp_new(TCG_TYPE_PTR);
+    TCGTemp *hva = tcg_opt_temp_new(TCG_TYPE_PTR);
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_ld_i64);
+    op->args[0] = temp_arg(addend);
+    op->args[1] = temp_arg(entry);
+    op->args[2] = offsetof(CPUTLBEntry, addend);
+
+    /* Zero extend 32-bit guest address, if necessary. TCG conservatively
+     * assumes high bits always contain garbage regardless of the backend,
+     * we follow this tradition.  */
+    if (TCG_TYPE_TL != TCG_TYPE_PTR) {
+        TCGTemp *_addr = tcg_opt_temp_new(TCG_TYPE_PTR);
+
+        op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_extu_i32_i64);
+        op->args[0] = temp_arg(_addr);
+        op->args[1] = temp_arg(addr);
+        addr = _addr;
+    }
+    tcg_debug_assert(addr->type == TCG_TYPE_I64);
+
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_i64);
+    op->args[0] = temp_arg(hva);
+    op->args[1] = temp_arg(addr);
+    op->args[2] = temp_arg(addend);
+    return op;
+}
+
+static TCGOpcode memop_to_ldst_opc(MemOp memop, bool is_load, bool is_64bit)
+{
+    static const TCGOpcode ldst_opc[2][2][8] = {
+        {
+            {
+                [MO_UB] = INDEX_op_st8_i32,
+                [MO_UW] = INDEX_op_st16_i32,
+                [MO_UL] = INDEX_op_st_i32,
+            },
+            {
+                [MO_UB] = INDEX_op_st8_i64,
+                [MO_UW] = INDEX_op_st16_i64,
+                [MO_UL] = INDEX_op_st32_i64,
+                [MO_Q]  = INDEX_op_st_i64,
+            },
+        },
+        {
+            {
+                [MO_UB] = INDEX_op_ld8u_i32,
+                [MO_SB] = INDEX_op_ld8s_i32,
+                [MO_UW] = INDEX_op_ld16u_i32,
+                [MO_SW] = INDEX_op_ld16s_i32,
+                [MO_UL] = INDEX_op_ld_i32,
+            },
+            {
+                [MO_UB] = INDEX_op_ld8u_i64,
+                [MO_SB] = INDEX_op_ld8s_i64,
+                [MO_UW] = INDEX_op_ld16u_i64,
+                [MO_SW] = INDEX_op_ld16s_i64,
+                [MO_UL] = INDEX_op_ld32u_i64,
+                [MO_SL] = INDEX_op_ld32s_i64,
+                [MO_Q]  = INDEX_op_ld_i64,
+            },
+        },
+    };
+
+#ifdef CONFIG_DEBUG_TCG
+    switch (memop & MO_SSIZE) {
+    case MO_Q:
+        tcg_debug_assert(is_64bit);
+    case MO_UL:
+    case MO_UW:
+    case MO_UB:
+        break;
+    case MO_SL:
+        tcg_debug_assert(is_64bit);
+    case MO_SW:
+    case MO_SB:
+        tcg_debug_assert(is_load);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+#endif
+
+    return ldst_opc[is_load][is_64bit][memop & MO_SSIZE];
+}
+
+static TCGOp *tcg_opt_gen_ldst(TCGOp *op, TCGTemp *value, TCGTemp *base,
+                               intptr_t offset, MemOp memop, bool is_load,
+                               bool is_64bit)
+{
+    TCGOpcode opc = memop_to_ldst_opc(memop, is_load, is_64bit);
+
+    /* OFFSET to an associated base address is bounded by the speculation
+     * threshold and should always be able to be encoded into instructions,
+     * at least for x86_64 host.  */
+    tcg_debug_assert(offset == (int32_t) offset);
+
+    op = tcg_op_insert_after(tcg_ctx, op, opc);
+    /* A LOAD here may violate SSA property of the IR sequence, but will
+     * be fixed by further transformation.  */
+    op->args[0] = temp_arg(value);
+    op->args[1] = temp_arg(base);
+    op->args[2] = offset;
+    return op;
+}
+
+static void tcg_opt_qemu_ldst_finalize(TCGOp *op, bool is_load, bool is_64bit)
+{
+    TCGTemp *value = arg_temp(op->args[0]);
+    TCGTemp *addr = arg_temp(op->args[1]);
+    TCGMemOpIdx oi = op->args[2];
+    uint32_t mmu_idx = get_mmuidx(oi);
+    MemOp memop = get_memop(oi);
+    TCGTemp *entry, *hva;
+
+    /* Host should be 64-bit, with 64-bit pointer types.  */
+    tcg_debug_assert(TCG_TYPE_PTR == TCG_TYPE_I64);
+
+    /* Old qemu_{ld, st} is about to be separated into side-effect-less
+     * opcodes, but there still needs to be a TCGOp which serves as the
+     * carrier for the overall TCG_OPF_SIDE_EFFECTS for memory accesses.  */
+    op->opc = INDEX_op_side_effect;
+
+    /* Calculate TLB entry for address ADDR.  */
+    op = tcg_opt_gen_tlb_load(op, addr, mmu_idx);
+    entry = arg_temp(op->args[0]);
+
+    /* Extract TLB comparator from ADDR, and check to see if:
+     * 1. this is the address cached in TLB, and
+     * 2. this is an aligned, within-page, ordinary RAM access.
+     * Not satisfying the first condition causes an MMU walk and bails out
+     * only if MMU exception is encountered, otherwise, execution returns
+     * with TLB entry refilled.
+     * Execution never returns on violation of the second condition.  */
+    op = tcg_opt_gen_extract_comparator(op, addr, memop);
+    op = tcg_opt_gen_tlb_check(op, entry, addr, oi, is_load);
+
+    /* TLB hit, load ADDEND from TLB entry and calculate the host address
+     * corresponding to the guest access.  */
+    op = tcg_opt_gen_gva_addend(op, entry, addr);
+    hva = arg_temp(op->args[0]);
+
+    /* Perform the actual memory access.  */
+    tcg_opt_gen_ldst(op, value, hva, 0, memop, is_load, is_64bit);
+}
+
 static uint64_t do_constant_folding_2(TCGOpcode op, uint64_t x, uint64_t y)
 {
     uint64_t l64, h64;
@@ -777,8 +997,7 @@ static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s)
         TCGTemp *ts;
 
         /* Count arguments, and initialize all input ones, this will catch
-         * all variables that are read before written to. Copy propagation
-         * is performed after that.  */
+         * all variables that are read before written to.  */
         if (opc == INDEX_op_call) {
             nb_oargs = TCGOP_CALLO(op);
             nb_iargs = TCGOP_CALLI(op);
@@ -792,6 +1011,41 @@ static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s)
             }
             if (init_its_info(op, i)) {
                 goto done_this_op;
+            }
+        }
+
+        /* Decomposition and finalization of QEMU_{LD, ST} opcode, NOTE THAT
+         * THIS MUST BE DONE BEFORE COPY PROPAGATION. Otherwise, the original
+         * ADDR or VALUE temporary may be "dereference"d twice -- once in the
+         * old QEMU_{LD, ST} opcode, and once in new opcodes generated below,
+         * for example TLB_LOAD entry, *ADDR*, mmu_idx.  */
+        if (!use_monolithic_ldst()) {
+            bool is_load, is_64bit;
+
+            switch (opc) {
+            case INDEX_op_qemu_ld_i32:
+                is_load = true, is_64bit = false;
+                goto do_finalize;
+            case INDEX_op_qemu_ld_i64:
+                is_load = true, is_64bit = true;
+                goto do_finalize;
+            case INDEX_op_qemu_st_i32:
+                is_load = false, is_64bit = false;
+                goto do_finalize;
+            case INDEX_op_qemu_st_i64:
+                is_load = false, is_64bit = true;
+            do_finalize:
+                tcg_opt_qemu_ldst_finalize(op, is_load, is_64bit);
+                op_next = QTAILQ_NEXT(op, link);
+                continue;
+            default:
+                break;
+            }
+        }
+
+        for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
+            if (unlikely(op->args[i] == TCG_CALL_DUMMY_ARG)) {
+                continue;
             }
             /* Do copy propagation.  */
             op->args[i] = temp_arg(ts_indirection(arg_temp(op->args[i])));

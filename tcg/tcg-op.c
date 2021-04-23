@@ -2818,7 +2818,8 @@ void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
     orig_memop = memop;
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        !(TCG_TARGET_HAS_MEMORY_BSWAP && use_monolithic_ldst())) {
         memop &= ~MO_BSWAP;
         /* The bswap primitive requires zero-extended input.  */
         if ((memop & MO_SSIZE) == MO_SW) {
@@ -2856,7 +2857,8 @@ void tcg_gen_qemu_st_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
     memop = tcg_canonicalize_memop(memop, 0, 1);
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        !(TCG_TARGET_HAS_MEMORY_BSWAP && use_monolithic_ldst())) {
         swap = tcg_temp_new_i32();
         switch (memop & MO_SIZE) {
         case MO_16:
@@ -2903,7 +2905,8 @@ void tcg_gen_qemu_ld_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
     orig_memop = memop;
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        !(TCG_TARGET_HAS_MEMORY_BSWAP && use_monolithic_ldst())) {
         memop &= ~MO_BSWAP;
         /* The bswap primitive requires zero-extended input.  */
         if ((memop & MO_SIGN) && (memop & MO_SIZE) < MO_64) {
@@ -2953,7 +2956,8 @@ void tcg_gen_qemu_st_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     info = trace_mem_get_info(memop, idx, 1);
     trace_guest_mem_before_tcg(tcg_ctx->cpu, cpu_env, addr, info);
 
-    if (!TCG_TARGET_HAS_MEMORY_BSWAP && (memop & MO_BSWAP)) {
+    if ((memop & MO_BSWAP) &&
+        !(TCG_TARGET_HAS_MEMORY_BSWAP && use_monolithic_ldst())) {
         swap = tcg_temp_new_i64();
         switch (memop & MO_SIZE) {
         case MO_16:

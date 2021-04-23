@@ -3217,7 +3217,8 @@ static void temp_allocate_frame(TCGContext *s, TCGTemp *ts)
 #endif
     if (s->current_frame_offset + (tcg_target_long)sizeof(tcg_target_long) >
         s->frame_end) {
-        tcg_abort();
+        /* Overflow of stack slot, starting over with fewer guest insns.  */
+        siglongjmp(s->jmp_trans, -2);
     }
     ts->mem_offset = s->current_frame_offset;
     ts->mem_base = s->frame_temp;
