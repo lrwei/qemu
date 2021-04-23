@@ -1535,6 +1535,7 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_ext_i32_i64:
     case INDEX_op_extu_i32_i64:
     case INDEX_op_tlb_load:
+    case INDEX_op_tlb_check:
         return TCG_TARGET_REG_BITS == 64;
 
     case INDEX_op_movcond_i64:
@@ -2828,9 +2829,9 @@ static void liveness_pass_1(TCGContext *s)
                 la_bb_end(s, nb_globals, nb_temps);
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 la_global_sync(s, nb_globals);
-                if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                    la_cross_call(s, nb_temps);
-                }
+            }
+            if (def->flags & TCG_OPF_CALL_CLOBBER) {
+                la_cross_call(s, nb_temps);
             }
 
             /* Record arguments that die in this opcode.  */

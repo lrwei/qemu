@@ -218,6 +218,16 @@ static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
     /* no need to flush icache explicitly */
 }
 
+#define _RESERVE_REG(reg)                               \
+    register uint64_t _##reg asm (#reg);                \
+    uint64_t reg = _##reg;
+
+#define _RESTORE_REG(reg)                               \
+    asm ("movq %0, %%" #reg :: "rm" (reg) : #reg);
+
+#define TCG_TARGET_AREG0                                \
+    ({ _RESERVE_REG(rbp) (CPUArchState *) rbp; })
+
 /* This defines the natural memory order supported by this
  * architecture before guarantees made by various barrier
  * instructions.

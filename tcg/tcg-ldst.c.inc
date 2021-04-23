@@ -27,8 +27,15 @@ typedef struct TCGLabelQemuLdst {
     TCGReg addr_reg;    /* Register for guest virtual address.  */
 } TCGLabelQemuLdst;
 
+typedef struct TCGLabelTlbCheck {
+    TCGMemOpIdx _oi;
+    BackendValType addr_type;
+    TCGArg addr;
+} TCGLabelTlbCheck;
+
 typedef enum TCGLabelSlowPathType {
     QemuLdst,
+    TlbCheck,
 } TCGLabelSlowPathType;
 
 typedef struct TCGLabelSlowPath {
@@ -38,6 +45,7 @@ typedef struct TCGLabelSlowPath {
     tcg_insn_unit *label_ptr;
     union {
         TCGLabelQemuLdst *ldst;
+        TCGLabelTlbCheck *tlb_check;
     };
     QSIMPLEQ_ENTRY(TCGLabelSlowPath) next;
 } TCGLabelSlowPath;
@@ -49,6 +57,7 @@ typedef struct TCGLabelSlowPath {
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
+static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl);
 
 static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
 {
@@ -57,6 +66,8 @@ static bool tcg_dispatch_slow_path_label(TCGContext *s, TCGLabelSlowPath *spl)
         return !!(spl->ldst->_oi & _OI_LOAD)
                ? tcg_out_qemu_ld_slow_path(s, spl)
                : tcg_out_qemu_st_slow_path(s, spl);
+    case TlbCheck:
+        return tcg_out_tlb_check_slow_path(s, spl);
     default:
         g_assert_not_reached();
     }
@@ -117,5 +128,6 @@ static inline TCGLabel##subtype *new_##field##_label(TCGContext *s,            \
 }
 
 DEFINE_NEW_LABEL_FUNC(QemuLdst, ldst)
+DEFINE_NEW_LABEL_FUNC(TlbCheck, tlb_check)
 
 #undef DEFINE_NEW_LABEL_FUNC

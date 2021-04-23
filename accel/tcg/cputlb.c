@@ -2620,6 +2620,90 @@ void cpu_stq_le_data(CPUArchState *env, target_ulong ptr, uint64_t val)
     cpu_stq_le_data_ra(env, ptr, val, 0);
 }
 
+static void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
+{
+    /* Request another TB capable of doing full qemu_{ld, st}.  */
+    cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
+    /* Restore CPUArchState before bailout.  */
+    tcg_debug_assert(cpu_restore_state(cpu, retaddr, true));
+}
+
+static inline void QEMU_ALWAYS_INLINE
+tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                 uintptr_t retaddr, bool is_load)
+{
+    uintptr_t mmu_idx = get_mmuidx(oi);
+    uintptr_t index = tlb_index(env, mmu_idx, addr);
+    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+    target_ulong tlb_addr = is_load ? entry->addr_read : tlb_addr_write(entry);
+    size_t tlb_off = is_load ? offsetof(CPUTLBEntry, addr_read)
+                             : offsetof(CPUTLBEntry, addr_write);
+    MMUAccessType access_type = is_load ? MMU_DATA_LOAD : MMU_DATA_STORE;
+    MemOp op = get_memop(oi);
+    uint32_t a_bits = get_alignment_bits(op);
+    uint32_t size = memop_size(op);
+    CPUTLBDesc *desc = &env_tlb(env)->d[mmu_idx];
+    CPUState *cpu = env_cpu(env);
+
+    /* Handle CPU specific unaligned behaviour.  */
+    if (unlikely(a_bits > 0 && (addr & ((1 << a_bits) - 1)))) {
+        cpu_unaligned_access(cpu, addr, access_type, mmu_idx, retaddr);
+    }
+
+    /* Handle slow unaligned access (it spans two pages or IO).  */
+    if (size > 1
+        && unlikely((addr & ~TARGET_PAGE_MASK) + size - 1
+                              >= TARGET_PAGE_SIZE)) {
+        goto bailout;
+    }
+
+    /* If the TLB entry is for a different page, reload and try again,
+     * usually this would be the case. But still there's a fair amount
+     * of bailout caused by writing pages with TLB_NOTDIRTY.  */
+    if (likely(!tlb_hit(tlb_addr, addr))) {
+        if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
+                            addr & TARGET_PAGE_MASK)) {
+            int64_t window_begin_ns = desc->window_begin_ns;
+
+            tlb_fill(cpu, addr, size, access_type, mmu_idx, retaddr);
+            /* Translation blocks compiled with CF_MONOLITHIC unset can not
+             * be returned to if TLB is flushed or resized here.  */
+            tcg_debug_assert(window_begin_ns == desc->window_begin_ns);
+        }
+        tlb_addr = is_load ? entry->addr_read : tlb_addr_write(entry);
+        tlb_addr &= ~TLB_INVALID_MASK;
+    }
+
+    /* Handle anything that isn't just a straight memory access.  */
+    if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
+        if (is_load) {
+            goto bailout;
+        } else if ((tlb_addr & ~TARGET_PAGE_MASK) != TLB_NOTDIRTY) {
+            goto bailout;
+        }
+        notdirty_write(cpu, addr, size, &desc->iotlb[index], retaddr);
+    }
+    return;
+
+bailout:
+    cpu_rescue_speculation_failure(cpu, retaddr);
+    cpu_loop_exit_noexc(cpu);
+}
+
+/* Passing argument through %rbp requires the ordinary frame pointer updating
+ * sequence (i.e. pushq %rbp; movq %rsp, %rbp) be omitted.  */
+__attribute__((optimize("-fomit-frame-pointer")))
+void helper_tlb_check_ld(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
+{
+    tlb_check_helper(TCG_TARGET_AREG0, addr, oi, retaddr, true);
+}
+
+__attribute__((optimize("-fomit-frame-pointer")))
+void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
+{
+    tlb_check_helper(TCG_TARGET_AREG0, addr, oi, retaddr, false);
+}
+
 /* First set of helpers allows passing in of OI and RETADDR.  This makes
    them callable from other helpers.  */
 

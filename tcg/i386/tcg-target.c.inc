@@ -155,6 +155,10 @@ static const char *target_parse_constraint(TCGArgConstraint *ct,
         tcg_regset_reset_reg(ct->regs, TCG_REG_L0);
         tcg_regset_reset_reg(ct->regs, TCG_REG_L1);
         break;
+    case 'C':
+        /* Call clobber general registers.  */
+        ct->regs |= ALL_GENERAL_REGS & tcg_target_call_clobber_regs;
+        break;
 
     case 'e':
         ct->ct |= (type == TCG_TYPE_I32 ? TCG_CT_CONST : TCG_CT_CONST_S32);
@@ -1852,6 +1856,42 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_jmp(s, qemu_st_helpers[opc & (MO_BSWAP | MO_SIZE)]);
     return true;
 }
+
+static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    TCGLabelTlbCheck *l = spl->tlb_check;
+    TCGMemOpIdx oi = l->_oi & ~_OI_LOAD;
+    void *helper_tlb_check_ = oi != l->_oi ? helper_tlb_check_ld
+                                           : helper_tlb_check_st;
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    /* Resolve label address.  */
+    tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
+
+    /* Signature of the helper to be called:
+     * void helper_tlb_check_{ld, st}(target_ulong addr, TCGMemOpIdx oi,
+     *                                uintptr_t retaddr, CPUArchState *rbp);
+     *
+     * Note that the functions implement nonstandard calling convention,
+     * in the sense that certain arguments are passed through registers
+     * specified by corresponding argument name.  */
+
+    if (l->addr_type == BACKEND_REG) {
+        tcg_out_mov(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[0], l->addr);
+    } else {
+        tcg_debug_assert(l->addr_type == BACKEND_CONST);
+        tcg_out_movi(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[0], l->addr);
+    }
+    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], oi);
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[2],
+                 (uintptr_t) spl->raddr);
+
+    /* "Tail call" to the helper, with the return address back inline.  */
+    tcg_out_push(s, tcg_target_call_iarg_regs[2]);
+    tcg_out_jmp(s, helper_tlb_check_);
+    return true;
+}
 #elif TCG_TARGET_REG_BITS == 32
 # define x86_guest_base_seg     0
 # define x86_guest_base_index   -1
@@ -2070,6 +2110,33 @@ static void tcg_out_qemu_st(TCGContext *s, TCGReg data_reg, TCGReg addr_reg,
     tcg_out_qemu_st_direct(s, data_reg, addr_reg, x86_guest_base_index,
                            x86_guest_base_offset, x86_guest_base_seg, opc);
 #endif
+}
+
+static void add_tlb_check_label(TCGContext *s, tcg_insn_unit *raddr,
+                                tcg_insn_unit *label_ptr, TCGMemOpIdx _oi,
+                                TCGArg addr, BackendValType addr_type)
+{
+    TCGLabelTlbCheck *label = new_tlb_check_label(s, raddr, label_ptr);
+
+    label->_oi = _oi;
+    label->addr = addr;
+    label->addr_type = addr_type;
+}
+
+static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator_,
+                              TCGArg addr, const BackendValType *arg_types,
+                              TCGMemOpIdx _oi)
+{
+    intptr_t offset = _oi & _OI_LOAD ? offsetof(CPUTLBEntry, addr_read)
+                                     : offsetof(CPUTLBEntry, addr_write);
+    int rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+
+    tcg_out_cmpm(s, entry, offset, comparator_, arg_types[1], rexw);
+    tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
+    s->code_ptr += 4;
+
+    add_tlb_check_label(s, s->code_ptr, s->code_ptr - 4, _oi, addr,
+                        arg_types[2]);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2354,6 +2421,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
 
     case INDEX_op_tlb_load:
         tcg_out_tlb_load(s, a0, a1, arg_types[1], a2);
+        break;
+    case INDEX_op_tlb_check:
+        tcg_out_tlb_check(s, a0, a1, a2, arg_types, args[3]);
         break;
 
     OP_32_64(mulu2):
@@ -3003,6 +3073,16 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
                 .args_ct_str = { "r", "ri" }
             };
             return &tlb_load;
+        }
+    case INDEX_op_tlb_check:
+        {
+            static const TCGTargetOpDef tlb_check = {
+                /* The second argument of TLB_CHECK (i.e. COMPARATOR_)
+                 * will never be used afterward, allocate it into call
+                 * clobber registers to decrease register pressure.  */
+                .args_ct_str = { "r", "Ce", "re" }
+            };
+            return &tlb_check;
         }
 
     case INDEX_op_brcond2_i32:
