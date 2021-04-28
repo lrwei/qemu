@@ -155,10 +155,6 @@ static const char *target_parse_constraint(TCGArgConstraint *ct,
         tcg_regset_reset_reg(ct->regs, TCG_REG_L0);
         tcg_regset_reset_reg(ct->regs, TCG_REG_L1);
         break;
-    case 'C':
-        /* Call clobber general registers.  */
-        ct->regs |= ALL_GENERAL_REGS & tcg_target_call_clobber_regs;
-        break;
 
     case 'e':
         ct->ct |= (type == TCG_TYPE_I32 ? TCG_CT_CONST : TCG_CT_CONST_S32);
@@ -3111,10 +3107,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_tlb_check:
         {
             static const TCGTargetOpDef tlb_check = {
-                /* The second argument of TLB_CHECK (i.e. COMPARATOR_)
-                 * will never be used afterward, allocate it into call
-                 * clobber registers to decrease register pressure.  */
-                .args_ct_str = { "r", "Ce", "re" }
+                .args_ct_str = { "r", "re", "re" }
             };
             return &tlb_check;
         }
