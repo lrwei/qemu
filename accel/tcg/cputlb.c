@@ -2695,13 +2695,21 @@ bailout:
 __attribute__((optimize("-fomit-frame-pointer")))
 void helper_tlb_check_ld(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 {
+    TCG_TARGET_EXTRA_PROLOGUE
+
     tlb_check_helper(TCG_TARGET_AREG0, addr, oi, retaddr, true);
+
+    TCG_TARGET_EXTRA_EPILOGUE
 }
 
 __attribute__((optimize("-fomit-frame-pointer")))
 void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 {
+    TCG_TARGET_EXTRA_PROLOGUE
+
     tlb_check_helper(TCG_TARGET_AREG0, addr, oi, retaddr, false);
+
+    TCG_TARGET_EXTRA_EPILOGUE
 }
 
 /* Declare the function to be __attribute__((naked)) to prevent GCC

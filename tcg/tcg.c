@@ -197,6 +197,7 @@ static void *region_trees;
 static size_t tree_size;
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
+static TCGRegSet tcg_target_tlb_check_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static __attribute__((unused)) inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -2556,12 +2557,14 @@ static void la_bb_sync(TCGContext *s, size_t ng, size_t nt)
 }
 
 /* Liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, size_t nt)
+static void la_cross_call(TCGContext *s, size_t nt, bool tlb_check)
 {
-    TCGRegSet mask = ~tcg_target_call_clobber_regs;
+    TCGRegSet mask = ~(tlb_check ? tcg_target_tlb_check_clobber_regs
+                                 : tcg_target_call_clobber_regs);
 
     for (size_t i = 0; i < nt; i++) {
         TCGTemp *ts = &s->temps[i];
+
         if (!(ts->state & TS_DEAD)) {
             TCGRegSet *pset = la_temp_pref(ts);
             TCGRegSet set = *pset;
@@ -2658,7 +2661,7 @@ static void liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, false);
 
                 nb_call_regs = ARRAY_SIZE(tcg_target_call_iarg_regs);
 
@@ -2703,6 +2706,11 @@ static void liveness_pass_1(TCGContext *s)
              * ridiculous possibility of triggering memory exceptions.  */
             la_global_sync(s, nb_globals);
             break;
+        case INDEX_op_tlb_check:
+            nb_oargs = 0;
+            nb_iargs = 3;
+            la_cross_call(s, nb_temps, true);
+            goto do_not_remove2;
 
         case INDEX_op_add2_i32:
             opc_new = INDEX_op_add_i32;
@@ -2833,9 +2841,10 @@ static void liveness_pass_1(TCGContext *s)
                 la_global_sync(s, nb_globals);
             }
             if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, false);
             }
 
+        do_not_remove2:
             /* Record arguments that die in this opcode.  */
             for (i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                 ts = arg_temp(op->args[i]);
@@ -3877,6 +3886,16 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_cbranch(s);
     } else if (def->flags & TCG_OPF_BB_END) {
         tcg_reg_alloc_bb_end(s);
+    } else if (op->opc == INDEX_op_tlb_check) {
+        for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+            if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
+                tcg_reg_free(s, i);
+            }
+        }
+        /* No output arguments for TLB_CHECK.  */
+        tcg_debug_assert(nb_oargs == 0);
+        tcg_out_op(s, op->opc, new_args, arg_types);
+        return;
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
             /* XXX: Permit generic clobber register list?  */

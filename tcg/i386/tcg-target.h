@@ -235,6 +235,18 @@ static inline void tcg_target_jmp(uintptr_t jmp_addr)
 #define TCG_TARGET_AREG0                                \
     ({ _RESERVE_REG(rbp) (CPUArchState *) rbp; })
 
+#define TCG_TARGET_EXTRA_PROLOGUE                       \
+    _RESERVE_REG(r8)                                    \
+    _RESERVE_REG(r9)                                    \
+    _RESERVE_REG(r10)                                   \
+    _RESERVE_REG(r11)
+
+#define TCG_TARGET_EXTRA_EPILOGUE                       \
+    _RESTORE_REG(r8)                                    \
+    _RESTORE_REG(r9)                                    \
+    _RESTORE_REG(r10)                                   \
+    _RESTORE_REG(r11)
+
 /* This defines the natural memory order supported by this
  * architecture before guarantees made by various barrier
  * instructions.
