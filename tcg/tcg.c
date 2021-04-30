@@ -3777,6 +3777,17 @@ done:
     }
 }
 
+static void temp_move(TCGContext *s, TCGTemp *ts, TCGReg reg)
+{
+    tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_REG);
+    if (!tcg_out_mov(s, ts->type, reg, ts->reg)) {
+        /* Cross register class move not supported. Sync the
+         * temp back to its slot and load from there.  */
+        temp_sync(s, ts, 0);
+        tcg_out_ld(s, ts->type, reg, ts->mem_base->reg, ts->mem_offset);
+    }
+}
+
 static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 {
     const TCGLifeData arg_life = op->life;
@@ -3860,14 +3871,10 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                       ~i_allocated_regs, 0);
             reg = tcg_reg_alloc(s, arg_ct->regs & ~i_allocated_regs,
                                 o_preferred_regs, ts->indirect_base);
-            if (!tcg_out_mov(s, ts->type, reg, ts->reg)) {
-                /*
-                 * Cross register class move not supported.  Sync the
-                 * temp back to its slot and load from there.
-                 */
-                temp_sync(s, ts, 0);
-                tcg_out_ld(s, ts->type, reg,
-                           ts->mem_base->reg, ts->mem_offset);
+            /* Nasty case where tcg_reg_alloc spills the very register
+             * that `ts` uses, no move is therefore needed.  */
+            if (reg != ts->reg) {
+                temp_move(s, ts, reg);
             }
         }
         new_args[i] = reg;
@@ -4087,15 +4094,7 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
         if (ts_val_type(ts) == TEMP_VAL_REG) {
             if (ts->reg != reg) {
                 tcg_reg_free(s, reg);
-                if (!tcg_out_mov(s, ts->type, reg, ts->reg)) {
-                    /*
-                     * Cross register class move not supported. Sync the
-                     * temp back to its slot and load from there.
-                     */
-                    temp_sync(s, ts, 0);
-                    tcg_out_ld(s, ts->type, reg,
-                               ts->mem_base->reg, ts->mem_offset);
-                }
+                temp_move(s, ts, reg);
             }
         } else {
             tcg_reg_free(s, reg);
