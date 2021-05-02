@@ -2459,7 +2459,7 @@ static void reachable_code_pass(TCGContext *s)
 
 #define TS_DEAD                 (1 << 0)
 #define TS_MAY_CLOBBER          (1 << 1)
-#define TS_MEM                  (1 << 2)
+#define TS_SYNC                 (1 << 2)
 
 #define IS_DEAD_ARG(n)          (arg_life & (DEAD_ARG << (n)))
 #define MAY_CLOBBER_ARG(n)      (arg_life & (CLOBBER_ARG << (n)))
@@ -2483,7 +2483,7 @@ static inline void la_reset_pref(TCGTemp *ts)
 static void la_global_kill(TCGContext *s, size_t ng)
 {
     for (size_t i = 0; i < ng; i++) {
-        s->temps[i].state = TS_DEAD | TS_MEM;
+        s->temps[i].state = TS_DEAD | TS_SYNC;
         la_reset_pref(&s->temps[i]);
     }
 }
@@ -2512,7 +2512,7 @@ static void la_bb_end(TCGContext *s, size_t ng, size_t nt)
 
         switch (ts->kind) {
         case TEMP_LOCAL:
-            state = TS_DEAD | TS_MEM;
+            state = TS_DEAD | TS_SYNC;
             break;
         case TEMP_NORMAL:
         case TEMP_CONST:
@@ -2532,7 +2532,7 @@ static void la_global_sync(TCGContext *s, size_t ng)
     for (size_t i = 0; i < ng; ++i) {
         uint32_t state = s->temps[i].state;
 
-        s->temps[i].state = state | TS_MEM;
+        s->temps[i].state = state | TS_SYNC;
         if (state == TS_DEAD) {
             /* If the global was previously dead, reset prefs.  */
             la_reset_pref(&s->temps[i]);
@@ -2555,7 +2555,7 @@ static void la_bb_sync(TCGContext *s, size_t ng, size_t nt)
         switch (ts->kind) {
         case TEMP_LOCAL:
             state = ts->state;
-            ts->state = state | TS_MEM;
+            ts->state = state | TS_SYNC;
             if (state != TS_DEAD) {
                 continue;
             }
@@ -2625,7 +2625,7 @@ static void la_record_life(const TCGTemp *ts, TCGLifeData *parg_life,
     }
     /* The output argument should be synced back to its canonical memory
      * location at the end of this op.  */
-    if (is_oargs && (ts->state & TS_MEM)) {
+    if (is_oargs && (ts->state & TS_SYNC)) {
         arg_life |= SYNC_ARG << i;
     }
     *parg_life = arg_life;
@@ -3022,7 +3022,7 @@ static bool liveness_pass_2(TCGContext *s)
                     lop->args[2] = arg_ts->mem_offset;
 
                     /* Loaded, but synced with memory.  */
-                    arg_ts->state = TS_MEM;
+                    arg_ts->state = TS_SYNC;
                 }
             }
         }
@@ -3051,7 +3051,7 @@ static bool liveness_pass_2(TCGContext *s)
         } else if (call_flags & TCG_CALL_NO_WRITE_GLOBALS) {
             for (i = 0; i < nb_globals; ++i) {
                 /* Liveness should see that globals are synced back,
-                   that is, either TS_DEAD or TS_MEM.  */
+                   that is, either TS_DEAD or TS_SYNC.  */
                 arg_ts = &s->temps[i];
                 tcg_debug_assert(arg_ts->state_ptr == 0
                                  || arg_ts->state != 0);
@@ -3089,7 +3089,7 @@ static bool liveness_pass_2(TCGContext *s)
                         arg_ts->state = TS_DEAD;
                         tcg_op_remove(s, op);
                     } else {
-                        arg_ts->state = TS_MEM;
+                        arg_ts->state = TS_SYNC;
                     }
 
                     sop->args[0] = temp_arg(out_ts);
@@ -3123,7 +3123,7 @@ static bool liveness_pass_2(TCGContext *s)
                     sop->args[1] = temp_arg(arg_ts->mem_base);
                     sop->args[2] = arg_ts->mem_offset;
 
-                    arg_ts->state = TS_MEM;
+                    arg_ts->state = TS_SYNC;
                 }
                 /* Drop outputs that are dead.  */
                 if (IS_DEAD_ARG(i)) {
