@@ -1893,6 +1893,9 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
+    /* Offset field in GUARD's JNE should be aligned.  */
+    tcg_debug_assert((uintptr_t) spl->label_ptr % 4 == 0);
+
     /* Resolve label address.  */
     tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
 
@@ -2156,10 +2159,28 @@ static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator_,
                         arg_types[2]);
 }
 
+static void tcg_out_padding_4(TCGContext *s, ptrdiff_t opcode_bytes)
+{
+    ptrdiff_t gap;
+
+    /* Jump displacement must be aligned for atomic patching. See if we need
+     * to add extra NOPs before jump.
+     * Ideally, s->code_ptr + opcode_bytes should be already aligned to word
+     * boundary (i.e. gap == opcode_bytes), pad it to be if not so.  */
+    gap = tcg_pcrel_diff(s, QEMU_ALIGN_PTR_UP(s->code_ptr + opcode_bytes, 4));
+    if (gap != opcode_bytes) {
+        tcg_out_nopn(s, gap - opcode_bytes);
+    }
+}
+
 static void tcg_out_guard(TCGContext *s, TCGReg arg1, TCGArg arg2,
                           BackendValType arg2_type, int rexw)
 {
     tcg_out_cmp(s, arg1, arg2, arg2_type, rexw);
+    /* On x86_64 hosts, {ADD, LEA} + AND + MOV + CMP + JNE_OPCODE takes up
+     * (4 + 7 + 4 + 3 + 2 = 16) BYTEs, so if the previous GUARD is aligned
+     * the second GUARD will also be aligned automatically, which is lucky.  */
+    tcg_out_padding_4(s, 2);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
@@ -2202,14 +2223,7 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
     case INDEX_op_goto_tb:
         if (s->tb_jmp_insn_offset) {
             /* direct jump method */
-            int gap;
-            /* jump displacement must be aligned for atomic patching;
-             * see if we need to add extra nops before jump
-             */
-            gap = tcg_pcrel_diff(s, QEMU_ALIGN_PTR_UP(s->code_ptr + 1, 4));
-            if (gap != 1) {
-                tcg_out_nopn(s, gap - 1);
-            }
+            tcg_out_padding_4(s, 1);
             tcg_out8(s, OPC_JMP_long); /* jmp im */
             s->tb_jmp_insn_offset[a0] = tcg_current_code_size(s);
             tcg_out32(s, 0);
