@@ -45,13 +45,9 @@
 #if TARGET_LONG_BITS == 32
 #define INDEX_op_add_tl     INDEX_op_add_i32
 #define INDEX_op_and_tl     INDEX_op_and_i32
-#define INDEX_op_ld_tl      INDEX_op_ld_i32
-#define INDEX_op_guard_tl   INDEX_op_guard_i32
 #else
 #define INDEX_op_add_tl     INDEX_op_add_i64
 #define INDEX_op_and_tl     INDEX_op_and_i64
-#define INDEX_op_ld_tl      INDEX_op_ld_i64
-#define INDEX_op_guard_tl   INDEX_op_guard_i64
 #endif
 
 /* General explanation of how input IR is converted to SSA-form:
@@ -541,7 +537,7 @@ static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
     uint32_t s_bits = memop & MO_SIZE;
     uint32_t a_mask = (1 << a_bits) - 1;
     uint32_t s_mask = (1 << s_bits) - 1;
-    TCGTemp *comparator_ = tcg_opt_temp_new(TCG_TYPE_TL);
+    TCGTemp *comparator = tcg_opt_temp_new(TCG_TYPE_TL);
 
     if (a_bits >= s_bits) {
         /* Alignment check implies the cross-page check for accesses with
@@ -577,7 +573,7 @@ static TCGOp *tcg_opt_gen_extract_comparator(TCGOp *op, TCGTemp *addr,
     }
 
     op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_and_tl);
-    op->args[0] = temp_arg(comparator_);
+    op->args[0] = temp_arg(comparator);
     op->args[1] = temp_arg(addr);
     op->args[2] = tcg_opt_constant_new(TCG_TYPE_TL, TARGET_PAGE_MASK | a_mask);
     return op;
@@ -588,7 +584,7 @@ static TCGOp *tcg_opt_gen_tlb_check(TCGOp *op, TCGTemp *entry, TCGTemp *addr,
 {
     op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_tlb_check);
     op->args[0] = temp_arg(entry);
-    /* comparator_ */
+    /* comparator */
     op->args[1] = QTAILQ_PREV(op, link)->args[0];
     op->args[2] = temp_arg(addr);
     op->args[3] = oi | (is_load ? _OI_LOAD : 0);
@@ -627,23 +623,12 @@ static TCGOp *tcg_opt_gen_gva_addend(TCGOp *op, TCGTemp *entry, TCGTemp *addr)
     return op;
 }
 
-static TCGOp *tcg_opt_gen_tlb_guard(TCGOp *op, TCGTemp *entry, bool is_load)
+static TCGOp *tcg_opt_gen_tlb_guard(TCGOp *op, TCGTemp *entry,
+                                    TCGTemp *comparator, bool is_load)
 {
-    TCGTemp *comparator = tcg_opt_temp_new(TCG_TYPE_TL);
-    intptr_t offset_of_comparator = is_load ? offsetof(CPUTLBEntry, addr_read)
-                                            : offsetof(CPUTLBEntry, addr_write);
-
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_ld_tl);
-    op->args[0] = temp_arg(comparator);
-    op->args[1] = temp_arg(entry);
-    op->args[2] = offset_of_comparator;
-
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guard_tl);
-    op->args[0] = temp_arg(comparator);
-    /* comparator_ */
-    op->args[1] = QTAILQ_PREV(QTAILQ_PREV(op, link), link)->args[0];
-    /* Special CARG serves only as a hint for guard hoisting pass, will not be
-     * used and have no affect on codegen.  */
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_tlb_guard);
+    op->args[0] = temp_arg(entry);
+    op->args[1] = temp_arg(comparator);
     op->args[2] = is_load ? _OI_LOAD : 0;
     return op;
 }
@@ -784,7 +769,8 @@ static void tcg_opt_qemu_ldst_finalize(TCGOp *op, bool is_load, bool is_64bit)
          *    disturbed by padding made in check 2 in extremely subtle way,
          *    see also tcg_opt_gen_extract_comparator().  */
         op = tcg_opt_gen_extract_comparator(op, addr, memop, offset, true);
-        op = tcg_opt_gen_tlb_guard(op, address->entry, is_load);
+        op = tcg_opt_gen_tlb_guard(op, address->entry, arg_temp(op->args[0]),
+                                   is_load);
     }
 
     /* Perform the actual memory access.  */
@@ -2215,7 +2201,7 @@ static TCGOp *op_cast(TCGOp *op, TCGOpcode opc)
     }
 }
 
-/* COMPARATOR_s used by TLB_CHECK or GUARD operations are always calculated by
+/* COMPARATORs used by TLB_CHECK or GUARD operations are always calculated by
  * masking out (mostly) the non-page-number bits of the address, which usually
  * takes the form of "BASE + constant offset", and may or may not be padded by
  * MO_SIZE-related constant offset. This function aims at extracting:
@@ -2228,28 +2214,28 @@ static uint32_t extract_padded_offset(TCGOp *op_tlb, int64_t *poffset,
     TCGOp *op_and, *op_add;
 
     tcg_debug_assert(op_cast(op_tlb, INDEX_op_tlb_check) ||
-                     op_cast(op_tlb, INDEX_op_guard_tl));
+                     op_cast(op_tlb, INDEX_op_tlb_guard));
     tcg_debug_assert(poffset);
 
     /*                             v
-     * TLB_CHECK       entry, comparator_, _oi
-     * GUARD      comparator, comparator_
+     * TLB_CHECK       entry, comparator, _oi
+     * TLB_GUARD       entry, comparator
      *                             ^            */
     op_and = temp_definition(arg_temp(op_tlb->args[1]));
 
-    /* The COMPARATOR_ must be calculated by AND_TL operation, constant
+    /* The COMPARATOR must be calculated by AND_TL operation, constant
      * comparators do not obey this rule and are handled differently.  */
     tcg_debug_assert(op_cast(op_and, INDEX_op_and_tl));
     if (pmask) {
         *pmask = arg_value(op_and->args[2]);
     }
 
-    /*                              v
-     * AND_TL     comparator_, padded_addr, mask
-     *                              ^           */
+    /*                                   v
+     *    AND_TL        comparator, padded_addr, mask
+     *                                   ^      */
     op_add = temp_definition(arg_temp(op_and->args[1]));
 
-    /* The COMPARATOR_ may or may not be padded before being masked.  */
+    /* The COMPARATOR may or may not be padded before being masked.  */
     if (op_cast(op_add, INDEX_op_add_tl) && arg_is_const(op_add->args[2])) {
         *poffset = arg_value(op_add->args[2]);
         return temp_idx(arg_temp(op_add->args[1]));
@@ -2273,7 +2259,7 @@ static void init_ts_guard_info(TCGTemp *ts, TCGOp *op)
     if (unlikely(arg_is_const(op->args[1]))) {
         info->is_constant = true;
         /* .OFFSET_INITIAL field is not used for constant GUARDs, as whether
-         * a constant COMPARATOR_ for GUARD is equal to that of corrsponding
+         * a constant COMPARATOR for GUARD is equal to that of corrsponding
          * TLB_CHECK's is known statically. See tcg_opt_guard_hoisting() for
          * more detailed explanation.  */
         info->offset_initial = 0;
@@ -2296,23 +2282,20 @@ static void init_ts_guard_info(TCGTemp *ts, TCGOp *op)
  * temp_definition(op->args[0])->args[1] should be used.  */
 static GuardHoistingInfo *op_guard_info(TCGOp *op)
 {
-    TCGTemp *ts;
+    TCGTemp *ts = arg_temp(op->args[0]);
     GuardHoistingInfo *info;
 
     switch (op->opc) {
     case INDEX_op_tlb_check:
-        ts = arg_temp(op->args[0]);
         init_ts_guard_info(ts, op);
         break;
-    case INDEX_op_guard_tl:
-        tcg_debug_assert((op = op_cast(temp_definition(arg_temp(op->args[0])),
-                                       INDEX_op_ld_tl)));
-        ts = arg_temp(op->args[1]);
+    case INDEX_op_tlb_guard:
         break;
     default:
         g_assert_not_reached();
     }
 
+    tcg_debug_assert(op_cast(temp_definition(ts), INDEX_op_tlb_load));
     tcg_debug_assert((info = ts_guard_info(ts)));
     return info;
 }
@@ -2329,30 +2312,11 @@ static TCGTemp *tcg_opt_temp_new_with_op(TCGType type, TCGOp *defining_op)
     return ts;
 }
 
-static TCGOp *tcg_opt_insert_guard_after__raw(TCGOp *op, TCGArg entry,
-                                              TCGArg comparator_, bool is_load)
-{
-    TCGTemp *comparator;
-    intptr_t offset_of_comparator = is_load ? offsetof(CPUTLBEntry, addr_read)
-                                            : offsetof(CPUTLBEntry, addr_write);
-
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_ld_tl);
-    comparator = tcg_opt_temp_new_with_op(TCG_TYPE_TL, op);
-    op->args[0] = temp_arg(comparator);
-    op->args[1] = entry;
-    op->args[2] = offset_of_comparator;
-
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_guard_tl);
-    op->args[0] = temp_arg(comparator);
-    op->args[1] = comparator_;
-    return op;
-}
-
-static TCGOp *tcg_opt_insert_guard_after(TCGOp *op, TCGArg base, int64_t offset,
+static TCGOp *tcg_opt_gen_tlb_guard_full(TCGOp *op, TCGArg base, int64_t offset,
                                          bool is_load)
 {
-    TCGTemp *comparator_, *padded_addr;
-    TCGArg entry = op_cast(op, INDEX_op_tlb_check)->args[0];
+    TCGTemp *comparator, *padded_addr;
+    TCGTemp *entry = arg_temp(op_cast(op, INDEX_op_tlb_check)->args[0]);
 
     if (likely(offset != 0)) {
         op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_tl);
@@ -2366,13 +2330,12 @@ static TCGOp *tcg_opt_insert_guard_after(TCGOp *op, TCGArg base, int64_t offset,
     }
 
     op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_and_tl);
-    comparator_ = tcg_opt_temp_new_with_op(TCG_TYPE_TL, op);
-    op->args[0] = temp_arg(comparator_);
+    comparator = tcg_opt_temp_new_with_op(TCG_TYPE_TL, op);
+    op->args[0] = temp_arg(comparator);
     op->args[1] = temp_arg(padded_addr);
     op->args[2] = tcg_opt_constant_new__raw(TCG_TYPE_TL, TARGET_PAGE_MASK);
 
-    return tcg_opt_insert_guard_after__raw(op, entry, temp_arg(comparator_),
-                                           is_load);
+    return tcg_opt_gen_tlb_guard(op, entry, comparator, is_load);
 }
 
 static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
@@ -2388,16 +2351,17 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
     if (info->offset_max == info->offset_min) {
         tcg_debug_assert(info->offset_max == info->offset_initial);
         if (info->guard_exist) {
-            /* This is a double check using THE SAME COMPARATOR_ as with the
+            /* This is a double check using THE SAME COMPARATOR as with the
              * TLB_CHECK itself, even if both accesses are of the same type.
              * Its necessity is justified by the following nasty cases, where
              * address lies in area:
              * 1. of which protection is enforced in unit smaller than a page,
              * 2. to which every write invalidate the overlapping TB,
              * 3. implementing weird attribute like s390x's PAGE_WRITE_INV.  */
-            tcg_opt_insert_guard_after__raw(op, op->args[0], op->args[1],
-                                            info->has_load && info->has_store ?
-                                            !is_load : is_load);
+            tcg_opt_gen_tlb_guard(op, arg_temp(op->args[0]),
+                                  arg_temp(op->args[1]),
+                                  info->has_load && info->has_store ? !is_load
+                                                                    : is_load);
         }
         return;
     }
@@ -2413,10 +2377,10 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
          * upper bound (if necessary) of the collected accesses.  */
         tcg_debug_assert(info->has_load || info->has_store);
         if (info->offset_max > info->offset_initial) {
-            tcg_opt_insert_guard_after(op, base, info->offset_max, is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_max, is_load);
         }
         if (info->offset_min < info->offset_initial) {
-            tcg_opt_insert_guard_after(op, base, info->offset_min, is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_min, is_load);
         }
     } else {
         /* Both load and store are associated with the base address,
@@ -2429,12 +2393,12 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
          * The above conditions hold iff all these GUARDs get passed.  */
         if (info->offset_max > info->offset_initial &&
             info->offset_min < info->offset_initial) {
-            tcg_opt_insert_guard_after(op, base, info->offset_max, is_load);
-            tcg_opt_insert_guard_after(op, base, info->offset_min, !is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_max, is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_min, !is_load);
         } else if (info->offset_max > info->offset_initial) {
-            tcg_opt_insert_guard_after(op, base, info->offset_max, !is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_max, !is_load);
         } else {
-            tcg_opt_insert_guard_after(op, base, info->offset_min, !is_load);
+            tcg_opt_gen_tlb_guard_full(op, base, info->offset_min, !is_load);
         }
     }
 }
@@ -2464,22 +2428,22 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
             info = op_guard_info(op);
             _oi = op->args[3];
             goto is_load_or_not;
-        case INDEX_op_guard_tl:
+        case INDEX_op_tlb_guard:
             info = op_guard_info(op);
             if (unlikely(info->is_constant)) {
-                uint64_t _comparator_ = arg_value(info->tlb_check_op->args[1]);
-                uint64_t comparator_ = arg_value(op->args[1]);
+                uint64_t _comparator = arg_value(info->tlb_check_op->args[1]);
+                uint64_t comparator = arg_value(op->args[1]);
 
                 /* Unaligned access will never pass TLB_CHECK, of which the
                  * original requirement for aligned-ness (i.e. A_MASK) will
                  * not be touched as in tcg_opt_extract_comparator_finalize,
                  * therefore matches that would be checked in slow path. So
                  * we are safe to clear the low bits here.  */
-                _comparator_ &= TARGET_PAGE_MASK;
+                _comparator &= TARGET_PAGE_MASK;
 
                 /* Access not satisfying aligned-ness requirement will
                  * result in bailing out from slow path, DEFINITELY.  */
-                if (unlikely(comparator_ & ~TARGET_PAGE_MASK)) {
+                if (unlikely(comparator & ~TARGET_PAGE_MASK)) {
                     continue;
 
                 /* Reassociation process of constant addresses guarantees
@@ -2487,11 +2451,11 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
                  * as with its base address, but NOT the last. This will
                  * result in a cross-page access, and in turn bailing out
                  * from slow path, DEFINITELY.  */
-                } else if (unlikely(comparator_ ==
-                                    _comparator_ + TARGET_PAGE_SIZE)) {
+                } else if (unlikely(comparator ==
+                                    _comparator + TARGET_PAGE_SIZE)) {
                     continue;
                 }
-                tcg_debug_assert(comparator_ == _comparator_);
+                tcg_debug_assert(comparator == _comparator);
             } else {
                 int64_t offset, mask;
 
@@ -2514,8 +2478,6 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
                 }
             }
             info->guard_exist = true;
-
-            /* See tcg_opt_gen_tlb_guard() for this special CARG.  */
             _oi = op->args[2];
 
             /* Remove encountered GUARD and SIDE_EFFECT operation.  */

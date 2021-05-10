@@ -1889,7 +1889,7 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     return true;
 }
 
-static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
@@ -1901,7 +1901,7 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
     /* Signature of the helper to be called:
      * QEMU_NORETURN
-     * void helper_guard_failure(CPUArchState *rbp, uintptr_t retaddr);
+     * void helper_tlb_guard_failure(CPUArchState *rbp, uintptr_t retaddr);
      *
      * Note that the function implements nonstandard calling convention,
      * in the sense that certain arguments are passed through registers
@@ -1909,7 +1909,7 @@ static bool tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
                  (uintptr_t) spl->raddr);
     /* Guard failure never returns.  */
-    tcg_out_jmp(s, (tcg_insn_unit *) helper_guard_failure);
+    tcg_out_jmp(s, (tcg_insn_unit *) helper_tlb_guard_failure);
     return true;
 }
 #elif TCG_TARGET_REG_BITS == 32
@@ -2143,7 +2143,7 @@ static void add_tlb_check_label(TCGContext *s, tcg_insn_unit *raddr,
     label->addr_type = addr_type;
 }
 
-static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator_,
+static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator,
                               TCGArg addr, const BackendValType *arg_types,
                               TCGMemOpIdx _oi)
 {
@@ -2151,7 +2151,7 @@ static void tcg_out_tlb_check(TCGContext *s, TCGReg entry, TCGArg comparator_,
                                      : offsetof(CPUTLBEntry, addr_write);
     int rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
 
-    tcg_out_cmpm(s, entry, offset, comparator_, arg_types[1], rexw);
+    tcg_out_cmpm(s, entry, offset, comparator, arg_types[1], rexw);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
@@ -2173,18 +2173,19 @@ static void tcg_out_padding_4(TCGContext *s, ptrdiff_t opcode_bytes)
     }
 }
 
-static void tcg_out_guard(TCGContext *s, TCGReg arg1, TCGArg arg2,
-                          BackendValType arg2_type, int rexw)
+static void tcg_out_tlb_guard(TCGContext *s, TCGReg entry, TCGArg comparator,
+                              BackendValType arg_type, TCGMemOpIdx _oi)
 {
-    tcg_out_cmp(s, arg1, arg2, arg2_type, rexw);
-    /* On x86_64 hosts, {ADD, LEA} + AND + MOV + CMP + JNE_OPCODE takes up
-     * (4 + 7 + 4 + 3 + 2 = 16) BYTEs, so if the previous GUARD is aligned
-     * the second GUARD will also be aligned automatically, which is lucky.  */
+    intptr_t offset = _oi & _OI_LOAD ? offsetof(CPUTLBEntry, addr_read)
+                                     : offsetof(CPUTLBEntry, addr_write);
+    int rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+
+    tcg_out_cmpm(s, entry, offset, comparator, arg_type, rexw);
     tcg_out_padding_4(s, 2);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     s->code_ptr += 4;
 
-    new_guard_label(s, s->code_ptr, s->code_ptr - 4);
+    new_tlb_guard_label(s, s->code_ptr, s->code_ptr - 4);
 }
 
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
@@ -2466,8 +2467,8 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
     case INDEX_op_tlb_check:
         tcg_out_tlb_check(s, a0, a1, a2, arg_types, args[3]);
         break;
-    OP_32_64(guard):
-        tcg_out_guard(s, a0, a1, arg_types[1], rexw);
+    case INDEX_op_tlb_guard:
+        tcg_out_tlb_guard(s, a0, a1, arg_types[1], a2);
         break;
 
     OP_32_64(mulu2):
@@ -3125,13 +3126,12 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
             };
             return &tlb_check;
         }
-    case INDEX_op_guard_i32:
-    case INDEX_op_guard_i64:
+    case INDEX_op_tlb_guard:
         {
-            static const TCGTargetOpDef guard = {
+            static const TCGTargetOpDef tlb_guard = {
                 .args_ct_str = { "r", "re" }
             };
-            return &guard;
+            return &tlb_guard;
         }
 
     case INDEX_op_brcond2_i32:

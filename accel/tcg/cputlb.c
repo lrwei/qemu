@@ -2723,7 +2723,7 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
  * instead of tcg_target_jmp(), with tiny little bit of extra runtime
  * overhead.  */
 QEMU_NORETURN __attribute__((naked))
-void helper_guard_failure(CPUArchState *_, uintptr_t retaddr)
+void helper_tlb_guard_failure(CPUArchState *_, uintptr_t retaddr)
 {
     CPUState *cpu = env_cpu(TCG_TARGET_AREG0);
 
