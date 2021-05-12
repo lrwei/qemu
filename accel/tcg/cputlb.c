@@ -212,7 +212,8 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 }
 
-static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
+static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                                 CPUITLBDescFast *ifast, bool itlb_is_dirty)
 {
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
@@ -220,6 +221,19 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     desc->vindex = 0;
     memset(fast->table, -1, sizeof_tlb(fast));
     memset(desc->vtable, -1, sizeof(desc->vtable));
+
+    /* iTLB is always re-callocated instead of memset-ed on flush, i.e., it
+     * uses 0 as the invalid state. This is possible (or profitable) because
+     * the contents of iTLB are always compared to page-aligned, STATICALLY
+     * known values, to which we add by 1 to make comparison to 0 fail. For
+     * ordinary TLB operations, we have to OR some bit to those DYNAMICALLY
+     * calculated comparators before doing the comparison, which is kind of
+     * questionable.  */
+    if (itlb_is_dirty) {
+        /* Free the old iTLB before reallocation.  */
+        g_free(ifast->table);
+        ifast->table = g_new0(CPUITLBEntry, CPU_ITLB_SIZE);
+    }
 }
 
 static void tlb_flush_one_mmuidx_locked(CPUArchState *env, int mmu_idx,
@@ -227,12 +241,15 @@ static void tlb_flush_one_mmuidx_locked(CPUArchState *env, int mmu_idx,
 {
     CPUTLBDesc *desc = &env_tlb(env)->d[mmu_idx];
     CPUTLBDescFast *fast = &env_tlb(env)->f[mmu_idx];
+    CPUITLBDescFast *ifast = &env_tlb(env)->i[mmu_idx];
 
     tlb_mmu_resize_locked(desc, fast, now);
-    tlb_mmu_flush_locked(desc, fast);
+    tlb_mmu_flush_locked(desc, fast, ifast,
+                         !!(env_tlb(env)->c.dirty_i & (1 << mmu_idx)));
 }
 
-static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
+static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now,
+                         CPUITLBDescFast *ifast)
 {
     size_t n_entries = 1 << CPU_TLB_DYN_DEFAULT_BITS;
 
@@ -241,7 +258,8 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
     desc->iotlb = g_new(CPUIOTLBEntry, n_entries);
-    tlb_mmu_flush_locked(desc, fast);
+    ifast->table = g_new0(CPUITLBEntry, CPU_ITLB_SIZE);
+    tlb_mmu_flush_locked(desc, fast, NULL, false);
 }
 
 static inline void tlb_n_used_entries_inc(CPUArchState *env, uintptr_t mmu_idx)
@@ -264,9 +282,11 @@ void tlb_init(CPUState *cpu)
 
     /* All tlbs are initialized flushed. */
     env_tlb(env)->c.dirty = 0;
+    env_tlb(env)->c.dirty_i = 0;
 
     for (i = 0; i < NB_MMU_MODES; i++) {
-        tlb_mmu_init(&env_tlb(env)->d[i], &env_tlb(env)->f[i], now);
+        tlb_mmu_init(&env_tlb(env)->d[i], &env_tlb(env)->f[i], now,
+                     &env_tlb(env)->i[i]);
     }
 }
 
@@ -279,9 +299,11 @@ void tlb_destroy(CPUState *cpu)
     for (i = 0; i < NB_MMU_MODES; i++) {
         CPUTLBDesc *desc = &env_tlb(env)->d[i];
         CPUTLBDescFast *fast = &env_tlb(env)->f[i];
+        CPUITLBDescFast *ifast = &env_tlb(env)->i[i];
 
         g_free(fast->table);
         g_free(desc->iotlb);
+        g_free(ifast->table);
     }
 }
 
@@ -325,7 +347,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
     CPUArchState *env = cpu->env_ptr;
     uint16_t asked = data.host_int;
-    uint16_t all_dirty, work, to_clean;
+    uint16_t work, to_clean;
     int64_t now = get_clock_realtime();
 
     assert_cpu_is_self(cpu);
@@ -334,15 +356,16 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_lock(&env_tlb(env)->c.lock);
 
-    all_dirty = env_tlb(env)->c.dirty;
-    to_clean = asked & all_dirty;
-    all_dirty &= ~to_clean;
-    env_tlb(env)->c.dirty = all_dirty;
-
+    /* For targets without separate architectural iTLB, C.DIRTY should
+     * cover C.DIRTY_I for the most of the time, but maybe not all the
+     * time. Expected to introduce certain amount of overhead.  */
+    to_clean = (env_tlb(env)->c.dirty | env_tlb(env)->c.dirty_i) & asked;
     for (work = to_clean; work != 0; work &= work - 1) {
         int mmu_idx = ctz32(work);
         tlb_flush_one_mmuidx_locked(env, mmu_idx, now);
     }
+    env_tlb(env)->c.dirty &= ~asked;
+    env_tlb(env)->c.dirty_i &= ~asked;
 
     qemu_spin_unlock(&env_tlb(env)->c.lock);
 
@@ -475,6 +498,52 @@ static inline void tlb_flush_vtlb_page_locked(CPUArchState *env, int mmu_idx,
     tlb_flush_vtlb_page_mask_locked(env, mmu_idx, page, -1);
 }
 
+static inline CPUITLBEntry *itlb_entry(CPUArchState *env, int mmu_idx,
+                                       target_ulong addr)
+{
+    CPUITLBDescFast *ifast = &env_tlb(env)->i[mmu_idx];
+
+    /* iTLB shall never be ACCESSED by any vCPU thread other than the one it
+     * belongs to. Therefore, no locks, even atomic operations are needed.  */
+    tcg_debug_assert(qemu_cpu_is_self(env_cpu(env)));
+    return &ifast->table[(addr >> TARGET_PAGE_BITS) & CPU_ITLB_MASK];
+}
+
+static inline void itlb_flush_page_mask_locked(CPUArchState *env, int mmu_idx,
+                                               target_ulong page,
+                                               target_ulong mask)
+{
+    CPUITLBEntry *entry = itlb_entry(env, mmu_idx, page);
+
+    /* Flush the iTLB entry corresponding to the address PAGE. Note that
+     * resetting PHYS_PAGE field only suffices to flush the iTLB entry.  */
+    if ((entry->virt_page & mask) == (page & mask)) {
+        entry->phys_page = 0;
+    }
+}
+
+static inline void itlb_flush_page_locked(CPUArchState *env, int mmu_idx,
+                                          target_ulong page)
+{
+    itlb_flush_page_mask_locked(env, mmu_idx, page, -1);
+}
+
+void itlb_update_entry(CPUArchState *env, target_ulong vaddr, ram_addr_t paddr)
+{
+    int mmu_idx = cpu_mmu_index(env, true);
+    CPUITLBEntry *entry = itlb_entry(env, mmu_idx, vaddr);
+
+    tcg_debug_assert(!((paddr | vaddr) & ~TARGET_PAGE_MASK));
+    /* Physical page addresses are always OR'ed with 1 -- as an indication of
+     * being valid -- before inserted into iTLB, the same rule applies also to
+     * addresses to be compared to. This enables the using of 0 as the invalid
+     * value for iTLB entries and further more, using calloc instead of memset
+     * to flush iTLB -- an idea proposed by Emilio G. Cota.  */
+    entry->virt_page = vaddr;
+    entry->phys_page = 1 | paddr;
+    env_tlb(env)->c.dirty_i |= 1 << mmu_idx;
+}
+
 static void tlb_flush_page_locked(CPUArchState *env, int midx,
                                   target_ulong page)
 {
@@ -492,6 +561,7 @@ static void tlb_flush_page_locked(CPUArchState *env, int midx,
             tlb_n_used_entries_dec(env, midx);
         }
         tlb_flush_vtlb_page_locked(env, midx, page);
+        itlb_flush_page_locked(env, midx, page);
     }
 }
 
@@ -725,6 +795,7 @@ static void tlb_flush_page_bits_locked(CPUArchState *env, int midx,
         tlb_n_used_entries_dec(env, midx);
     }
     tlb_flush_vtlb_page_mask_locked(env, midx, page, mask);
+    itlb_flush_page_mask_locked(env, midx, page, mask);
 }
 
 typedef struct {

@@ -32,6 +32,7 @@
 #include "exec/hwaddr.h"
 #endif
 #include "exec/memattrs.h"
+#include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
 
 #include "cpu-param.h"
@@ -191,6 +192,35 @@ typedef struct CPUTLBDescFast {
     CPUTLBEntry *table;
 } CPUTLBDescFast QEMU_ALIGNED(2 * sizeof(void *));
 
+/* Minic that of HQEMU.  */
+#define CPU_ITLB_BITS           12
+#define CPU_ITLB_SIZE           (1ull << CPU_ITLB_BITS)
+#define CPU_ITLB_MASK           (CPU_ITLB_SIZE - 1)
+#define CPU_ITLB_ENTRY_BITS     4
+
+/* Cache translation from target virtual address to mysterious RAM address.
+ * The entry is valid only if the lowest bit of PHYS_PAGE is set.  */
+typedef struct CPUITLBEntry {
+    union {
+        struct {
+            target_ulong virt_page;
+            ram_addr_t phys_page;
+        };
+        uint8_t dummy[1 << CPU_ITLB_ENTRY_BITS];
+    };
+} CPUITLBEntry;
+
+QEMU_BUILD_BUG_ON(sizeof(CPUITLBEntry) != (1 << CPU_ITLB_ENTRY_BITS));
+
+/* ITLB Data element that are per MMU mode, accessed by the fast path.
+ * Indirection instead of POD is used for the benefit of:
+ * 1. Decreasing addressing pressure among RISC hosts,
+ * 2. Being able to play reallocate-rather-than-clear trick to hide
+ *    ITLB flush latency.  */
+typedef struct CPUITLBDescFast {
+    CPUITLBEntry *table;
+} CPUITLBDescFast;
+
 /*
  * Data elements that are shared between all MMU modes.
  */
@@ -203,6 +233,8 @@ typedef struct CPUTLBCommon {
      * Protected by tlb_c.lock.
      */
     uint16_t dirty;
+    /* NOT protected by tlb_c.lock, seems neither should the above one.  */
+    uint16_t dirty_i;
     /*
      * Statistics.  These are not lock protected, but are read and
      * written atomically.  This allows the monitor to print a snapshot
@@ -223,12 +255,15 @@ typedef struct CPUTLBCommon {
 typedef struct CPUTLB {
     CPUTLBCommon c;
     CPUTLBDesc d[NB_MMU_MODES];
+    CPUITLBDescFast i[NB_MMU_MODES];
     CPUTLBDescFast f[NB_MMU_MODES];
 } CPUTLB;
 
 /* This will be used by TCG backends to compute offsets.  */
 #define TLB_MASK_TABLE_OFS(IDX) \
     ((int)offsetof(ArchCPU, neg.tlb.f[IDX]) - (int)offsetof(ArchCPU, env))
+#define ITLB_OFS(IDX)           \
+    ((int)offsetof(ArchCPU, neg.tlb.i[IDX]) - (int)offsetof(ArchCPU, env))
 
 #else
 

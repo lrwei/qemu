@@ -303,6 +303,9 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
 void tlb_set_page(CPUState *cpu, target_ulong vaddr,
                   hwaddr paddr, int prot,
                   int mmu_idx, target_ulong size);
+
+void itlb_update_entry(CPUArchState *env, target_ulong vaddr, ram_addr_t paddr);
+
 #else
 static inline void tlb_init(CPUState *cpu)
 {
