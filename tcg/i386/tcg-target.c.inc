@@ -2188,6 +2188,29 @@ static void tcg_out_tlb_guard(TCGContext *s, TCGReg entry, TCGArg comparator,
     new_tlb_guard_label(s, s->code_ptr, s->code_ptr - 4);
 }
 
+static void tcg_out_itlb_load(TCGContext *s, TCGReg entry, TCGArg addr,
+                              uint32_t mem_index)
+{
+    intptr_t table_ofs = ITLB_OFS(mem_index) + offsetof(CPUITLBDescFast, table);
+
+    /* Only low bits of the address are meaningful for iTLB index:
+     * | BITS_TO_IGNORE | CPU_ITLB_BITS | TARGET_PAGE_BITS |
+     *                          v
+     * |      0      | CPU_ITLB_BITS | CPU_ITLB_ENTRY_BITS |
+     * Note that no compiler is here to help us scaling the pointer
+     * according to sizeof(CPUITLBEntry), we have to do it ourselves,
+     * see also tcg_out_tlb_load().  */
+    tcg_debug_assert(TARGET_PAGE_BITS + CPU_ITLB_BITS <= 32);
+
+    addr = extract32(addr, TARGET_PAGE_BITS, CPU_ITLB_BITS);
+    addr <<= CPU_ITLB_ENTRY_BITS;
+    tcg_out_movi(s, TCG_TYPE_I32, entry, addr);
+
+    /* Native pointer on x86_64 should be 64-bit, P_REXW is thus needed.  */
+    _Static_assert(TCG_TYPE_PTR == TCG_TYPE_I64);
+    tcg_out_modrm_offset(s, OPC_ADD_GvEv + P_REXW, entry, TCG_AREG0, table_ofs);
+}
+
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
                               const BackendValType *arg_types)
 {
@@ -2469,6 +2492,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     case INDEX_op_tlb_guard:
         tcg_out_tlb_guard(s, a0, a1, arg_types[1], a2);
+        break;
+    case INDEX_op_itlb_load:
+        tcg_out_itlb_load(s, a0, a1, a2);
         break;
 
     OP_32_64(mulu2):
@@ -2928,6 +2954,7 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
 
     switch (op) {
     case INDEX_op_goto_ptr:
+    case INDEX_op_itlb_load:
         return &r;
 
     case INDEX_op_ld8u_i32:
