@@ -2269,6 +2269,20 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     cpu_loop_exit_noexc(cpu);
 }
 
+void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
+{
+    TranslationBlock *tb;
+
+    tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+    tb_phys_invalidate(tb, false);
+
+    /* All ITLB_CHECK is guarded by SIDE_EFFECTS op for the time being,
+     * i.e. TEMP_GLOBALs are always synced back to CPUArchState by the
+     * time execution reaches here, so we can exit cpu loop directly.  */
+    cpu_loop_exit_noexc(cpu);
+}
+
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)
 {
     unsigned int i, i0 = tb_jmp_cache_hash_page(page_addr);

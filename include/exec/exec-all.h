@@ -73,6 +73,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);
 void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
+void QEMU_NORETURN cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t pc);
 
 /**
  * cpu_loop_exit_requested:

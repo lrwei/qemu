@@ -2805,6 +2805,88 @@ void helper_tlb_guard_failure(CPUArchState *_, uintptr_t retaddr)
     tcg_target_jmp((uintptr_t) tcg_ctx->code_gen_epilogue);
 }
 
+QEMU_ALWAYS_INLINE
+static inline void itlb_check_helper(CPUArchState *env, ram_addr_t phys,
+                                     target_ulong virt, uintptr_t retaddr)
+{
+    uintptr_t mmu_idx = cpu_mmu_index(env, true);
+    uintptr_t index = tlb_index(env, mmu_idx, virt);
+    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, virt);
+    CPUITLBEntry *entry_i = itlb_entry(env, mmu_idx, virt);
+    CPUState *cpu = env_cpu(env);
+    void *hostp;
+
+    tcg_debug_assert((phys & ~TARGET_PAGE_MASK) == 1);
+    tcg_debug_assert(!(virt & ~TARGET_PAGE_MASK));
+    tcg_debug_assert(entry_i->phys_page != phys || entry_i->virt_page != virt);
+
+    /* Check whether we enter the slow path due to iTLB conflict or invalidate,
+     * otherwise the memory mapping must have been changed.  */
+    if (unlikely((entry_i->phys_page & 1) && entry_i->virt_page == virt)) {
+        goto invalidate_and_bailout;
+    }
+
+    /* Try refill the iTLB entry corresponds to VIRT, as this should be
+     * caused by cache conflicts for the most of the time. The original
+     * TLB as well as the victim one are used to accelarate translation
+     * process.  */
+    if (likely(!tlb_hit(entry->addr_code, virt))) {
+        if (!VICTIM_TLB_HIT(addr_code, virt)) {
+            CPUTLBDesc *desc = &env_tlb(env)->d[mmu_idx];
+            int64_t window_begin_ns = desc->window_begin_ns;
+            CPUClass *cc = CPU_GET_CLASS(cpu);
+
+            /* Probing must be used here, as all TEMP_GLOBALs might not
+             * be synced back to CPUArchState yet. (It is now, but wont
+             * be in future.)  */
+            if (unlikely(!cc->tlb_fill(cpu, virt, 0, MMU_INST_FETCH, mmu_idx,
+                                       true, /* Shall never use this.  */ 0))) {
+                /* The page's being non-executable will force the execution
+                 * bailout to tb_find(), where finding in both TB_JMP_CACHE
+                 * and QHT will fail, even if the TB is not invalidated.
+                 * MMU exception will be triggered and handled in the next
+                 * round of tb_gen_code() using PC restored here.  */
+                goto invalidate_and_bailout;
+            }
+            /* Translation blocks compiled with CF_MONOLITHIC unset can not
+             * be returned to if TLB is flushed or resized here.  */
+            tcg_debug_assert(window_begin_ns == desc->window_begin_ns);
+        }
+    }
+    tcg_debug_assert(tlb_hit(entry->addr_code, virt));
+
+    /* TBs backed by memory pages with unusual attributes should not be
+     * linked at the first place. Nevertheless strange guests are still
+     * free to map what they want, so this is still possible.  */
+    if (unlikely(entry->addr_code & (TLB_INVALID_MASK | TLB_MMIO))) {
+        goto invalidate_and_bailout;
+    }
+    hostp = (void *) ((uintptr_t) virt + entry->addend);
+    itlb_update_entry(env, virt, qemu_ram_addr_from_host_nofail(hostp));
+
+    if (unlikely(entry_i->phys_page != phys)) {
+        goto invalidate_and_bailout;
+    }
+    return;
+
+invalidate_and_bailout:
+    /* This indicates a (partial) updation of guest memory mapping, which
+     * should be infrequent for most of the workload, and renders "the TB
+     * making this ITLB_CHECK" invalid -- CPBL and IBTC (not implemented
+     * yet) will be checked under the INSN_START of jump target blocks.  */
+    cpu_rescue_itlb_check_failure(cpu, retaddr);
+}
+
+__attribute__((optimize("-fomit-frame-pointer")))
+void helper_itlb_check(ram_addr_t phys, target_ulong virt, uintptr_t retaddr)
+{
+    TCG_TARGET_EXTRA_PROLOGUE
+
+    itlb_check_helper(TCG_TARGET_AREG0, phys, virt, retaddr);
+
+    TCG_TARGET_EXTRA_EPILOGUE
+}
+
 /* First set of helpers allows passing in of OI and RETADDR.  This makes
    them callable from other helpers.  */
 

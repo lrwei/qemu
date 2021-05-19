@@ -1912,6 +1912,45 @@ static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     tcg_out_jmp(s, (tcg_insn_unit *) helper_tlb_guard_failure);
     return true;
 }
+
+static bool tcg_out_itlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    TCGLabelItlbCheck *l = spl->itlb_check;
+
+    _Static_assert(TCG_TARGET_REG_BITS == 64);
+
+    /* Resolve label address.  */
+    tcg_patch32(spl->label_ptr, s->code_ptr - (spl->label_ptr + 4));
+
+    /* Signature of the helper to be called:
+     * QEMU_NORETURN
+     * void helper_itlb_check(ram_addr_t phys, target_ulong virt,
+     *                        uintptr_t retaddr, CPUArchState *rbp);
+     *
+     * Note that the function implements nonstandard calling convention,
+     * in the sense that certain arguments are passed through registers
+     * specified by corresponding argument name.  */
+
+    if (l->phys_type == BACKEND_CONST) {
+        tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], l->phys);
+    } else {
+        tcg_debug_assert(l->phys_type == BACKEND_REG &&
+                         l->phys == tcg_target_call_iarg_regs[0]);
+    }
+    if (l->virt_type == BACKEND_CONST) {
+        tcg_out_movi(s, TCG_TYPE_TL, tcg_target_call_iarg_regs[1], l->virt);
+    } else {
+        tcg_debug_assert(l->virt_type == BACKEND_REG &&
+                         l->virt == tcg_target_call_iarg_regs[1]);
+    }
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[2],
+                 (uintptr_t) spl->raddr);
+
+    /* "Tail call" to the helper, with the return address back inline.  */
+    tcg_out_push(s, tcg_target_call_iarg_regs[2]);
+    tcg_out_jmp(s, (tcg_insn_unit *) helper_itlb_check);
+    return true;
+}
 #elif TCG_TARGET_REG_BITS == 32
 # define x86_guest_base_seg     0
 # define x86_guest_base_index   -1
@@ -2211,6 +2250,44 @@ static void tcg_out_itlb_load(TCGContext *s, TCGReg entry, TCGArg addr,
     tcg_out_modrm_offset(s, OPC_ADD_GvEv + P_REXW, entry, TCG_AREG0, table_ofs);
 }
 
+static void add_itlb_check_label(TCGContext *s, tcg_insn_unit *raddr,
+                                 tcg_insn_unit *label_ptr, TCGArg phys,
+                                 TCGArg virt, const BackendValType *arg_types)
+{
+    TCGLabelItlbCheck *label = new_itlb_check_label(s, raddr, label_ptr);
+
+    label->phys = phys;
+    label->virt = virt;
+    label->phys_type = arg_types[1];
+    label->virt_type = arg_types[2];
+}
+
+static void tcg_out_itlb_check(TCGContext *s, TCGReg entry, TCGArg phys,
+                               TCGArg virt, const BackendValType *arg_types)
+{
+    intptr_t offset_phys = offsetof(CPUITLBEntry, phys_page);
+    intptr_t offset_virt = offsetof(CPUITLBEntry, virt_page);
+    int t_rexw = TARGET_LONG_BITS == 32 ? 0 : P_REXW;
+    tcg_insn_unit *label_ptr;
+
+    // cmp phys, offset_phys(entry)
+    // label:
+    // jne slow_path
+    tcg_out_cmpm(s, entry, offset_phys, phys, arg_types[1], P_REXW);
+    label_ptr = s->code_ptr;
+    tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
+    s->code_ptr += 4;
+
+    // cmp virt, offset_virt(entry)
+    // jne label
+    tcg_out_cmpm(s, entry, offset_virt, virt, arg_types[2], t_rexw);
+    tcg_out8(s, OPC_JCC_short + JCC_JNE);
+    tcg_out8(s, label_ptr - (s->code_ptr + 1));
+
+    add_itlb_check_label(s, s->code_ptr, label_ptr + 2, phys, virt,
+                         arg_types);
+}
+
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
                               const BackendValType *arg_types)
 {
@@ -2495,6 +2572,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     case INDEX_op_itlb_load:
         tcg_out_itlb_load(s, a0, a1, a2);
+        break;
+    case INDEX_op_itlb_check:
+        tcg_out_itlb_check(s, a0, a1, a2, arg_types);
         break;
 
     OP_32_64(mulu2):
@@ -3159,6 +3239,17 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
                 .args_ct_str = { "r", "re" }
             };
             return &tlb_guard;
+        }
+    case INDEX_op_itlb_check:
+        {
+            /* Unlike TLB_CHECK, both PHYS and VIRT tend to die after
+             * this opcode, so allocate them directly into what slow
+             * path expects them to be, this helps simplify arguments
+             * passing there.  */
+            static const TCGTargetOpDef itlb_check = {
+                .args_ct_str = { "r", "De", "Se" }
+            };
+            return &itlb_check;
         }
 
     case INDEX_op_brcond2_i32:

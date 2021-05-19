@@ -1404,7 +1404,6 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_mov_vec:
     case INDEX_op_dup_vec:
     case INDEX_op_side_effect:
-    case INDEX_op_tlb_check:
         return false;
 
     case INDEX_op_br:
@@ -1539,6 +1538,8 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_tlb_load:
     case INDEX_op_tlb_guard:
     case INDEX_op_itlb_load:
+    case INDEX_op_tlb_check:
+    case INDEX_op_itlb_check:
         return TCG_TARGET_REG_BITS == 64;
 
     case INDEX_op_movcond_i64:
@@ -2779,6 +2780,7 @@ static void liveness_pass_1(TCGContext *s)
             la_global_sync(s, nb_globals);
             break;
         case INDEX_op_tlb_check:
+        case INDEX_op_itlb_check:
             nb_oargs = 0;
             nb_iargs = 3;
             la_cross_call(s, nb_temps, true);
@@ -3913,58 +3915,6 @@ static inline void temp_finalize(TCGContext *s, const TCGOp *op, uint8_t i,
     }
 }
 
-static void tcg_reg_alloc_tlb_check(TCGContext *s, const TCGOp *op)
-{
-    const TCGOpDef * const def = &tcg_op_defs[op->opc];
-    TCGRegSet allocated_regs = s->reserved_regs;
-    size_t i;
-    TCGArg new_args[TCG_MAX_OP_ARGS];
-    BackendValType arg_types[TCG_MAX_OP_ARGS];
-
-    tcg_debug_assert(def->nb_oargs == 0);
-    tcg_debug_assert(def->nb_cargs == 1);
-    tcg_debug_assert(def->nb_iargs == 3);
-
-    /* Copy the only constant.  */
-    new_args[3] = op->args[3];
-
-    /* Satisfy input constraints.  */
-    for (i = 0; i < 3; i++) {
-        const TCGArgConstraint *arg_ct = &def->args_ct[i];
-        TCGTemp *ts = arg_temp(op->args[i]);
-
-        if (ts_val_type(ts) == TEMP_VAL_CONST) {
-            if (tcg_target_const_match(ts->val, ts->type, arg_ct)) {
-                /* Constant is OK for the instruction.  */
-                arg_types[i] = BACKEND_CONST;
-                new_args[i] = ts->val;
-                continue;
-            }
-        }
-
-        temp_load(s, ts, arg_ct->regs & ~allocated_regs, 0);
-        tcg_debug_assert(tcg_regset_test_reg(arg_ct->regs, ts->reg));
-
-        new_args[i] = ts->reg;
-        arg_types[i] = BACKEND_REG;
-        tcg_regset_set_reg(allocated_regs, ts->reg);
-    }
-
-    for (i = 0; i < 3; i++) {
-        temp_finalize(s, op, i, false);
-    }
-
-    for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs, i)) {
-            /* Liveness analysis should have ensured that temporaries
-             * using registers clobbered by this op be freed.  */
-            tcg_debug_assert(!s->reg_to_temp[i]);
-        }
-    }
-
-    tcg_out_op(s, op->opc, new_args, arg_types);
-}
-
 static void temp_move(TCGContext *s, TCGTemp *ts, TCGReg reg)
 {
     tcg_debug_assert(ts_val_type(ts) == TEMP_VAL_REG);
@@ -4080,7 +4030,20 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_bb_end(s);
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
-            /* XXX: Permit generic clobber register list?  */
+            if (op->opc == INDEX_op_tlb_check ||
+                op->opc == INDEX_op_itlb_check) {
+                for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+                    if (tcg_regset_test_reg(tcg_target_tlb_check_clobber_regs,
+                                            i)) {
+                        /* Liveness analysis should have ensured that temporary
+                         * using registers clobbered by this op be freed.  */
+                        tcg_debug_assert(!s->reg_to_temp[i]);
+                    }
+                }
+                tcg_debug_assert(def->nb_oargs == 0);
+                tcg_out_op(s, op->opc, new_args, arg_types);
+                return;
+            }
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
                 if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
                     tcg_reg_free(s, i);
@@ -4607,9 +4570,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             goto do_default;
         case INDEX_op_side_effect:
             sync_globals(s);
-            break;
-        case INDEX_op_tlb_check:
-            tcg_reg_alloc_tlb_check(s, op);
             break;
         default:
         do_default:
