@@ -383,12 +383,15 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
         qatomic_set(&cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)], tb);
     }
 #ifndef CONFIG_USER_ONLY
-    /* We don't take care of direct jumps when address mapping changes in
-     * system emulation. So it's not safe to make a direct jump to a TB
-     * spanning two pages because the mapping for the second page can change.
-     */
-    if (tb->page_addr[1] != -1) {
+    /* TBs not backed by ordinary physical RAM pages are volatile,
+     * and should not be chained.  */
+    if (unlikely(tb->page_addr[0] == -1)) {
         last_tb = NULL;
+    /* TBs spanning 2 virtual pages will be guarded by ITLB_CHECK op
+     * to check for possible (but seldom) partial changing of memory
+     * mapping. This enables chaining of direct branch to these TBs.
+     * See also translator_loop_tb_finalize().  */
+    } else if (tb->page_addr[1] != -1) {
     }
 #endif
     /* See if we can patch the calling TB. */

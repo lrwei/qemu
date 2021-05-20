@@ -32,6 +32,45 @@ void translator_loop_temp_check(DisasContextBase *db)
     }
 }
 
+static void translator_loop_tb_finalize(CPUArchState *env, TranslationBlock *tb)
+{
+    target_ulong virt_page2 = (tb->pc + tb->size - 1) & TARGET_PAGE_MASK;
+    TCGOp *op;
+
+    /* page_addr[0] is filled in tb_gen_code().  */
+    if (tb->page_addr[0] == -1 || (tb->pc & TARGET_PAGE_MASK) == virt_page2) {
+        tb->page_addr[1] = -1;
+        return;
+    }
+
+    tb->page_addr[1] = get_page_addr_code(env, virt_page2);
+    /* This would be too damn weird.  */
+    g_assert(tb->page_addr[1] != -1);
+    itlb_update_entry(env, virt_page2, tb->page_addr[1]);
+
+    /* Insert iTLB check stub after entry INSN_START to guard against cross
+     * page TB's being invalidated due to partially updated memory mapping.  */
+    QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
+        if (op->opc == INDEX_op_insn_start) {
+            break;
+        }
+    }
+
+    /* ITLB_LOAD    entry, VIRT_PAGE2, MMU_IDX */
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_itlb_load);
+    op->args[0] = temp_arg(tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_NORMAL));
+    op->args[1] = virt_page2;
+    op->args[2] = cpu_mmu_index(env, true);
+
+    /* ITLB_CHECK   entry, 1 | page_addr[1], virt_page2
+     * Bit 1 is set to indicate this is an VALID physical address ready
+     * to be checked against iTLB entry, see also itlb_update_entry().  */
+    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_itlb_check);
+    op->args[0] = QTAILQ_PREV(op, link)->args[0];
+    op->args[1] = tcg_constant_arg_new(TCG_TYPE_PTR, 1 | tb->page_addr[1]);
+    op->args[2] = tcg_constant_arg_new(TCG_TYPE_TL, virt_page2);
+}
+
 void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
                      CPUState *cpu, TranslationBlock *tb, int max_insns)
 {
@@ -135,6 +174,8 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     /* The disas_log hook may use these values rather than recompute.  */
     db->tb->size = db->pc_next - db->pc_first;
     db->tb->icount = db->num_insns;
+
+    translator_loop_tb_finalize(cpu->env_ptr, tb);
 
 #ifdef DEBUG_DISAS
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)

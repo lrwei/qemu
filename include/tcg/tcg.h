@@ -1127,6 +1127,13 @@ static inline TCGv_i64 tcg_constant_i64(int64_t val)
     return temp_tcgv_i64(ts);
 }
 
+static inline TCGArg tcg_constant_arg_new(TCGType type, int64_t val)
+{
+    TCGTemp *ts;
+    tcg_constant_internal(type, val, &ts);
+    return temp_arg(ts);
+}
+
 TCGv_vec tcg_constant_vec(TCGType type, unsigned vece, int64_t val);
 TCGv_vec tcg_constant_vec_matching(TCGv_vec match, unsigned vece, int64_t val);
 

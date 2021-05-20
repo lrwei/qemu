@@ -1536,7 +1536,10 @@ static inline void tb_page_add(PageDesc *p, TranslationBlock *tb,
 
     assert_page_locked(p);
 
-    tb->page_addr[n] = page_addr;
+    /* page_addr[] should have been filled in at tb_gen_code() and
+     * translator_loop_tb_finalize(), keep an tcg_debug_assert for
+     * safety.  */
+    tcg_debug_assert(tb->page_addr[n] == page_addr);
     tb->page_next[n] = p->first_tb;
 #ifndef CONFIG_USER_ONLY
     page_already_protected = p->first_tb != (uintptr_t)NULL;
@@ -1654,8 +1657,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 {
     CPUArchState *env = cpu->env_ptr;
     TranslationBlock *tb, *existing_tb;
-    tb_page_addr_t phys_pc, phys_page2;
-    target_ulong virt_page2;
+    tb_page_addr_t phys_pc;
     tcg_insn_unit *gen_code_buf;
     int gen_code_size, search_size, max_insns;
 #ifdef CONFIG_PROFILER
@@ -1692,6 +1694,14 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         /* Make the execution loop process the flush as soon as possible.  */
         cpu->exception_index = EXCP_INTERRUPT;
         cpu_loop_exit(cpu);
+    }
+
+    /* Fill page_addr[0] here using the phyisical PC translated above,
+     * page_addr[1] will be filled in at translator_loop_tb_finalize().  */
+    if (phys_pc == -1) {
+        tb->page_addr[0] = -1;
+    } else {
+        tb->page_addr[0] = phys_pc & TARGET_PAGE_MASK;
     }
 
     gen_code_buf = tcg_ctx->code_gen_ptr;
@@ -1889,21 +1899,16 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * attempting to link to other TBs or add to the lookup table.
      */
     if (phys_pc == -1) {
-        tb->page_addr[0] = tb->page_addr[1] = -1;
         return tb;
     }
 
-    /* check next page if needed */
-    virt_page2 = (pc + tb->size - 1) & TARGET_PAGE_MASK;
-    phys_page2 = -1;
-    if ((pc & TARGET_PAGE_MASK) != virt_page2) {
-        phys_page2 = get_page_addr_code(env, virt_page2);
-    }
     /*
      * No explicit memory barrier is required -- tb_link_page() makes the
      * TB visible in a consistent state.
+     * See translator_loop() for value of page_addr[1]. Note that the use
+     * of PHYS_PC (instead of page_addr[0]) is demanded by tb_link_page().
      */
-    existing_tb = tb_link_page(tb, phys_pc, phys_page2);
+    existing_tb = tb_link_page(tb, phys_pc, tb->page_addr[1]);
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
         uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
@@ -2272,6 +2277,15 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;
+
+    /* Theoretically, this could happen. But for now, ITLB_CHECK is used
+     * only for TBs that are across page boundaries, within which partial
+     * memory mapping updates are extremely unlikely. As such, mechanism
+     * associated with cpu_rescue_itlb_check_failure has not been tested
+     * yet, disable it temporarorily until someone explicitly uses this
+     * functionality, this may help prevent bugs in this module silently
+     * corrupting future works.  */
+    g_assert_not_reached();
 
     tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
     cpu_restore_state_from_tb(cpu, tb, retaddr, true);
