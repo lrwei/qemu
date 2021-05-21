@@ -1902,6 +1902,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         return tb;
     }
 
+    /* Finalize the TB by inserting it into the corresponding region tree
+     * before "publishing" it through QHT. Otherwise, bailout happened in
+     * the TB (in other vCPU thread) may fail to lookup itself by host pc.  */
+    tcg_tb_insert(tb);
+
     /*
      * No explicit memory barrier is required -- tb_link_page() makes the
      * TB visible in a consistent state.
@@ -1916,9 +1921,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
         tb_destroy(tb);
+        tcg_tb_remove(tb);
         return existing_tb;
     }
-    tcg_tb_insert(tb);
     return tb;
 }
 
@@ -2287,7 +2292,12 @@ void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
      * corrupting future works.  */
     g_assert_not_reached();
 
-    tcg_debug_assert((tb = tcg_tb_lookup(retaddr)));
+    tb = tcg_tb_lookup(retaddr);
+    if (unlikely(!tb)) {
+        cpu_abort(cpu,
+                  "cpu_rescue_itlb_check_failure: could not find TB for pc=%p",
+                  (void *)retaddr);
+    }
     cpu_restore_state_from_tb(cpu, tb, retaddr, true);
     tb_phys_invalidate(tb, false);
 
@@ -2295,6 +2305,23 @@ void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
      * i.e. TEMP_GLOBALs are always synced back to CPUArchState by the
      * time execution reaches here, so we can exit cpu loop directly.  */
     cpu_loop_exit_noexc(cpu);
+}
+
+void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
+{
+    TranslationBlock *tb;
+
+    /* Request another TB capable of doing full qemu_{ld, st}.  */
+    cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
+
+    /* Restore CPUArchState before bailout.  */
+    tb = tcg_tb_lookup(retaddr);
+    if (unlikely(!tb)) {
+        cpu_abort(cpu,
+                  "cpu_rescue_speculation_failure: could not find TB for pc=%p",
+                  (void *)retaddr);
+    }
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
 }
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)

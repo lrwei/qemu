@@ -2691,14 +2691,6 @@ void cpu_stq_le_data(CPUArchState *env, target_ulong ptr, uint64_t val)
     cpu_stq_le_data_ra(env, ptr, val, 0);
 }
 
-static void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
-{
-    /* Request another TB capable of doing full qemu_{ld, st}.  */
-    cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
-    /* Restore CPUArchState before bailout.  */
-    tcg_debug_assert(cpu_restore_state(cpu, retaddr, true));
-}
-
 static inline void QEMU_ALWAYS_INLINE
 tlb_check_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                  uintptr_t retaddr, bool is_load)
