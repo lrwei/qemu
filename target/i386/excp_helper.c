@@ -153,6 +153,11 @@ static hwaddr get_hphys(CPUState *cs, hwaddr gphys, MMUAccessType access_type,
         return gphys;
     }
 
+    /* We enable probing for x86_cpu_tlb_fill() at the expense of breaking
+     * the support for hypervisor mode of x86_64 frontend. This is a lousy
+     * move, but most of the workloads seem to be still functional.  */
+    g_assert_not_reached();
+
     if (!(env->nested_pg_mode & SVM_NPT_NXE)) {
         rsvd_mask |= PG_NX_MASK;
     }
@@ -692,8 +697,11 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
 #else
     env->retaddr = retaddr;
     if (handle_mmu_fault(cs, addr, size, access_type, mmu_idx)) {
-        /* FIXME: On error in get_hphys we have already jumped out.  */
-        g_assert(!probe);
+        /* FIXME: Support for HF2_NPT_MASK is dropped to make x86_cpu_tlb_fill()
+         * probeable. On error in get_hphys we would have already jumped out. */
+        if (probe) {
+            return false;
+        }
         raise_exception_err_ra(env, cs->exception_index,
                                env->error_code, retaddr);
     }

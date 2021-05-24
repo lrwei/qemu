@@ -2283,15 +2283,6 @@ void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;
 
-    /* Theoretically, this could happen. But for now, ITLB_CHECK is used
-     * only for TBs that are across page boundaries, within which partial
-     * memory mapping updates are extremely unlikely. As such, mechanism
-     * associated with cpu_rescue_itlb_check_failure has not been tested
-     * yet, disable it temporarorily until someone explicitly uses this
-     * functionality, this may help prevent bugs in this module silently
-     * corrupting future works.  */
-    g_assert_not_reached();
-
     tb = tcg_tb_lookup(retaddr);
     if (unlikely(!tb)) {
         cpu_abort(cpu,
