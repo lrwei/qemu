@@ -331,57 +331,67 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
     return p - block;
 }
 
-/* The cpu state corresponding to 'searched_pc' is restored.
- * When reset_icount is true, current TB will be interrupted and
- * icount should be recalculated.
- */
-static int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
-                                     uintptr_t searched_pc, bool reset_icount)
+static bool reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
+                                  uintptr_t searched_pc, uint16_t *pnum_insns,
+                                  target_ulong data[TARGET_INSN_START_WORDS])
 {
-    target_ulong data[TARGET_INSN_START_WORDS] = { tb->pc };
-    uintptr_t host_pc = (uintptr_t)tb->tc.ptr;
-    CPUArchState *env = cpu->env_ptr;
+    uintptr_t host_pc = (uintptr_t) tb->tc.ptr;
     uint8_t *p = tb->tc.ptr + tb->tc.size;
-    int i, j, num_insns = tb->icount;
-#ifdef CONFIG_PROFILER
-    TCGProfile *prof = &tcg_ctx->prof;
-    int64_t ti = profile_getclock();
-#endif
+    int i, j;
 
     searched_pc -= GETPC_ADJ;
-
     if (searched_pc < host_pc) {
-        return -1;
+        return false;
     }
 
-    /* Reconstruct the stored insn data while looking for the point at
-       which the end of the insn exceeds the searched_pc.  */
-    for (i = 0; i < num_insns; ++i) {
+    data[0] = tb->pc;
+    /* Reconstruct the stored insn data while looking for the point
+     * at which the end of the insn exceeds the searched_pc.  */
+    for (i = 0; i < tb->icount; ++i) {
         for (j = 0; j < TARGET_INSN_START_WORDS; ++j) {
             data[j] += decode_sleb128(&p);
         }
         host_pc += decode_sleb128(&p);
         if (host_pc > searched_pc) {
-            goto found;
+            *pnum_insns = i;
+            return true;
         }
     }
-    return -1;
+    return false;
+}
 
- found:
+/* The cpu state corresponding to 'searched_pc' is restored.
+ * When reset_icount is true, current TB will be interrupted and
+ * icount should be recalculated.
+ */
+static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+                                      uintptr_t searched_pc, bool reset_icount)
+{
+    target_ulong data[TARGET_INSN_START_WORDS] = { };
+    uint16_t icount;
+#ifdef CONFIG_PROFILER
+    TCGProfile *prof = &tcg_ctx->prof;
+    int64_t ti = profile_getclock();
+#endif
+
+    if (!reconstruct_insn_data(cpu, tb, searched_pc, &icount, data)) {
+        return false;
+    }
+
     if (reset_icount && (tb_cflags(tb) & CF_USE_ICOUNT)) {
         assert(icount_enabled());
         /* Reset the cycle counter to the start of the block
            and shift if to the number of actually executed instructions */
-        cpu_neg(cpu)->icount_decr.u16.low += num_insns - i;
+        cpu_neg(cpu)->icount_decr.u16.low += tb->icount - icount;
     }
-    restore_state_to_opc(env, tb, data);
+    restore_state_to_opc(cpu->env_ptr, tb, data);
 
 #ifdef CONFIG_PROFILER
     qatomic_set(&prof->restore_time,
                 prof->restore_time + profile_getclock() - ti);
     qatomic_set(&prof->restore_count, prof->restore_count + 1);
 #endif
-    return 0;
+    return true;
 }
 
 void tb_destroy(TranslationBlock *tb)
@@ -2235,7 +2245,7 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
 
     /* On MIPS and SH, delay slot instructions can only be restarted if
        they were already the first instruction in the TB.  If this is not
@@ -2289,7 +2299,7 @@ void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
                   "cpu_rescue_itlb_check_failure: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
     tb_phys_invalidate(tb, false);
 
     /* All ITLB_CHECK is guarded by SIDE_EFFECTS op for the time being,
@@ -2312,7 +2322,7 @@ void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
                   "cpu_rescue_speculation_failure: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
+    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
 }
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)
