@@ -331,57 +331,62 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
     return p - block;
 }
 
-/* The cpu state corresponding to 'searched_pc' is restored.
- * When reset_icount is true, current TB will be interrupted and
- * icount should be recalculated.
- */
-static int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
-                                     uintptr_t searched_pc, bool reset_icount)
+static void reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
+                                  uintptr_t searched_pc, uint16_t *pnum_insns,
+                                  target_ulong data[TARGET_INSN_START_WORDS])
 {
-    target_ulong data[TARGET_INSN_START_WORDS] = { tb->pc };
-    uintptr_t host_pc = (uintptr_t)tb->tc.ptr;
-    CPUArchState *env = cpu->env_ptr;
+    uintptr_t host_pc = (uintptr_t) tb->tc.ptr;
     uint8_t *p = tb->tc.ptr + tb->tc.size;
-    int i, j, num_insns = tb->icount;
-#ifdef CONFIG_PROFILER
-    TCGProfile *prof = &tcg_ctx->prof;
-    int64_t ti = profile_getclock();
-#endif
+    int i, j;
 
     searched_pc -= GETPC_ADJ;
+    g_assert(searched_pc >= host_pc);
 
-    if (searched_pc < host_pc) {
-        return -1;
-    }
-
-    /* Reconstruct the stored insn data while looking for the point at
-       which the end of the insn exceeds the searched_pc.  */
-    for (i = 0; i < num_insns; ++i) {
+    data[0] = tb->pc;
+    /* Reconstruct the stored insn data while looking for the point
+     * at which the end of the insn exceeds the searched_pc.  */
+    for (i = 0; i < tb->icount; ++i) {
         for (j = 0; j < TARGET_INSN_START_WORDS; ++j) {
             data[j] += decode_sleb128(&p);
         }
         host_pc += decode_sleb128(&p);
         if (host_pc > searched_pc) {
-            goto found;
+            *pnum_insns = i;
+            return;
         }
     }
-    return -1;
+    g_assert_not_reached();
+}
 
- found:
+/* The cpu state corresponding to 'searched_pc' is restored.
+ * When reset_icount is true, current TB will be interrupted and
+ * icount should be recalculated.
+ */
+static void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+                                      uintptr_t searched_pc, bool reset_icount)
+{
+    target_ulong data[TARGET_INSN_START_WORDS] = { };
+    uint16_t icount;
+#ifdef CONFIG_PROFILER
+    TCGProfile *prof = &tcg_ctx->prof;
+    int64_t ti = profile_getclock();
+#endif
+
+    reconstruct_insn_data(cpu, tb, searched_pc, &icount, data);
+
     if (reset_icount && (tb_cflags(tb) & CF_USE_ICOUNT)) {
         assert(icount_enabled());
         /* Reset the cycle counter to the start of the block
            and shift if to the number of actually executed instructions */
-        cpu_neg(cpu)->icount_decr.u16.low += num_insns - i;
+        cpu_neg(cpu)->icount_decr.u16.low += tb->icount - icount;
     }
-    restore_state_to_opc(env, tb, data);
+    restore_state_to_opc(cpu->env_ptr, tb, data);
 
 #ifdef CONFIG_PROFILER
     qatomic_set(&prof->restore_time,
                 prof->restore_time + profile_getclock() - ti);
     qatomic_set(&prof->restore_count, prof->restore_count + 1);
 #endif
-    return 0;
 }
 
 void tb_destroy(TranslationBlock *tb)
