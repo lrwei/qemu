@@ -394,15 +394,6 @@ static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
     return true;
 }
 
-void tb_destroy(TranslationBlock *tb)
-{
-    qemu_spin_destroy(&tb->jmp_lock);
-    if (tb->bailout_info) {
-        tcg_debug_assert(tb_cflags(tb) & CF_BAILOUT);
-        g_free(tb->bailout_info);
-    }
-}
-
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
 {
     TranslationBlock *tb;
@@ -2026,7 +2017,6 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
 
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
-        tb_destroy(tb);
         tcg_tb_remove(tb);
         return existing_tb;
     }
