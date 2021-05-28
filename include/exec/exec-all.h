@@ -75,6 +75,7 @@ void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);
 void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
 void QEMU_NORETURN cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t pc);
 void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t pc);
+uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t pc);
 
 /**
  * cpu_loop_exit_requested:
@@ -467,6 +468,11 @@ struct TranslationBlock {
 #define CF_USE_ICOUNT  0x00020000
 #define CF_INVALID     0x00040000 /* TB is stale. Set with @jmp_lock held */
 #define CF_PARALLEL    0x00080000 /* Generate code for a parallel context */
+/* CF_BAILOUT TB serves only for ONE particular GUARD op, and is compiled
+ * with certain kind of context attached to, i.e. TCGBailoutInfo. Besides,
+ * these TBs are linked directly to the GUARD failure branch, therefore
+ * will not be inserted into QHT.  */
+#define CF_BAILOUT     0x00100000 /* TB to be used in bailout procedure only */
 #define CF_CLUSTER_MASK 0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
 /* cflags' mask for hashing/comparison, basically ignore CF_INVALID */
@@ -525,6 +531,17 @@ struct TranslationBlock {
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
     uintptr_t jmp_dest[2];
+
+    /* Hold BAILOUT_INFO for CF_BAILOUT TBs, freed when the TB is removed from
+     * the corresponding region tree.  */
+    TCGBailoutInfo *bailout_info;
+};
+
+struct TCGBailoutInfo {
+    TranslationBlock *tb;
+    tcg_target_offset_t *label_ptr;
+    uintptr_t reset_target;
+    target_ulong data[TARGET_INSN_START_WORDS];
 };
 
 /* Hide the qatomic_read to make code a little easier on the eyes */

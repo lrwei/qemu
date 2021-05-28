@@ -2788,13 +2788,20 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
 QEMU_NORETURN __attribute__((naked))
 void helper_tlb_guard_failure(CPUArchState *_, uintptr_t retaddr)
 {
-    CPUState *cpu = env_cpu(TCG_TARGET_AREG0);
-
-    cpu_rescue_speculation_failure(cpu, retaddr);
-    /* Jump directly to the epilogue of TCG code cache, STACK POINTER
-     * MUST NOT BE ALTERED BY THE COMPILER, or execution can't return
-     * to the runtime correctly.  */
-    tcg_target_jmp((uintptr_t) tcg_ctx->code_gen_epilogue);
+    /* Jump directly to the entry point of the corresponding bailout TB.
+     * STACK POINTER MUST NOT BE ALTERED BY THE COMPILER WITHIN CURRENT
+     * FUNCTION, or execution will not be able to return to the runtime
+     * correctly. Note that TCG generated code (except for the prologue,
+     * epilogue, and call instruction which is not used here) assumes a
+     * constant stack pointer, "as if by gcc's -mno-push-args option".
+     *
+     * We always force TEMP_GLOBALs to be SYNC'ed back to their canonical
+     * locations before calling this for the time being, so a direct jump
+     * suffices. Situation may change in future, and a TCGBailoutFrame or
+     * something alike may have to be poped out before (, or, along with)
+     * the control flow alternation.  */
+    tcg_target_jmp(cpu_rescue_guard_failure(env_cpu(TCG_TARGET_AREG0),
+                                            retaddr));
 }
 
 QEMU_ALWAYS_INLINE

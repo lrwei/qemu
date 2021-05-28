@@ -93,7 +93,27 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     tcg_clear_temp_count();
 
     /* Start translating.  */
-    gen_tb_start(db->tb);
+    if (tb->cflags & CF_BAILOUT) {
+        TCGv_ptr bailout_tb = tcg_const_ptr((uintptr_t) tb);
+
+        /* BAILOUT TBs shall restore state at TB entry. Most targets don't
+         * care the correctness of the state within the middle of TB, and
+         * get corresponding values through tb->flags (so restoration only
+         * need to happen once at compile time). However, there does exist
+         * situations where this restoration is necessary, e.g. CC_OP for
+         * x86 target.  */
+        gen_helper_restore_state_from_bailout(cpu_env, bailout_tb);
+        /* TODO: Emit ITLB_CHECK for cross-page bailout.  */
+        tcg_debug_assert(tb->pc - tb->bailout_info->tb->pc <
+                         tb->bailout_info->tb->size);
+        tcg_temp_free_ptr(bailout_tb);
+    } else {
+        /* CF_BAILOUT TBs don't check pending interrupt, as no loop can be
+         * formed with only CF_BAILOUT TBs. Besides, BRCOND at entry point
+         * SYNCs TEMP_GLOBALs back to their canonical locations, which is
+         * unwanted.  */
+        gen_tb_start(db->tb);
+    }
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
@@ -165,7 +185,10 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
-    gen_tb_end(db->tb, db->num_insns - bp_insn);
+    /* Paired with gen_tb_start().  */
+    if (!(tb->cflags & CF_BAILOUT)) {
+        gen_tb_end(db->tb, db->num_insns - bp_insn);
+    }
 
     if (plugin_enabled) {
         plugin_gen_tb_end(cpu);

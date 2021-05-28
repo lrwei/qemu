@@ -28,11 +28,10 @@
 
 typedef struct TranslationBlock TranslationBlock;
 typedef struct TBContext TBContext;
+typedef struct TCGBailoutInfo TCGBailoutInfo;
 
 struct TBContext {
-
     struct qht htable;
-
     /* statistics */
     unsigned tb_flush_count;
 };

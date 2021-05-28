@@ -397,6 +397,10 @@ static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
 void tb_destroy(TranslationBlock *tb)
 {
     qemu_spin_destroy(&tb->jmp_lock);
+    if (tb->bailout_info) {
+        tcg_debug_assert(tb_cflags(tb) & CF_BAILOUT);
+        g_free(tb->bailout_info);
+    }
 }
 
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
@@ -1366,6 +1370,7 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
         return;
     }
 
+    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT));
     qemu_spin_lock(&dest->jmp_lock);
     /*
      * While acquiring the lock, the jump might have been removed if the
@@ -1413,6 +1418,7 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     TranslationBlock *tb;
     int n;
 
+    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT));
     qemu_spin_lock(&dest->jmp_lock);
 
     TB_FOR_EACH_JMP(dest, tb, n) {
@@ -1425,34 +1431,33 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_unlock(&dest->jmp_lock);
 }
 
-/*
- * In user-mode, call with mmap_lock held.
- * In !user-mode, if @rm_from_page_list is set, call with the TB's pages'
- * locks held.
- */
-static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+static bool tb_remove_bailout(TranslationBlock *tb)
 {
-    CPUState *cpu;
+    TCGBailoutInfo *info = tb->bailout_info;
+    tcg_target_offset_t offset, reset_offset;
+
+    offset = tcg_target_jump_offset(info->label_ptr, (uintptr_t) tb->tc.ptr);
+    reset_offset = tcg_target_jump_offset(info->label_ptr, info->reset_target);
+
+    /* It could be the case that:
+     * 1. Two or more threads are invalidating this TB at the same time, only
+     *    the first one returns TRUE and proceeds to clean up remaining stuff.
+     * 2. The bailout slot may have been re-linked to a TRACE (not implemented
+     *    yet), it would have already invalidated this TB. Otherwise, since we
+     *    have marked this block as CF_INVALID, the tracer will stop on seeing
+     *    that.  */
+    return offset == qatomic_cmpxchg(info->label_ptr, offset, reset_offset);
+}
+
+static void do_tb_phys_invalidate_common(TranslationBlock *tb,
+                                         bool rm_from_page_list)
+{
     PageDesc *p;
-    uint32_t h;
-    tb_page_addr_t phys_pc;
 
-    assert_memory_lock();
+    /* TB should have been marked as CF_INVALID.  */
+    tcg_debug_assert(tb_cflags(tb) & CF_INVALID);
 
-    /* make sure no further incoming jumps will be chained to this TB */
-    qemu_spin_lock(&tb->jmp_lock);
-    qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
-    qemu_spin_unlock(&tb->jmp_lock);
-
-    /* remove the TB from the hash list */
-    phys_pc = tb->page_addr[0] + (tb->pc & ~TARGET_PAGE_MASK);
-    h = tb_hash_func(phys_pc, tb->pc, tb->flags, tb_cflags(tb) & CF_HASH_MASK,
-                     tb->trace_vcpu_dstate);
-    if (!qht_remove(&tb_ctx.htable, tb, h)) {
-        return;
-    }
-
-    /* remove the TB from the page list */
+    /* Remove the TB from the page list.  */
     if (rm_from_page_list) {
         p = page_find(tb->page_addr[0] >> TARGET_PAGE_BITS);
         tb_page_remove(p, tb);
@@ -1464,23 +1469,68 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         }
     }
 
-    /* remove the TB from the hash list */
-    h = tb_jmp_cache_hash_func(tb->pc);
-    CPU_FOREACH(cpu) {
-        if (qatomic_read(&cpu->tb_jmp_cache[h]) == tb) {
-            qatomic_set(&cpu->tb_jmp_cache[h], NULL);
-        }
-    }
-
-    /* suppress this TB from the two jump lists */
+    /* Suppress this TB from the two jump lists.  */
     tb_remove_from_jmp_list(tb, 0);
     tb_remove_from_jmp_list(tb, 1);
+}
 
-    /* suppress any remaining jumps to this TB */
-    tb_jmp_unlink(tb);
+/*
+ * In user-mode, call with mmap_lock held.
+ * In !user-mode, if @rm_from_page_list is set, call with the TB's pages'
+ * locks held.
+ */
+static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+{
+    CPUState *cpu;
+    uint32_t h;
+    tb_page_addr_t phys_pc;
+
+    assert_memory_lock();
+
+    /* Make sure no further incoming jumps will be chained to this TB.  */
+    qemu_spin_lock(&tb->jmp_lock);
+    qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
+    qemu_spin_unlock(&tb->jmp_lock);
+
+    /* Remove the TB from the hash list, if this is an ordinary TB.  */
+    if (!(tb_cflags(tb) & CF_BAILOUT)) {
+        phys_pc = tb->page_addr[0] + (tb->pc & ~TARGET_PAGE_MASK);
+        h = tb_hash_func(phys_pc, tb->pc, tb->flags,
+                         tb_cflags(tb) & CF_HASH_MASK, tb->trace_vcpu_dstate);
+        if (!qht_remove(&tb_ctx.htable, tb, h)) {
+            return;
+        }
+    /* Otherwise just unlink it from the corresponding bailout slot.  */
+    } else if (!tb_remove_bailout(tb)) {
+        return;
+    }
+
+    /* Remove from page list as well as from jump lists.  */
+    do_tb_phys_invalidate_common(tb, rm_from_page_list);
+
+    if (!(tb_cflags(tb) & CF_BAILOUT)) {
+        /* Remove the TB from the hash list.  */
+        h = tb_jmp_cache_hash_func(tb->pc);
+        CPU_FOREACH(cpu) {
+            if (qatomic_read(&cpu->tb_jmp_cache[h]) == tb) {
+                qatomic_set(&cpu->tb_jmp_cache[h], NULL);
+            }
+        }
+        /* Suppress any remaining jumps to this TB.  */
+        tb_jmp_unlink(tb);
+    } else {
+        /* CF_BAILOUT TB will not be inserted in CPU's TB_JMP_CACHE[], neither
+         * would it be linked to TB other than BAILOUT_INFO->TB, nor could it
+         * ever be marked as BELONGing to any trace -- the PageDesc they share
+         * would have been locked by the tracer thread, so the execution can't
+         * reach here; and after the trace is inserted into the page, the HEAD
+         * BAILOUT TB would been invalidated right away, before its PageDesc's
+         * being unlocked.  */
+        tcg_debug_assert(rm_from_page_list);
+    }
 
     qatomic_set(&tcg_ctx->tb_phys_invalidate_count,
-               tcg_ctx->tb_phys_invalidate_count + 1);
+                tcg_ctx->tb_phys_invalidate_count + 1);
 }
 
 static void tb_phys_invalidate__locked(TranslationBlock *tb)
@@ -1593,6 +1643,31 @@ static inline void tb_page_add(PageDesc *p, TranslationBlock *tb,
 #endif
 }
 
+static void tb_insert_bailout(TranslationBlock *tb, void **existing)
+{
+    TCGBailoutInfo *info = tb->bailout_info;
+    tcg_target_offset_t offset, reset_offset, cmpxchg_offset;
+    TranslationBlock *existing_tb;
+    uintptr_t tc_ptr;
+
+    offset = tcg_target_jump_offset(info->label_ptr, (uintptr_t) tb->tc.ptr);
+    reset_offset = tcg_target_jump_offset(info->label_ptr, info->reset_target);
+
+    cmpxchg_offset = qatomic_cmpxchg(info->label_ptr, reset_offset, offset);
+    /* We are the first to re-patch it. Return without touching EXISTING.  */
+    if (likely(cmpxchg_offset == reset_offset)) {
+        return;
+    }
+
+    /* The branch has been re-patched by other thread, recover and record
+     * the pointer to the TranslationBlock previously linked here.  */
+    tc_ptr = tcg_target_jump_target(info->label_ptr, cmpxchg_offset);
+    existing_tb = (TranslationBlock *) (tc_ptr - ROUND_UP(sizeof(*existing_tb),
+                                                         qemu_icache_linesize));
+    tcg_debug_assert(tc_ptr == (uintptr_t) existing_tb->tc.ptr);
+    *existing = existing_tb;
+}
+
 /*
  * Add a new TB and link it to the physical page tables. phys_page2 is
  * (-1) to indicate that only one page contains the TB.
@@ -1608,8 +1683,7 @@ static TranslationBlock *
 tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
              tb_page_addr_t phys_page2)
 {
-    PageDesc *p;
-    PageDesc *p2 = NULL;
+    PageDesc *p, *p2 = NULL;
     void *existing_tb = NULL;
     uint32_t h;
 
@@ -1631,10 +1705,16 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
         tb->page_addr[1] = -1;
     }
 
-    /* add in the hash table */
-    h = tb_hash_func(phys_pc, tb->pc, tb->flags, tb->cflags & CF_HASH_MASK,
-                     tb->trace_vcpu_dstate);
-    qht_insert(&tb_ctx.htable, tb, h, &existing_tb);
+    /* Ordinary TBs (i.e. those without CF_BAILOUT) shall be added in QHT.  */
+    if (!(tb->cflags & CF_BAILOUT)) {
+        h = tb_hash_func(phys_pc, tb->pc, tb->flags, tb->cflags & CF_HASH_MASK,
+                         tb->trace_vcpu_dstate);
+        qht_insert(&tb_ctx.htable, tb, h, &existing_tb);
+    /* While the others are not, and is linked directly at the corresponding
+     * GUARD branch instruction.  */
+    } else {
+        tb_insert_bailout(tb, &existing_tb);
+    }
 
     /* remove TB from the page(s) if we couldn't insert it */
     if (unlikely(existing_tb)) {
@@ -1661,9 +1741,10 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
 }
 
 /* Called with mmap_lock held for user mode emulation.  */
-TranslationBlock *tb_gen_code(CPUState *cpu,
-                              target_ulong pc, target_ulong cs_base,
-                              uint32_t flags, uint32_t cflags)
+static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
+                                              target_ulong cs_base,
+                                              uint32_t flags, uint32_t cflags,
+                                              TCGBailoutInfo *bailout_info)
 {
     CPUArchState *env = cpu->env_ptr;
     TranslationBlock *tb, *existing_tb;
@@ -1676,6 +1757,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 #endif
 
     assert_memory_lock();
+
+    /* BAILOUT_INFO shall be attached to and only to CF_BAILOUT TBs.  */
+    tcg_debug_assert(!!(cflags & CF_BAILOUT) == !!bailout_info);
 
     phys_pc = get_page_addr_code(env, pc);
 
@@ -1721,6 +1805,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb->flags = flags;
     tb->cflags = cflags;
     tb->trace_vcpu_dstate = *cpu->trace_dstate;
+    /* This will only be used by translator_loop(), BAILOUT_INFO would be
+     * made persistent before the TB is commited.  */
+    tb->bailout_info = bailout_info;
     tcg_ctx->tb_cflags = cflags;
  tb_overflow:
 
@@ -1912,6 +1999,15 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         return tb;
     }
 
+    /* Up to now, BAILOUT_INFO has been a temporal local storage allocated
+     * on the stack, commit heap allocation only after TB has reached its
+     * completion. Otherwise cpu_loop_exit() triggered in between may leak
+     * memory.  */
+    if (tb->cflags & CF_BAILOUT) {
+        tb->bailout_info = g_new(TCGBailoutInfo, 1);
+        memcpy(tb->bailout_info, bailout_info, sizeof(TCGBailoutInfo));
+    }
+
     /* Finalize the TB by inserting it into the corresponding region tree
      * before "publishing" it through QHT. Otherwise, bailout happened in
      * the TB (in other vCPU thread) may fail to lookup itself by host pc.  */
@@ -1935,6 +2031,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         return existing_tb;
     }
     return tb;
+}
+
+TranslationBlock *tb_gen_code(CPUState *cpu, target_ulong pc,
+                              target_ulong cs_base, uint32_t flags,
+                              uint32_t cflags)
+{
+    return tb_gen_code_internal(cpu, pc, cs_base, flags, cflags, NULL);
 }
 
 /*
@@ -2323,6 +2426,66 @@ void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
                   (void *)retaddr);
     }
     tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
+}
+
+static bool bailout_info_finalize(TCGBailoutInfo *pinfo, TranslationBlock *tb,
+                                  uintptr_t retaddr, uintptr_t *pjump_target)
+{
+    tcg_target_offset_t *label_ptr = tcg_target_label_ptr(retaddr);
+    uintptr_t jump_target = tcg_target_jump_target(label_ptr,
+                                                   qatomic_read(label_ptr));
+
+    /* LABEL_PTR should be aligned for atomic patching.  */
+    tcg_debug_assert((uintptr_t) label_ptr % sizeof(*label_ptr) == 0);
+
+    if (unlikely(jump_target < (uintptr_t) tb->tc.ptr ||
+                 jump_target >= (uintptr_t) tb->tc.ptr + tb->tc.size)) {
+        /* Branch to slow path have been re-patched to new target,
+         * by another thread.  */
+        *pjump_target = jump_target;
+        return false;
+    }
+    pinfo->tb = tb;
+    pinfo->label_ptr = label_ptr;
+    pinfo->reset_target = jump_target;
+    return true;
+}
+
+uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr)
+{
+    CPUArchState *env = cpu->env_ptr;
+    TCGBailoutInfo info = {};
+    TranslationBlock *tb;
+    uint16_t _;
+    uintptr_t jump_target;
+
+    /* Restore CPUArchState before bailout.  */
+    tb = tcg_tb_lookup(retaddr);
+    if (unlikely(!tb)) {
+        cpu_abort(cpu,
+                  "cpu_rescue_guard_failure: could not find TB for pc=%p",
+                  (void *)retaddr);
+    }
+    tcg_debug_assert(reconstruct_insn_data(cpu, tb, retaddr, &_, info.data));
+    restore_state_to_opc(env, tb, info.data);
+
+    if (bailout_info_finalize(&info, tb, retaddr, &jump_target)) {
+        target_ulong pc, cs_base;
+        uint32_t flags, cflags = curr_cflags(cpu) | CF_BAILOUT | CF_MONOLITHIC;
+
+        cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+        /* All CPU states except for PC should be the same as that of the
+         * bailout TB, as any state-changing operations (especially those
+         * that could affect codegen) should have ended the corresponding
+         * TB immediately.  */
+        tcg_debug_assert(cs_base == tb->cs_base);
+        // RISC-V frontend seems to not respect this in mark_fs_dirty().
+        // tcg_debug_assert(flags == tb->flags);
+
+        tb = tb_gen_code_internal(cpu, pc, cs_base, flags, cflags, &info);
+        jump_target = (uintptr_t) tb->tc.ptr;
+    }
+    return jump_target;
 }
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, target_ulong page_addr)
