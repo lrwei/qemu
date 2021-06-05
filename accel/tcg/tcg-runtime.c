@@ -186,3 +186,8 @@ void HELPER(restore_state_from_bailout)(CPUArchState *env, void *bailout_tb)
      * be used here) should have terminated the TB immediately.  */
     restore_state_to_opc(env, bailout_tb, info->data);
 }
+
+void HELPER(profile_tb)(CPUArchState *env, void *tb)
+{
+    profile_tb(env, tb);
+}

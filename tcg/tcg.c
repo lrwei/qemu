@@ -4544,6 +4544,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
                 s->gen_insn_end_off[num_insns] = off;
                 /* Assert that we do not overflow our stored offset.  */
                 assert(s->gen_insn_end_off[num_insns] == off);
+            } else {
+                tb->prologue_offset = tcg_current_code_size(s);
             }
             num_insns++;
             for (i = 0; i < TARGET_INSN_START_WORDS; ++i) {
@@ -4624,6 +4626,17 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     flush_icache_range((uintptr_t)s->code_buf, (uintptr_t)s->code_ptr);
 
     return tcg_current_code_size(s);
+}
+
+void tcg_tracer_reset(void)
+{
+    if (!tcg_ctx->trace) {
+        return;
+    }
+    tcg_ctx->trace = false;
+    /* Clean up all resources allocated for tracing and reset
+     * relevant states.  */
+    g_assert_not_reached();
 }
 
 #ifdef CONFIG_PROFILER

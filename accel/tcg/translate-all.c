@@ -1799,6 +1799,7 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
     /* This will only be used by translator_loop(), BAILOUT_INFO would be
      * made persistent before the TB is commited.  */
     tb->bailout_info = bailout_info;
+    tb->exec_count = 0;
     tcg_ctx->tb_cflags = cflags;
  tb_overflow:
 
@@ -2405,6 +2406,9 @@ void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;
 
+    /* No !CF_MONOLITHIC blocks shall be executed in tracing mode.  */
+    tcg_debug_assert(!tcg_ctx->trace);
+
     /* Request another TB capable of doing full qemu_{ld, st}.  */
     cpu->cflags_next_tb = curr_cflags(cpu) | CF_MONOLITHIC;
 
@@ -2448,6 +2452,9 @@ uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr)
     TranslationBlock *tb;
     uint16_t _;
     uintptr_t jump_target;
+
+    /* No !CF_MONOLITHIC blocks shall be executed in tracing mode.  */
+    tcg_debug_assert(!tcg_ctx->trace);
 
     /* Restore CPUArchState before bailout.  */
     tb = tcg_tb_lookup(retaddr);

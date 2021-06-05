@@ -75,7 +75,7 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
                      CPUState *cpu, TranslationBlock *tb, int max_insns)
 {
     int bp_insn = 0;
-    bool plugin_enabled;
+    bool plugin_enabled, tb_started = false;
 
     /* Initialize DisasContext */
     db->tb = tb;
@@ -114,7 +114,6 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
          * unwanted.  */
         gen_tb_start(db->tb);
     }
-    ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
     plugin_enabled = plugin_gen_tb_start(cpu, tb);
@@ -122,6 +121,12 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     while (true) {
         db->num_insns++;
         ops->insn_start(db, cpu);
+        if (!tb_started) {
+            /* Target-specific tb_start() should always be executed, and
+             * shall be excluded from the TB prologue.  */
+            ops->tb_start(db, cpu);
+            tb_started = true;
+        }
         tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
         if (plugin_enabled) {

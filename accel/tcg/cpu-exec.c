@@ -144,7 +144,8 @@ static void init_delay_params(SyncClocks *sc, const CPUState *cpu)
 #endif /* CONFIG USER ONLY */
 
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
-static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb,
+                                           bool skip_prologue)
 {
     CPUArchState *env = cpu->env_ptr;
     uintptr_t ret;
@@ -174,6 +175,11 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
         qemu_log_unlock(logfile);
     }
 #endif /* DEBUG_DISAS */
+
+    /* Skip both profiling and interrupt checking stub for this TB.  */
+    if (skip_prologue) {
+        tb_ptr += itb->prologue_offset;
+    }
 
     ret = tcg_qemu_tb_exec(env, tb_ptr);
     cpu->can_do_io = 1;
@@ -226,7 +232,10 @@ void cpu_exec_step_atomic(CPUState *cpu)
         cc->cpu_exec_enter(cpu);
         /* execute the generated code */
         trace_exec_tb(tb, pc);
-        cpu_tb_exec(cpu, tb);
+        /* Assert non-tracing mode for cpu_exec_step_atomic(), and
+         * always skip prologue to avoid profiling.  */
+        g_assert(!tcg_ctx->trace);
+        cpu_tb_exec(cpu, tb, true);
         cc->cpu_exec_exit(cpu);
     } else {
         /*
@@ -623,7 +632,7 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     int32_t insns_left;
 
     trace_exec_tb(tb, tb->pc);
-    ret = cpu_tb_exec(cpu, tb);
+    ret = cpu_tb_exec(cpu, tb, false);
     tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
     *tb_exit = ret & TB_EXIT_MASK;
     if (*tb_exit != TB_EXIT_REQUESTED) {
@@ -634,13 +643,14 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     *last_tb = NULL;
     insns_left = qatomic_read(&cpu_neg(cpu)->icount_decr.u32);
     if (insns_left < 0) {
-        /* Something asked us to stop executing chained TBs; just
-         * continue round the main loop. Whatever requested the exit
-         * will also have set something else (eg exit_request or
-         * interrupt_request) which will be handled by
-         * cpu_handle_interrupt.  cpu_handle_interrupt will also
-         * clear cpu->icount_decr.u16.high.
-         */
+        /* Something asked us to stop executing chained TBs; just continue
+         * round the main loop. Whatever requested the exit will also have
+         * set something else (eg exit_request or interrupt_request) which
+         * will be handled by cpu_handle_interrupt. cpu_handle_interrupt()
+         * will also clear cpu->icount_decr.u16.high.  */
+        /* Reset tracer if this is caused by { INTERRUPT, EXIT }_REQUEST,
+         * which is always the case for the time being.  */
+        tcg_tracer_reset();
         return;
     }
 
@@ -735,6 +745,13 @@ int cpu_exec(CPUState *cpu)
             } else {
                 cpu->cflags_next_tb = -1;
             }
+
+            /* tcg_ctx->trace should be strictly confined inside of
+             * cpu_loop_exec_tb(). There are only 2 ways of leaving
+             * it, either by function return, or by cpu_loop_exit()
+             * from inside of the code cache, both of which should
+             * reset TCG to the normal operate mode first.  */
+            tcg_debug_assert(!tcg_ctx->trace);
 
             tb = tb_find(cpu, last_tb, tb_exit, cflags);
             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);

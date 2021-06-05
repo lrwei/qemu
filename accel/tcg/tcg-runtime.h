@@ -27,6 +27,10 @@ DEF_HELPER_FLAGS_1(ctpop_i64, TCG_CALL_NO_RWG_SE, i64, i64)
 DEF_HELPER_FLAGS_1(lookup_tb_ptr, TCG_CALL_NO_WG_SE, ptr, env)
 DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
 DEF_HELPER_2(restore_state_from_bailout, void, env, ptr)
+/* Call to helper_profile_tb will be injected by hand, rather
+ * than by tcg_gen_callN(), so the call_flag here is more ofa
+ * comment.  */
+DEF_HELPER_FLAGS_2(profile_tb, TCG_CALL_NO_RWG, void, env, ptr)
 
 #ifdef CONFIG_SOFTMMU
 

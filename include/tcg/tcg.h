@@ -711,6 +711,9 @@ typedef struct TCGContext {
 
     /* Index of the current TCGOp, inversed.  */
     uint16_t current_insn;
+
+    /* Whether or not TCG is in tracing mode. Should start up in FALSE.  */
+    bool trace;
 } TCGContext;
 
 static inline bool temp_readonly(TCGTemp *ts)
@@ -1529,5 +1532,7 @@ static inline const TCGOpcode *tcg_swap_vecop_list(const TCGOpcode *n)
 }
 
 bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
+
+void tcg_tracer_reset(void);
 
 #endif /* TCG_H */

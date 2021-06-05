@@ -66,6 +66,7 @@ void cpu_loop_exit(CPUState *cpu)
 {
     /* Undo the setting in cpu_tb_exec.  */
     cpu->can_do_io = 1;
+    tcg_tracer_reset();
     siglongjmp(cpu->jmp_env, 1);
 }
 

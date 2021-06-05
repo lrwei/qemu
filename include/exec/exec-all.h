@@ -535,6 +535,12 @@ struct TranslationBlock {
     /* Hold BAILOUT_INFO for CF_BAILOUT TBs, freed when the TB is removed from
      * the corresponding region tree.  */
     TCGBailoutInfo *bailout_info;
+
+    /* Profiling counter, enter tracing mode when reaches PROFILE_THRESHOLD.  */
+    uint32_t exec_count;
+    /* Offset of INSN_START[0], TB interrupted by profiling shall be re-entered
+     * through tb->tc.ptr + tb->prologue_offset.  */
+    uint16_t prologue_offset;
 };
 
 struct TCGBailoutInfo {
@@ -559,6 +565,20 @@ static inline uint32_t curr_cflags(CPUState *cpu)
 static inline bool use_monolithic_ldst(void)
 {
     return unlikely(!!(tcg_ctx->tb_cflags & CF_MONOLITHIC));
+}
+
+#define PROFILE_THRESHOLD 0x50
+
+static inline void profile_tb(CPUArchState *env, TranslationBlock *tb)
+{
+    if (!tcg_ctx->trace &&
+        unlikely(qatomic_inc_fetch(&tb->exec_count) == PROFILE_THRESHOLD)) {
+        tcg_debug_assert(tb_cflags(tb) & CF_MONOLITHIC);
+        tcg_ctx->trace = true;
+        /* Force further TB to exit early, it will be re-entered with prologue
+         * skipped after get retranslated and recorded.  */
+        qatomic_set(&env_neg(env)->icount_decr.u16.high, -1);
+    }
 }
 
 /* TranslationBlock invalidate API */
