@@ -2192,7 +2192,7 @@ static void ts_set_guard_info(TCGTemp *ts, GuardHoistingInfo *info)
 }
 
 /* Lousy copy of LLVM dyn_cast<>.  */
-static TCGOp *op_cast(TCGOp *op, TCGOpcode opc)
+static const TCGOp *__op_cast(const TCGOp *op, TCGOpcode opc)
 {
     if (op && op->opc == opc) {
         return op;
@@ -2200,6 +2200,7 @@ static TCGOp *op_cast(TCGOp *op, TCGOpcode opc)
         return NULL;
     }
 }
+#define op_cast(op, opc) __op_cast(op, INDEX_op_##opc)
 
 /* COMPARATORs used by TLB_CHECK or GUARD operations are always calculated by
  * masking out (mostly) the non-page-number bits of the address, which usually
@@ -2213,8 +2214,7 @@ static uint32_t extract_padded_offset(TCGOp *op_tlb, int64_t *poffset,
 {
     TCGOp *op_and, *op_add;
 
-    tcg_debug_assert(op_cast(op_tlb, INDEX_op_tlb_check) ||
-                     op_cast(op_tlb, INDEX_op_tlb_guard));
+    tcg_debug_assert(op_cast(op_tlb, tlb_check) || op_cast(op_tlb, tlb_guard));
     tcg_debug_assert(poffset);
 
     /*                             v
@@ -2225,7 +2225,7 @@ static uint32_t extract_padded_offset(TCGOp *op_tlb, int64_t *poffset,
 
     /* The COMPARATOR must be calculated by AND_TL operation, constant
      * comparators do not obey this rule and are handled differently.  */
-    tcg_debug_assert(op_cast(op_and, INDEX_op_and_tl));
+    tcg_debug_assert(op_cast(op_and, and_tl));
     if (pmask) {
         *pmask = arg_value(op_and->args[2]);
     }
@@ -2236,7 +2236,7 @@ static uint32_t extract_padded_offset(TCGOp *op_tlb, int64_t *poffset,
     op_add = temp_definition(arg_temp(op_and->args[1]));
 
     /* The COMPARATOR may or may not be padded before being masked.  */
-    if (op_cast(op_add, INDEX_op_add_tl) && arg_is_const(op_add->args[2])) {
+    if (op_cast(op_add, add_tl) && arg_is_const(op_add->args[2])) {
         *poffset = arg_value(op_add->args[2]);
         return temp_idx(arg_temp(op_add->args[1]));
     } else {
@@ -2249,7 +2249,7 @@ static void init_ts_guard_info(TCGTemp *ts, TCGOp *op)
 {
     GuardHoistingInfo *info = tcg_malloc(sizeof(GuardHoistingInfo));
 
-    tcg_debug_assert(op_cast(op, INDEX_op_tlb_check));
+    tcg_debug_assert(op_cast(op, tlb_check));
     tcg_debug_assert(ts == arg_temp(op->args[0]));
     tcg_debug_assert(!ts_guard_info(ts));
 
@@ -2295,7 +2295,7 @@ static GuardHoistingInfo *op_guard_info(TCGOp *op)
         g_assert_not_reached();
     }
 
-    tcg_debug_assert(op_cast(temp_definition(ts), INDEX_op_tlb_load));
+    tcg_debug_assert(op_cast(temp_definition(ts), tlb_load));
     tcg_debug_assert((info = ts_guard_info(ts)));
     return info;
 }
@@ -2316,7 +2316,7 @@ static TCGOp *tcg_opt_gen_tlb_guard_full(TCGOp *op, TCGArg base, int64_t offset,
                                          bool is_load)
 {
     TCGTemp *comparator, *padded_addr;
-    TCGTemp *entry = arg_temp(op_cast(op, INDEX_op_tlb_check)->args[0]);
+    TCGTemp *entry = arg_temp(op_cast(op, tlb_check)->args[0]);
 
     if (likely(offset != 0)) {
         op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_add_tl);
@@ -2344,7 +2344,7 @@ static void tcg_opt_do_guard_hoisting(GuardHoistingInfo *info)
     bool is_load = !!(op->args[3] & _OI_LOAD);
     TCGArg base = temp_arg(&tcg_ctx->temps[info->base_index]);
 
-    tcg_debug_assert(op_cast(op, INDEX_op_tlb_check));
+    tcg_debug_assert(op_cast(op, tlb_check));
 
     /* This implies neither `offset_max` nor `offset_min` has ever
      * been changed, and therefore must equal to `offset_initial`.  */
