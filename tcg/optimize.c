@@ -45,9 +45,13 @@
 #if TARGET_LONG_BITS == 32
 #define INDEX_op_add_tl     INDEX_op_add_i32
 #define INDEX_op_and_tl     INDEX_op_and_i32
+#define INDEX_op_mov_tl     INDEX_op_mov_i32
+#define INDEX_op_st_tl      INDEX_op_st_i32
 #else
 #define INDEX_op_add_tl     INDEX_op_add_i64
 #define INDEX_op_and_tl     INDEX_op_and_i64
+#define INDEX_op_mov_tl     INDEX_op_mov_i64
+#define INDEX_op_st_tl      INDEX_op_st_i64
 #endif
 
 /* General explanation of how input IR is converted to SSA-form:
@@ -2508,6 +2512,263 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
         }
         tcg_opt_do_guard_hoisting(info);
     }
+}
+
+static bool is_target_store_pc(const TCGOp *op, TCGArg *arg_p)
+{
+#if defined(TARGET_X86_64) || defined(TARGET_I386)
+    /* For x86(_64) PC is written using ST val, env, offsetof(eip).  */
+    *arg_p = op->args[0];
+    return op_cast(op, st_tl) &&
+           op->args[2] == offsetof(CPUArchState, eip);
+#elif defined (TARGET_AARCH64) || defined (TARGET_RISCV)
+    /* For AArch64 and RISCV, PC is promoted as TEMP_GLOBAL and
+     * is written by MOV op. AArch32 mode in ARMv8 is ignored.  */
+    *arg_p = op->args[1];
+    return op_cast(op, mov_tl) &&
+           arg_temp(op->args[0])->mem_offset == offsetof(CPUArchState, pc);
+#else
+#error target not supported
+#endif
+}
+
+/* Try to identify the exit stub of the current TB, lying at the end of
+ * IR sequence. Return its first TCGOp if succeeded, it could be:
+ * 1. GOTO_TB or CALL lookup_tb_ptr, if this is an unconditional branch,
+ *    note that the latter one may or may not be an indirect one.
+ * 2. BRCOND, if this is an standard conditional branch, only direct ones
+ *    are accepted.  */
+static TCGOp *tcg_opt_find_exit_stub(TCGContext *s)
+{
+    TCGOp *op = QTAILQ_LAST(&s->ops), *op_exit_stub_maybe;
+    TCGArg arg, already_found_one_direction = 0;
+
+    /* Skip epilogue of non-tracing mode TB, TB re-translated during trace
+     * recording mode doesn't generate interrupt checking stub.  */
+    if (!s->trace) {
+        /* CF_BAILOUT TBs are profiled within restore_state_from_bailout(),
+         * all the time, so there is no need to find exit stub for them.  */
+        if (s->tb_cflags & CF_BAILOUT) {
+            return NULL;
+        }
+        /* exit_tb  tb | TB_EXIT_REQUESTED */
+        tcg_debug_assert(op_cast(op, exit_tb) &&
+                         (op->args[0] & TB_EXIT_MASK) == TB_EXIT_REQUESTED);
+        op = QTAILQ_PREV(op, link);
+        /* set_label */
+        tcg_debug_assert(op_cast(op, set_label));
+        op = QTAILQ_PREV(op, link);
+    }
+
+    /* Pattern match (maybe one of the two directions of) exit stub,
+     * accepts:
+     *   goto_tb  TB
+     *   store    pc, TEMP_CONST
+     *   exit_tb  TB | idx
+     * or
+     *   store    pc, ...
+     *   call     lookup_tb_ptr
+     *   goto_ptr ...
+     * or
+     *   call     some_no_return_function
+     * and nothing else.  */
+try_match_another_direction:
+    switch (op->opc) {
+    case INDEX_op_goto_ptr:
+        /* GOTO_PTR, do nothing but skip.  */
+        op = QTAILQ_PREV(op, link);
+
+        /* CALL lookup_tb_ptr, might be the starting point of an exit stub.  */
+        tcg_debug_assert(op_cast(op, call) &&
+                         op->args[2] == (TCGArg) helper_lookup_tb_ptr);
+        op_exit_stub_maybe = op;
+        op = QTAILQ_PREV(op, link);
+
+        if (!already_found_one_direction) {
+            /* Anything other than standard constant updation of PC will be
+             * interpreted as indirect branch, of which conditional version
+             * will be rejected. Hopefully they don't show up very often.  */
+            if (!is_target_store_pc(op, &arg) || !arg_is_const(arg)) {
+                goto test_only_one_direction;
+            }
+        } else {
+            tcg_debug_assert(is_target_store_pc(op, &arg) && arg_is_const(arg));
+        }
+        op = QTAILQ_PREV(op, link);
+        break;
+    case INDEX_op_exit_tb:
+        /* EXIT_TB */
+        if (op->args[0] == 0) {
+            return NULL;
+        }
+        op = QTAILQ_PREV(op, link);
+
+        /* STORE pc, must be constant.  */
+        tcg_debug_assert(is_target_store_pc(op, &arg) && arg_is_const(arg));
+        op = QTAILQ_PREV(op, link);
+
+        /* GOTO_TB */
+        tcg_debug_assert(op_cast(op, goto_tb));
+        op_exit_stub_maybe = op;
+        op = QTAILQ_PREV(op, link);
+        break;
+    default:
+        tcg_debug_assert(op_cast(op, call) && TCGOP_CALLO(op) == 0);
+        tcg_debug_assert(op->args[TCGOP_CALLI(op) + 1] & TCG_CALL_NO_RETURN);
+        return NULL;
+    }
+
+    if (!already_found_one_direction) {
+        /* We assume fixed stub layout for branching:
+         *   brcond ..., label
+         *     direction_1
+         *   set_label label
+         *     direction_2
+         * in which direction_n must be jump to constant target, IDENTIFIABLE
+         * WITHOUT ANY CONSTANT FOLDING, with absolutely no other instruction
+         * intermixed, i.e.:
+         *   goto_tb + store pc, TEMP_CONST + exit_tb
+         * or,
+         *   store pc, TEMP_CONST + call lookup_tb_ptr + goto_ptr  */
+        if (op_cast(op, set_label)) {
+            already_found_one_direction = op->args[0];
+            op = QTAILQ_PREV(op, link);
+            goto try_match_another_direction;
+        }
+test_only_one_direction:
+        /* If the exit stub turns out not to be a standard conditional branch,
+         * we can still expect it to be an unconditional one. Test by checking
+         * that no other control flow ops belong to the same last guest insn.  */
+        while (!op_cast(op, insn_start)) {
+            if (op_cast(op, set_label) || op_cast(op, brcond_i32) ||
+                op_cast(op, brcond_i64)) {
+                return NULL;
+            }
+            op = QTAILQ_PREV(op, link);
+        }
+        return op_exit_stub_maybe;
+    } else if (op_cast(op, brcond_i32) || op_cast(op, brcond_i64)) {
+        tcg_debug_assert(op->args[3] == already_found_one_direction);
+        return op;
+    }
+    g_assert_not_reached();
+}
+
+static inline bool tcg_opt_basic_pass(TCGContext *s, TCGOptContinuation *cont)
+{
+    TCGOp *op_exit_stub = tcg_opt_find_exit_stub(s);
+
+    /* OP_EXIT_STUB's being NULL will cause all what is left in the IR
+     * sequence get optimized.  */
+    tcg_opt_convert_to_ssa_and_peephole(s, cont->op_start, op_exit_stub,
+                                        cont->nb_temps);
+    /* Record the TCGOp to start with for the next time, as well as the
+     * number of TCGTemp allocated by the time convert_to_ssa() returns,
+     * as they shall already be initialized, and must be skipped in the
+     * initialization process of the next invocation.  */
+    cont->op_start = op_exit_stub;
+    cont->nb_temps = s->nb_temps;
+    return !!op_exit_stub;
+}
+
+typedef enum TCGExitStubType {
+    STUB_HAS_LOOKUP_TB_PTR = 1 << 0,
+    STUB_IS_CONDITIONAL    = 1 << 1,
+} TCGExitStubType;
+
+static TCGExitStubType tcg_opt_extract_exit_targets(TCGOp *op_exit_stub,
+                                                    TCGTemp **p_targets)
+{
+    TCGOp *op;
+    TCGArg arg;
+    TCGExitStubType type;
+
+    switch (op_exit_stub->opc) {
+    case INDEX_op_call:
+        QTAILQ_FROM_TO_REVERSE(op, QTAILQ_PREV(op_exit_stub, link), NULL, link){
+            if (op_cast(op, insn_start)) {
+                break;
+            }
+            if (is_target_store_pc(op, &arg)) {
+                *p_targets = arg_temp(arg);
+                break;
+            }
+        }
+        return STUB_HAS_LOOKUP_TB_PTR;
+    case INDEX_op_goto_tb:
+        op = QTAILQ_NEXT(op_exit_stub, link);
+        tcg_debug_assert(is_target_store_pc(op, &arg) && arg_is_const(arg));
+        *p_targets = arg_temp(arg);
+        return 0;
+    CASE_OP_32_64(brcond):
+        type = STUB_IS_CONDITIONAL;
+        QTAILQ_FROM_TO(op, QTAILQ_NEXT(op_exit_stub, link), NULL, link) {
+            if (is_target_store_pc(op, &arg)) {
+                tcg_debug_assert(arg_is_const(arg));
+                *p_targets++ = arg_temp(arg);
+            } else if (op_cast(op, call)) {
+                type |= STUB_HAS_LOOKUP_TB_PTR;
+            }
+        }
+        return type;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+/* Insert helper function call to profile_tb() at the entry of a TB, if
+ * it contains either constant lookup_tb_ptr, or backward direct branch.  */
+static void insert_profile_stub_if_needed(TCGContext *s, TranslationBlock *tb,
+                                          TCGOp *op_exit_stub)
+{
+    /* QEMU internal program counter maybe different to the architectual one,
+     * for example tb->pc == env->eip + tb->cs_base for x86(_64) targets. For
+     * other frontends (e.g. AArch64 and RISC-V), tb->cs_base is always 0.  */
+    target_ulong ip = tb->pc - tb->cs_base;
+    TCGTemp *targets[2] = { NULL, NULL };
+    TCGExitStubType type;
+    TCGOp *op;
+
+    type = tcg_opt_extract_exit_targets(op_exit_stub, targets);
+    if (type & STUB_IS_CONDITIONAL) {
+        if (ts_value(targets[0]) <= ip || ts_value(targets[1]) <= ip ||
+            type & STUB_HAS_LOOKUP_TB_PTR) {
+            goto insert_profile_stub;
+        }
+    } else if (type & STUB_HAS_LOOKUP_TB_PTR) {
+        /* Indirect branch are not profiled. Note that PC could be updated
+         * implicitly through helpers, causing targets[0] remains NULL.  */
+        if (targets[0] && ts_is_const(targets[0])) {
+            goto insert_profile_stub;
+        }
+    } else if (ts_value(targets[0]) <= ip) {
+        goto insert_profile_stub;
+    }
+    return;
+
+insert_profile_stub:
+    op = tcg_op_insert_before(s, QTAILQ_FIRST(&s->ops), INDEX_op_call);
+    op->args[0] = tcgv_ptr_arg(cpu_env);
+    /* Note that we may allocate new TCGTemp here, and will not be properly
+     * initialized as with the others when scanned by convert_to_ssa(). But
+     * it seems to do no harm...  */
+    op->args[1] = tcg_constant_arg_new(TCG_TYPE_PTR, (uintptr_t) tb);
+    op->args[2] = (TCGArg) helper_profile_tb;
+    op->args[3] = TCG_CALL_NO_RWG;
+    TCGOP_CALLO(op) = 0;
+    TCGOP_CALLI(op) = 2;
+}
+
+void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb)
+{
+    TCGOptContinuation cont = { .op_start = NULL, .nb_temps = 0 };
+
+    tcg_debug_assert(use_monolithic_ldst());
+    if (!tcg_opt_basic_pass(s, &cont)) {
+        return;
+    }
+    insert_profile_stub_if_needed(s, tb, cont.op_start);
+    tcg_opt_convert_to_ssa_and_peephole(s, cont.op_start, NULL, cont.nb_temps);
 }
 
 void tcg_optimize(TCGContext *s)

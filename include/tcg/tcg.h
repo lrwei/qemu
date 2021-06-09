@@ -613,6 +613,11 @@ typedef struct TCGProfile {
     int64_t table_op_count[NB_OPS];
 } TCGProfile;
 
+typedef struct TCGOptContinuation {
+    TCGOp *op_start;
+    uint32_t nb_temps;
+} TCGOptContinuation;
+
 typedef struct TCGContext {
     uint8_t *pool_cur, *pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
@@ -1098,6 +1103,7 @@ TCGOp *tcg_op_insert_before(TCGContext *s, TCGOp *op, TCGOpcode opc);
 TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op, TCGOpcode opc);
 
 void tcg_optimize(TCGContext *s);
+void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb);
 
 /* Allocate a new temporary and initialize it with a constant. */
 TCGv_i32 tcg_const_i32(int32_t val);
