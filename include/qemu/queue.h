@@ -490,6 +490,24 @@ union {                                                                 \
              (var) && ((prev_var) = QTAILQ_PREV(var, field), 1);        \
              (var) = (prev_var))
 
+#define QTAILQ_FROM_TO(var, begin, end, field)                          \
+        for ((var) = (begin); (var) && (var != end);                    \
+             (var) = ((var)->field.tqe_next))
+
+#define QTAILQ_FROM_TO_SAFE(var, begin, end, field, next_var)           \
+        for ((var) = (begin); (var) && (var != end) &&                  \
+             ((next_var) = ((var)->field.tqe_next), 1);                 \
+             (var) = (next_var))
+
+#define QTAILQ_FROM_TO_REVERSE(var, begin, end, field)                  \
+        for ((var) = (begin); (var) && (var != end);                    \
+             (var) = QTAILQ_PREV(var, field))
+
+#define QTAILQ_FROM_TO_REVERSE_SAFE(var, begin, end, field, prev_var)   \
+        for ((var) = (begin); (var) && (var != end) &&                  \
+             ((prev_var) = QTAILQ_PREV(var, field), 1);                 \
+             (var) = (prev_var))
+
 /*
  * Tail queue access methods.
  */

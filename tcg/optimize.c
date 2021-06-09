@@ -1125,16 +1125,21 @@ static bool swap_commutative2(TCGArg *p1, TCGArg *p2)
     return false;
 }
 
-static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s)
+static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s, TCGOp *begin,
+                                                TCGOp *end, uint32_t nb_temps)
 {
     TCGOp *op, *op_next, *prev_mb = NULL;
     size_t i;
 
-    for (i = 0; i < s->nb_temps; i++) {
+    for (i = nb_temps; i < s->nb_temps; i++) {
         ts_set_uninitialized(&s->temps[i]);
     }
 
-    QTAILQ_FOREACH_SAFE(op, &s->ops, link, op_next) {
+    if (!begin) {
+        begin = QTAILQ_FIRST(&s->ops);
+    }
+
+    QTAILQ_FROM_TO_SAFE(op, begin, end, link, op_next) {
         uint64_t mask, partmask, affected, tmp;
         uint8_t nb_oargs, nb_iargs;
         TCGOpcode opc = op->opc;
@@ -2507,7 +2512,7 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
 
 void tcg_optimize(TCGContext *s)
 {
-    tcg_opt_convert_to_ssa_and_peephole(s);
+    tcg_opt_convert_to_ssa_and_peephole(s, NULL, NULL, 0);
 #ifdef DEBUG_TCG_SSA
     tcg_opt_check_ssa(s);
 #endif
