@@ -444,8 +444,7 @@ static inline void gen_op_st_rm_T0_A0(DisasContext *s, int idx, int d)
 
 static inline void gen_jmp_im(DisasContext *s, target_ulong pc)
 {
-    tcg_gen_movi_tl(s->tmp0, pc);
-    gen_op_jmp_v(s->tmp0);
+    tcg_gen_st_tl(tcg_constant_tl(pc), cpu_env, offsetof(CPUX86State, eip));
 }
 
 /* Compute SEG:REG into A0.  SEG is selected from the override segment
