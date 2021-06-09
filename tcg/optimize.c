@@ -2116,9 +2116,9 @@ done_algebraic_simplifying_and_constant_folding:
 
 // #define DEBUG_TCG_SSA
 
-#ifdef DEBUG_TCG_SSA
 static void tcg_opt_check_ssa(TCGContext *s)
 {
+#ifdef DEBUG_TCG_SSA
     TCGOp *op;
     size_t i;
 
@@ -2173,8 +2173,8 @@ static void tcg_opt_check_ssa(TCGContext *s)
             }
         }
     }
-}
 #endif
+}
 
 typedef struct GuardHoistingInfo {
     TCGOp *tlb_check_op;
@@ -2513,11 +2513,7 @@ static void tcg_opt_guard_hoisting(TCGContext *s)
 void tcg_optimize(TCGContext *s)
 {
     tcg_opt_convert_to_ssa_and_peephole(s, NULL, NULL, 0);
-#ifdef DEBUG_TCG_SSA
     tcg_opt_check_ssa(s);
-#endif
     tcg_opt_guard_hoisting(s);
-#ifdef DEBUG_TCG_SSA
     tcg_opt_check_ssa(s);
-#endif
 }
