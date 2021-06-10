@@ -1722,7 +1722,11 @@ static void handle_msr_i(DisasContext *s, uint32_t insn,
             gen_helper_rebuild_hflags_a64(cpu_env, t1);
             tcg_temp_free_i32(t1);
             /* Many factors, including TCO, go into MTE_ACTIVE. */
-            s->base.is_jmp = DISAS_UPDATE_NOCHAIN;
+
+            /* XXX: lookup_tb_ptr should not take care of TB state changes,
+             * as TCG might try to convert it into direct branch which only
+             * checks virt-to-phys correspondence of addresses.  */
+            s->base.is_jmp = DISAS_UPDATE_EXIT;
         } else if (dc_isar_feature(aa64_mte_insn_reg, s)) {
             /* Only "instructions accessible at EL0" -- PSTATE.TCO is WI.  */
             s->base.is_jmp = DISAS_NEXT;
