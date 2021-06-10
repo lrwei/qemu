@@ -76,6 +76,7 @@ static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
 #ifndef CONFIG_USER_ONLY
     tcg_gen_movi_tl(cpu_pc, ctx->pc_succ_insn);
     gen_helper_wfi(cpu_env);
+    ctx->base.is_jmp = DISAS_NORETURN;
     return true;
 #else
     return false;
