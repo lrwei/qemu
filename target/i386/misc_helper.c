@@ -543,7 +543,7 @@ void helper_rdmsr(CPUX86State *env)
 }
 #endif
 
-static void do_pause(X86CPU *cpu)
+QEMU_NORETURN static void do_pause(X86CPU *cpu)
 {
     CPUState *cs = CPU(cpu);
 
@@ -552,7 +552,7 @@ static void do_pause(X86CPU *cpu)
     cpu_loop_exit(cs);
 }
 
-static void do_hlt(X86CPU *cpu)
+QEMU_NORETURN static void do_hlt(X86CPU *cpu)
 {
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
