@@ -535,7 +535,8 @@ static inline bool arm_excp_unmasked(CPUState *cs, unsigned int excp_idx,
     return unmasked || pstate_unmasked;
 }
 
-bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+static bool arm_cpu_exec_or_probe_interrupt(CPUState *cs, int interrupt_request,
+                                            bool probe)
 {
     CPUClass *cc = CPU_GET_CLASS(cs);
     CPUARMState *env = cs->env_ptr;
@@ -582,10 +583,22 @@ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     return false;
 
  found:
-    cs->exception_index = excp_idx;
-    env->exception.target_el = target_el;
-    cc->do_interrupt(cs);
+    if (!probe) {
+        cs->exception_index = excp_idx;
+        env->exception.target_el = target_el;
+        cc->do_interrupt(cs);
+    }
     return true;
+}
+
+bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+{
+    return arm_cpu_exec_or_probe_interrupt(cs, interrupt_request, false);
+}
+
+bool arm_cpu_probe_interrupt(CPUState *cs, int interrupt_request)
+{
+    return arm_cpu_exec_or_probe_interrupt(cs, interrupt_request, true);
 }
 
 void arm_cpu_update_virq(ARMCPU *cpu)

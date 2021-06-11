@@ -343,6 +343,13 @@ CPUArchState *cpu_copy(CPUArchState *env);
      | CPU_INTERRUPT_TGT_EXT_3   \
      | CPU_INTERRUPT_TGT_EXT_4)
 
+/* The set of interrupt request bits internal to QEMU, to be checked in
+ * cpu_really_has_work(), CPU_INTERRUPT_HARD will be checked by target
+ * specific .has_work() hook.  */
+#define CPU_INTERRUPT_INTERNAL                                          \
+    (CPU_INTERRUPT_EXITTB | CPU_INTERRUPT_HALT | CPU_INTERRUPT_DEBUG    \
+     | CPU_INTERRUPT_RESET)
+
 #ifdef CONFIG_USER_ONLY
 
 /*

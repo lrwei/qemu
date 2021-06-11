@@ -625,6 +625,39 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
+__attribute__((unused))
+static bool cpu_really_has_work(CPUState *cpu)
+{
+    int interrupt_request = qatomic_read(&cpu->interrupt_request);
+    bool has_work;
+
+    if (likely(!interrupt_request)) {
+        return false;
+    } else if (interrupt_request & CPU_INTERRUPT_INTERNAL) {
+        return true;
+    }
+
+    qemu_mutex_lock_iothread();
+    has_work = cpu_has_work(cpu);
+    qemu_mutex_unlock_iothread();
+    if (!has_work) {
+        return false;
+    }
+
+#if defined(TARGET_ARM) || defined(TARGET_AARCH64)
+    /* We can't merge the detection of masked interrupt into arm_cpu_has_work(),
+     * as it's documented in
+     * [The AArch32 System Level Programmers' Model G1.18.2 Wait For Interrupt]:
+     * "WFI wake-up events cannot be masked by the mask bits in the PSTATE." So,
+     * it's demanded that arm_cpu_has_work() doesn't check whether the pending
+     * interrupt has been masked.  */
+    if (!arm_cpu_probe_interrupt(cpu, interrupt_request)) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     TranslationBlock **last_tb, int *tb_exit)
 {
