@@ -4639,6 +4639,16 @@ void tcg_tracer_reset(void)
     g_assert_not_reached();
 }
 
+bool tcg_tracer_retranslate_tb(CPUState *cpu, TranslationBlock *tb)
+{
+    g_assert_not_reached();
+}
+
+TranslationBlock *tcg_tracer_commit_trace(void)
+{
+    g_assert_not_reached();
+}
+
 #ifdef CONFIG_PROFILER
 void tcg_dump_info(void)
 {

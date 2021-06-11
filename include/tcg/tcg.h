@@ -1540,5 +1540,7 @@ static inline const TCGOpcode *tcg_swap_vecop_list(const TCGOpcode *n)
 bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
 
 void tcg_tracer_reset(void);
+bool tcg_tracer_retranslate_tb(CPUState *cpu, TranslationBlock *tb);
+TranslationBlock *tcg_tracer_commit_trace(void);
 
 #endif /* TCG_H */

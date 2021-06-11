@@ -625,7 +625,6 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
-__attribute__((unused))
 static bool cpu_really_has_work(CPUState *cpu)
 {
     int interrupt_request = qatomic_read(&cpu->interrupt_request);
@@ -662,30 +661,75 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     TranslationBlock **last_tb, int *tb_exit)
 {
     uintptr_t ret;
-    int32_t insns_left;
+    int32_t insns_left, tb_exit_kind;
+    bool skip_prologue = false;
 
     trace_exec_tb(tb, tb->pc);
-    ret = cpu_tb_exec(cpu, tb, false);
-    tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
-    *tb_exit = ret & TB_EXIT_MASK;
-    if (*tb_exit != TB_EXIT_REQUESTED) {
+re_enter_tb:
+    ret = cpu_tb_exec(cpu, tb, skip_prologue);
+    tb = (TranslationBlock *) (ret & ~TB_EXIT_MASK);
+    tb_exit_kind = ret & TB_EXIT_MASK;
+    /* Exited from TB epilogue, which indicates either:
+     *   1. CPU state might have been changed dynamically, i.e. EXIT_TB(0),
+     *   2. The branch target (may be direct or indirect) is unknown to QHT.
+     *      This should be rare during trace recording mode, as it only runs
+     *      on hot code.  */
+    if (tb_exit_kind <= TB_EXIT_IDXMAX) {
+        if (unlikely(tcg_ctx->trace)) {
+            TranslationBlock *trace = tcg_tracer_commit_trace();
+
+            /* This would not be an EXIT_TB(0) as that would have already
+             * terminated the trace when recorded, but still, it could be
+             * that lookup_tb_ptr fails due to the TB's being invalidated,
+             * or other weird reasons. Otherwise, we can link the next TB
+             * directly to the generated trace (, at the same side).  */
+            tb = likely(tb) ? trace : NULL;
+            tcg_debug_assert(!tcg_ctx->trace);
+        }
         *last_tb = tb;
+        *tb_exit = tb_exit_kind;
         return;
     }
+    tcg_debug_assert(tb_exit_kind == TB_EXIT_REQUESTED);
 
-    *last_tb = NULL;
     insns_left = qatomic_read(&cpu_neg(cpu)->icount_decr.u32);
     if (insns_left < 0) {
         /* Something asked us to stop executing chained TBs; just continue
          * round the main loop. Whatever requested the exit will also have
          * set something else (eg exit_request or interrupt_request) which
          * will be handled by cpu_handle_interrupt. cpu_handle_interrupt()
-         * will also clear cpu->icount_decr.u16.high.  */
+         * will also clear cpu->icount_decr.u16.high.
+         * Or it must be that some TB's execution counter has expired, and
+         * TCG entered trace recording mode.  */
+
+        /* Do nothing but exit if not in trace recording mode.  */
+        if (!tcg_ctx->trace) {
         /* Reset tracer if this is caused by { INTERRUPT, EXIT }_REQUEST,
-         * which is always the case for the time being.  */
-        tcg_tracer_reset();
+         * and return to the execution loop to handle pending requests.  */
+        } else if (qatomic_read(&cpu->exit_request) ||
+                   cpu_really_has_work(cpu)) {
+            tcg_tracer_reset();
+        /* Otherwise, this must be an early exit demanded by TCG trace
+         * recording mode (, maybe with some masked interrupt).  */
+        } else {
+            /* Trace recording may terminate due to:
+             * 1. Incoming TB is rejected, because of TB flags differ, loop back
+             *    detected, encountered existing trace head, blacklist-ed block,
+             *    and so on.
+             * 2. Trace length limit is reached, unable to identify exit stub of
+             *    the TB. But the incoming TB will be accepted by the tracer.
+             * Otherwise, re-execute the early exit-ed TB.  */
+            if (tcg_tracer_retranslate_tb(cpu, tb)) {
+                skip_prologue = true;
+                goto re_enter_tb;
+            }
+            tcg_tracer_commit_trace();
+        }
+        tcg_debug_assert(!tcg_ctx->trace);
+        *last_tb = NULL;
         return;
     }
+    g_assert_not_reached();
 
     /* Instruction counter expired.  */
     assert(icount_enabled());
