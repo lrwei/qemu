@@ -3314,6 +3314,14 @@ static inline int cpu_mmu_index(CPUARMState *env, bool ifetch)
     return FIELD_EX32(env->hflags, TBFLAG_ANY, MMUIDX);
 }
 
+/* All bits used in ENV->HFLAGS should have been copied to TB->FLAGS
+ * in cpu_get_tb_cpu_state(), following cpu_mmu_index() should work.  */
+static inline int cpu_mmu_index_from_tb_flags(target_ulong tb_flags,
+                                              bool ifetch)
+{
+    return FIELD_EX32(tb_flags, TBFLAG_ANY, MMUIDX);
+}
+
 static inline bool bswap_code(bool sctlr_b)
 {
 #ifdef CONFIG_USER_ONLY

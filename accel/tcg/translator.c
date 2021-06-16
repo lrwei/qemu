@@ -60,7 +60,9 @@ static void translator_loop_tb_finalize(CPUArchState *env, TranslationBlock *tb)
     op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_itlb_load);
     op->args[0] = temp_arg(tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_NORMAL));
     op->args[1] = virt_page2;
-    op->args[2] = cpu_mmu_index(env, true);
+    op->args[2] = cpu_mmu_index_from_tb_flags(tb->flags, true);
+    /* These two should be the same?  */
+    tcg_debug_assert(op->args[2] == cpu_mmu_index(env, true));
 
     /* ITLB_CHECK   entry, 1 | page_addr[1], virt_page2
      * Bit 1 is set to indicate this is an VALID physical address ready

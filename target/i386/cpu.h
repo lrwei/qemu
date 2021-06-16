@@ -1992,6 +1992,17 @@ static inline int cpu_mmu_index(CPUX86State *env, bool ifetch)
         ? MMU_KNOSMAP_IDX : MMU_KSMAP_IDX;
 }
 
+/* All bits used in ENV->{ HFLAGS, EFLAGS } should have been copied
+ * to TB->FLAGS in cpu_get_tb_cpu_state(), following cpu_mmu_index()
+ * should work.  */
+static inline int cpu_mmu_index_from_tb_flags(target_ulong tb_flags,
+                                              bool ifetch)
+{
+    return (tb_flags & HF_CPL_MASK) == 3 ? MMU_USER_IDX :
+        (!(tb_flags & HF_SMAP_MASK) || (tb_flags & AC_MASK))
+        ? MMU_KNOSMAP_IDX : MMU_KSMAP_IDX;
+}
+
 static inline int cpu_mmu_index_kernel(CPUX86State *env)
 {
     return !(env->hflags & HF_SMAP_MASK) ? MMU_KNOSMAP_IDX :

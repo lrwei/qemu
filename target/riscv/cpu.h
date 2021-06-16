@@ -437,6 +437,19 @@ static inline void cpu_get_tb_cpu_state(CPURISCVState *env, target_ulong *pc,
     *pflags = flags;
 }
 
+/* cpu_mmu_index() for RISC-V equals to ENV->PRIV, and is encoded in
+ * the low-bits of TB_FLAGS. Note that H-ext for RISC-V demands that
+ * accesses to virtualization-related address space happen only with
+ * specified H-ext instructions, and would never affect ITLB_LOAD.  */
+static inline int cpu_mmu_index_from_tb_flags(target_ulong tb_flags,
+                                              bool ifetch)
+{
+    /* TB_FLAGS_PRIV_HYP_ACCESS_MASK never appears in TB_FLAGS and
+     * has nothing to do with the main purpose of this function --
+     * supporting ITLB_LOAD -- as explained above.  */
+    return tb_flags & TB_FLAGS_PRIV_MMU_MASK;
+}
+
 int riscv_csrrw(CPURISCVState *env, int csrno, target_ulong *ret_value,
                 target_ulong new_value, target_ulong write_mask);
 int riscv_csrrw_debug(CPURISCVState *env, int csrno, target_ulong *ret_value,
