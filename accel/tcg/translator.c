@@ -77,7 +77,8 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
                      CPUState *cpu, TranslationBlock *tb, int max_insns)
 {
     int bp_insn = 0;
-    bool plugin_enabled, tb_started = false;
+    bool plugin_enabled, tb_start_emitted = false, tb_started = false;
+    uint32_t bailout_n = tb_cflags(tb) & CF_BAILOUT_MASK;
 
     /* Initialize DisasContext */
     db->tb = tb;
@@ -95,7 +96,7 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     tcg_clear_temp_count();
 
     /* Start translating.  */
-    if (tb->cflags & CF_BAILOUT) {
+    if (bailout_n) {
         TCGv_ptr bailout_tb = tcg_const_ptr((uintptr_t) tb);
 
         /* BAILOUT TBs shall restore state at TB entry. Most targets don't
@@ -105,16 +106,45 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
          * situations where this restoration is necessary, e.g. CC_OP for
          * x86 target.  */
         gen_helper_restore_state_from_bailout(cpu_env, bailout_tb);
+
         /* TODO: Emit ITLB_CHECK for cross-page bailout.  */
         tcg_debug_assert(tb->pc - tb->bailout_info->tb->pc <
                          tb->bailout_info->tb->size);
+        switch (bailout_n) {
+        case CF_BAILOUT_1:
+            /* Bailout TB of TLB_GUARD must use monolithic ldst, and
+             * will not be profiled or optimized again. Neither does
+             * it need interrupt checking stub, as CF_BAILOUT TB can
+             * not form loop themselves.  */
+
+            /* TCG can't be of trace recording mode at here, for:
+             * 1. The TB itself doesn't do profiling, so no early exit or
+             *    retranslation.
+             * 2. Bailout TB can only be executed from side exit of traces,
+             *    which should have terminated the trace recording mode.  */
+            tcg_debug_assert(!tcg_ctx->trace);
+            break;
+        case CF_BAILOUT_2:
+        case CF_BAILOUT_3:
+            g_assert_not_reached();
+            if (!tcg_ctx->trace) {
+                // gen_helper_profile_tb(cpu_env, bailout_tb);
+                gen_tb_start(db->tb);
+                tb_start_emitted = true;
+            }
+            break;
+        default:
+            g_assert_not_reached();
+        }
         tcg_temp_free_ptr(bailout_tb);
-    } else {
-        /* CF_BAILOUT TBs don't check pending interrupt, as no loop can be
-         * formed with only CF_BAILOUT TBs. Besides, BRCOND at entry point
-         * SYNCs TEMP_GLOBALs back to their canonical locations, which is
-         * unwanted.  */
+    } else if (!tcg_ctx->trace) {
+        /* Trace (except for BAILOUT ones) must have TB prologue / epilogue,
+         * so that other rounds of trace recording can stop on encountering
+         * existing traces. However, TB retranslated during trace recording
+         * won't have their own ones, the sole copy will be emitted only at
+         * trace finalization step.  */
         gen_tb_start(db->tb);
+        tb_start_emitted = true;
     }
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
@@ -193,7 +223,7 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
     /* Paired with gen_tb_start().  */
-    if (!(tb->cflags & CF_BAILOUT)) {
+    if (tb_start_emitted) {
         gen_tb_end(db->tb, db->num_insns - bp_insn);
     }
 

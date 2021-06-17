@@ -2546,9 +2546,8 @@ static TCGOp *tcg_opt_find_exit_stub(TCGContext *s)
     /* Skip epilogue of non-tracing mode TB, TB re-translated during trace
      * recording mode doesn't generate interrupt checking stub.  */
     if (!s->trace) {
-        /* CF_BAILOUT TBs are profiled within restore_state_from_bailout(),
-         * all the time, so there is no need to find exit stub for them.  */
-        if (s->tb_cflags & CF_BAILOUT) {
+        /* CF_BAILOUT TBs are profiled separatedly, if ever profiled.  */
+        if (s->tb_cflags & CF_BAILOUT_MASK) {
             return NULL;
         }
         /* exit_tb  tb | TB_EXIT_REQUESTED */

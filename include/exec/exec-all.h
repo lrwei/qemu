@@ -75,7 +75,7 @@ void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);
 void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
 void QEMU_NORETURN cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t pc);
 void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t pc);
-uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t pc);
+uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t pc, uint32_t n);
 
 /**
  * cpu_loop_exit_requested:
@@ -472,7 +472,10 @@ struct TranslationBlock {
  * with certain kind of context attached to, i.e. TCGBailoutInfo. Besides,
  * these TBs are linked directly to the GUARD failure branch, therefore
  * will not be inserted into QHT.  */
-#define CF_BAILOUT     0x00100000 /* TB to be used in bailout procedure only */
+#define CF_BAILOUT_MASK 0x00300000 /* TB to be used in bailout procedure only */
+#define CF_BAILOUT_1    0x00100000 /* Bailout of TLB_GUARD */
+#define CF_BAILOUT_2    0x00200000 /* Other bailout, with iTLB check */
+#define CF_BAILOUT_3    0x00300000 /* Other bailout, without iTLB check */
 #define CF_CLUSTER_MASK 0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
 /* cflags' mask for hashing/comparison, basically ignore CF_INVALID */

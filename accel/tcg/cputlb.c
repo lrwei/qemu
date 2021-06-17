@@ -2801,7 +2801,7 @@ void helper_tlb_guard_failure(CPUArchState *_, uintptr_t retaddr)
      * something alike may have to be poped out before (, or, along with)
      * the control flow alternation.  */
     tcg_target_jmp(cpu_rescue_guard_failure(env_cpu(TCG_TARGET_AREG0),
-                                            retaddr));
+                                            retaddr, CF_BAILOUT_1));
 }
 
 QEMU_ALWAYS_INLINE

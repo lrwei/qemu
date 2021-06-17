@@ -1361,7 +1361,7 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
         return;
     }
 
-    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT));
+    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT_MASK));
     qemu_spin_lock(&dest->jmp_lock);
     /*
      * While acquiring the lock, the jump might have been removed if the
@@ -1409,7 +1409,7 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     TranslationBlock *tb;
     int n;
 
-    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT));
+    tcg_debug_assert(!(tb_cflags(dest) & CF_BAILOUT_MASK));
     qemu_spin_lock(&dest->jmp_lock);
 
     TB_FOR_EACH_JMP(dest, tb, n) {
@@ -1484,7 +1484,7 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qemu_spin_unlock(&tb->jmp_lock);
 
     /* Remove the TB from the hash list, if this is an ordinary TB.  */
-    if (!(tb_cflags(tb) & CF_BAILOUT)) {
+    if (!(tb_cflags(tb) & CF_BAILOUT_MASK)) {
         phys_pc = tb->page_addr[0] + (tb->pc & ~TARGET_PAGE_MASK);
         h = tb_hash_func(phys_pc, tb->pc, tb->flags,
                          tb_cflags(tb) & CF_HASH_MASK, tb->trace_vcpu_dstate);
@@ -1499,7 +1499,7 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     /* Remove from page list as well as from jump lists.  */
     do_tb_phys_invalidate_common(tb, rm_from_page_list);
 
-    if (!(tb_cflags(tb) & CF_BAILOUT)) {
+    if (!(tb_cflags(tb) & CF_BAILOUT_MASK)) {
         /* Remove the TB from the hash list.  */
         h = tb_jmp_cache_hash_func(tb->pc);
         CPU_FOREACH(cpu) {
@@ -1697,7 +1697,7 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
     }
 
     /* Ordinary TBs (i.e. those without CF_BAILOUT) shall be added in QHT.  */
-    if (!(tb->cflags & CF_BAILOUT)) {
+    if (!(tb->cflags & CF_BAILOUT_MASK)) {
         h = tb_hash_func(phys_pc, tb->pc, tb->flags, tb->cflags & CF_HASH_MASK,
                          tb->trace_vcpu_dstate);
         qht_insert(&tb_ctx.htable, tb, h, &existing_tb);
@@ -1750,7 +1750,7 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
     assert_memory_lock();
 
     /* BAILOUT_INFO shall be attached to and only to CF_BAILOUT TBs.  */
-    tcg_debug_assert(!!(cflags & CF_BAILOUT) == !!bailout_info);
+    tcg_debug_assert(!!(cflags & CF_BAILOUT_MASK) == !!bailout_info);
 
     phys_pc = get_page_addr_code(env, pc);
 
@@ -1995,7 +1995,7 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
      * on the stack, commit heap allocation only after TB has reached its
      * completion. Otherwise cpu_loop_exit() triggered in between may leak
      * memory.  */
-    if (tb->cflags & CF_BAILOUT) {
+    if (tb->cflags & CF_BAILOUT_MASK) {
         tb->bailout_info = g_new(TCGBailoutInfo, 1);
         memcpy(tb->bailout_info, bailout_info, sizeof(TCGBailoutInfo));
     }
@@ -2445,7 +2445,8 @@ static bool bailout_info_finalize(TCGBailoutInfo *pinfo, TranslationBlock *tb,
     return true;
 }
 
-uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr)
+uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr,
+                                   uint32_t bailout_n)
 {
     CPUArchState *env = cpu->env_ptr;
     TCGBailoutInfo info = {};
@@ -2468,7 +2469,7 @@ uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr)
 
     if (bailout_info_finalize(&info, tb, retaddr, &jump_target)) {
         target_ulong pc, cs_base;
-        uint32_t flags, cflags = curr_cflags(cpu) | CF_BAILOUT | CF_MONOLITHIC;
+        uint32_t flags, cflags = curr_cflags(cpu) | bailout_n | CF_MONOLITHIC;
 
         cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
         /* All CPU states except for PC should be the same as that of the

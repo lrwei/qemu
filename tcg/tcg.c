@@ -389,7 +389,7 @@ static void tcg_tb_destroy(gpointer _tb)
 
     qemu_spin_destroy(&tb->jmp_lock);
     if (tb->bailout_info) {
-        tcg_debug_assert(tb_cflags(tb) & CF_BAILOUT);
+        tcg_debug_assert(tb->cflags & CF_BAILOUT_MASK);
         g_free(tb->bailout_info);
     }
 }
