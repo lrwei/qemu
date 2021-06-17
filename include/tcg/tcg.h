@@ -1104,6 +1104,8 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op, TCGOpcode opc);
 
 void tcg_optimize(TCGContext *s);
 void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb);
+void tcg_insert_itlb_check_stub(TCGContext *s, TCGOp *op, TranslationBlock *tb,
+                                bool check_branch_to_tb);
 
 /* Allocate a new temporary and initialize it with a constant. */
 TCGv_i32 tcg_const_i32(int32_t val);

@@ -37,40 +37,37 @@ static void translator_loop_tb_finalize(CPUArchState *env, TranslationBlock *tb)
     target_ulong virt_page2 = (tb->pc + tb->size - 1) & TARGET_PAGE_MASK;
     TCGOp *op;
 
-    /* page_addr[0] is filled in tb_gen_code().  */
+    /* In !trace mode, page_addr[0] is filled in tb_gen_code(), otherwise
+     * both of page_addr[] should have been filled.  */
     if (tb->page_addr[0] == -1 || (tb->pc & TARGET_PAGE_MASK) == virt_page2) {
-        tb->page_addr[1] = -1;
+        if (!tcg_ctx->trace) {
+            tb->page_addr[1] = -1;
+        } else {
+            tcg_debug_assert(tb->page_addr[0] != -1 && tb->page_addr[1] == -1);
+        }
         return;
     }
 
-    tb->page_addr[1] = get_page_addr_code(env, virt_page2);
-    /* This would be too damn weird.  */
-    g_assert(tb->page_addr[1] != -1);
-    itlb_update_entry(env, virt_page2, tb->page_addr[1]);
+    if (!tcg_ctx->trace) {
+        tb->page_addr[1] = get_page_addr_code(env, virt_page2);
+        /* This would be too damn weird.  */
+        g_assert(tb->page_addr[1] != -1);
 
-    /* Insert iTLB check stub after entry INSN_START to guard against cross
-     * page TB's being invalidated due to partially updated memory mapping.  */
-    QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
-        if (op->opc == INDEX_op_insn_start) {
-            break;
+        /* Insert iTLB check stub after entry INSN_START to guard against cross
+         * page TB's being invalidated due to partially updated memory mapping,
+         * won't be skipped.  */
+        QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
+            if (op->opc == INDEX_op_insn_start) {
+                break;
+            }
         }
+    } else {
+        g_assert_not_reached();
     }
 
-    /* ITLB_LOAD    entry, VIRT_PAGE2, MMU_IDX */
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_itlb_load);
-    op->args[0] = temp_arg(tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_NORMAL));
-    op->args[1] = virt_page2;
-    op->args[2] = cpu_mmu_index_from_tb_flags(tb->flags, true);
-    /* These two should be the same?  */
-    tcg_debug_assert(op->args[2] == cpu_mmu_index(env, true));
-
-    /* ITLB_CHECK   entry, 1 | page_addr[1], virt_page2
-     * Bit 1 is set to indicate this is an VALID physical address ready
-     * to be checked against iTLB entry, see also itlb_update_entry().  */
-    op = tcg_op_insert_after(tcg_ctx, op, INDEX_op_itlb_check);
-    op->args[0] = QTAILQ_PREV(op, link)->args[0];
-    op->args[1] = tcg_constant_arg_new(TCG_TYPE_PTR, 1 | tb->page_addr[1]);
-    op->args[2] = tcg_constant_arg_new(TCG_TYPE_TL, virt_page2);
+    tcg_insert_itlb_check_stub(tcg_ctx, op, tb, false);
+    /* These two should be equal.  */
+    tcg_debug_assert(QTAILQ_NEXT(op, link)->args[2] == cpu_mmu_index(env, 1));
 }
 
 void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
@@ -107,9 +104,9 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
          * x86 target.  */
         gen_helper_restore_state_from_bailout(cpu_env, bailout_tb);
 
-        /* TODO: Emit ITLB_CHECK for cross-page bailout.  */
-        tcg_debug_assert(tb->pc - tb->bailout_info->tb->pc <
-                         tb->bailout_info->tb->size);
+        /* CF_BAILOUT_1 stands for bailout for TLB_GUARD, which by definition
+         * must start from the same page. CF_BAILOUT_2 is for GUARDs that MAY
+         * start from a different page, and CF_BAILOUT_3 is for all else.  */
         switch (bailout_n) {
         case CF_BAILOUT_1:
             /* Bailout TB of TLB_GUARD must use monolithic ldst, and
@@ -154,6 +151,12 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
         db->num_insns++;
         ops->insn_start(db, cpu);
         if (!tb_started) {
+            /* Must be inserted under some INSN_START op, for proper restore
+             * of CPU state. (Have to use register map encoded in INSN_START,
+             * not implemented yet).  */
+            if (bailout_n == CF_BAILOUT_2) {
+                tcg_insert_itlb_check_stub(tcg_ctx, tcg_last_op(), tb, true);
+            }
             /* Target-specific tb_start() should always be executed, and
              * shall be excluded from the TB prologue.  */
             ops->tb_start(db, cpu);

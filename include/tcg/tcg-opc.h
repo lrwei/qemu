@@ -208,7 +208,7 @@ DEF(tlb_load, 1, 1, 1, IMPL64)
 DEF(tlb_check, 0, 3, 1, TCG_OPF_CALL_CLOBBER | IMPL64)
 DEF(tlb_guard, 0, 2, 1, IMPL64)
 DEF(itlb_load, 1, 0, 2, IMPL64)
-DEF(itlb_check, 0, 3, 0, TCG_OPF_CALL_CLOBBER | IMPL64)
+DEF(itlb_check, 0, 3, 0, TCG_OPF_SIDE_EFFECTS | TCG_OPF_CALL_CLOBBER | IMPL64)
 
 /* Host vector support.  */
 

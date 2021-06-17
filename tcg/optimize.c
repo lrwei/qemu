@@ -2770,6 +2770,38 @@ void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb)
     tcg_opt_convert_to_ssa_and_peephole(s, cont.op_start, NULL, cont.nb_temps);
 }
 
+void tcg_insert_itlb_check_stub(TCGContext *s, TCGOp *op, TranslationBlock *tb,
+                                bool check_branch_to_tb)
+{
+    target_ulong virt_page;
+    ram_addr_t phys_page;
+
+    if (check_branch_to_tb) {
+        virt_page = tb->pc & TARGET_PAGE_MASK;
+        phys_page = tb->page_addr[0];
+    } else {
+        virt_page = (tb->pc + tb->size - 1) & TARGET_PAGE_MASK;
+        phys_page = tb->page_addr[1];
+        tcg_debug_assert((tb->pc & TARGET_PAGE_MASK) != virt_page);
+    }
+    tcg_debug_assert(phys_page != -1);
+    itlb_update_entry(current_cpu->env_ptr, virt_page, phys_page);
+
+    /* ITLB_LOAD    entry, virt_page, mmu_idx */
+    op = tcg_op_insert_after(s, op, INDEX_op_itlb_load);
+    op->args[0] = temp_arg(tcg_temp_new_internal(TCG_TYPE_PTR, TEMP_NORMAL));
+    op->args[1] = virt_page;
+    op->args[2] = cpu_mmu_index_from_tb_flags(tb->flags, true);
+
+    /* ITLB_CHECK   entry, 1 | page_page, virt_page
+     * Bit 1 is set to indicate this is an VALID physical address ready
+     * to be checked against iTLB entry, see also itlb_update_entry().  */
+    op = tcg_op_insert_after(s, op, INDEX_op_itlb_check);
+    op->args[0] = QTAILQ_PREV(op, link)->args[0];
+    op->args[1] = tcg_constant_arg_new(TCG_TYPE_PTR, 1 | phys_page);
+    op->args[2] = tcg_constant_arg_new(TCG_TYPE_TL, virt_page);
+}
+
 void tcg_optimize(TCGContext *s)
 {
     tcg_opt_convert_to_ssa_and_peephole(s, NULL, NULL, 0);
