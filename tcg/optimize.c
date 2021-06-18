@@ -1220,6 +1220,7 @@ static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s, TCGOp *begin,
             swap_commutative(op->args[0], &op->args[1], &op->args[2]);
             break;
         CASE_OP_32_64(brcond):
+        CASE_OP_32_64(brcond_guard):
             if (swap_commutative(-1, &op->args[0], &op->args[1])) {
                 op->args[2] = tcg_swap_cond(op->args[2]);
             }
@@ -1614,6 +1615,20 @@ static void tcg_opt_convert_to_ssa_and_peephole(TCGContext *s, TCGOp *begin,
                 }
                 opc = op->opc = INDEX_op_br;
                 op->args[0] = op->args[3];
+            }
+            break;
+        CASE_OP_32_64(brcond_guard):
+            tmp = do_constant_folding_cond(opc, op->args[0],
+                                           op->args[1], op->args[2]);
+            if (tmp != 2) {
+                /* The condition can't be false, no need to check.  */
+                if (tmp == 1) {
+                    tcg_op_remove(s, op);
+                    continue;
+                }
+                /* WTF, this can't happen. As otherwise TCG can't generate
+                 * such a BRCOND_GUARD during the trace recording mode.  */
+                g_assert_not_reached();
             }
             break;
 

@@ -1544,6 +1544,9 @@ static bool tcg_op_supported_by_backend(TCGOpcode op)
     case INDEX_op_itlb_load:
     case INDEX_op_tlb_check:
     case INDEX_op_itlb_check:
+    /* Yes, we just won't support 32-bit hosts.  */
+    case INDEX_op_brcond_guard_i32:
+    case INDEX_op_brcond_guard_i64:
         return TCG_TARGET_REG_BITS == 64;
 
     case INDEX_op_movcond_i64:

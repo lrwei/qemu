@@ -1920,6 +1920,14 @@ static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     return true;
 }
 
+static bool tcg_out_brcond_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    TCGLabelBrcondGuard *l = spl->brcond_guard;
+    tcg_out_guard_slow_path(s, spl, l->check_itlb ? helpers_guard_failure[1]
+                                                  : helpers_guard_failure[2]);
+    return true;
+}
+
 static bool tcg_out_itlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 {
     TCGLabelItlbCheck *l = spl->itlb_check;
@@ -2295,6 +2303,28 @@ static void tcg_out_itlb_check(TCGContext *s, TCGReg entry, TCGArg phys,
                          arg_types);
 }
 
+static void add_brcond_guard_label(TCGContext *s, tcg_insn_unit *raddr,
+                                   tcg_insn_unit *label_ptr, bool check_itlb)
+{
+    TCGLabelBrcondGuard *label = new_brcond_guard_label(s, raddr, label_ptr);
+    label->check_itlb = check_itlb;
+}
+
+static void tcg_out_brcond_guard(TCGContext *s, TCGCond cond, TCGArg arg1,
+                                 TCGArg arg2, BackendValType arg2_type,
+                                 bool check_itlb, int rexw)
+{
+    tcg_out_cmp(s, arg1, arg2, arg2_type, rexw);
+    tcg_out_padding_4(s, 2);
+    /* BRCOND_GUARD verifies whether the given COND holds, and bailout
+     * IF IT DOES NOT.  */
+    tcg_out_opc(s, OPC_JCC_long + tcg_cond_to_jcc[tcg_invert_cond(cond)],
+                0, 0, 0);
+    s->code_ptr += 4;
+
+    add_brcond_guard_label(s, s->code_ptr, s->code_ptr - 4, check_itlb);
+}
+
 static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
                               const BackendValType *arg_types)
 {
@@ -2582,6 +2612,9 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         break;
     case INDEX_op_itlb_check:
         tcg_out_itlb_check(s, a0, a1, a2, arg_types);
+        break;
+    OP_32_64(brcond_guard):
+        tcg_out_brcond_guard(s, a2, a0, a1, arg_types[1], args[3], rexw);
         break;
 
     OP_32_64(mulu2):
@@ -3114,6 +3147,8 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
 
     case INDEX_op_brcond_i32:
     case INDEX_op_brcond_i64:
+    case INDEX_op_brcond_guard_i32:
+    case INDEX_op_brcond_guard_i64:
         return &r_re;
 
     case INDEX_op_bswap16_i32:
