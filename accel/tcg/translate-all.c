@@ -2445,8 +2445,8 @@ static bool bailout_info_finalize(TCGBailoutInfo *pinfo, TranslationBlock *tb,
     return true;
 }
 
-uintptr_t cpu_rescue_guard_failure(CPUState *cpu, uintptr_t retaddr,
-                                   uint32_t bailout_n)
+uintptr_t cpu_rescue_guard_failure(uintptr_t retaddr, uint32_t bailout_n,
+                                   CPUState *cpu)
 {
     CPUArchState *env = cpu->env_ptr;
     TCGBailoutInfo info = {};

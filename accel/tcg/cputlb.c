@@ -2775,34 +2775,56 @@ void helper_tlb_check_st(target_ulong addr, TCGMemOpIdx oi, uintptr_t retaddr)
     TCG_TARGET_EXTRA_EPILOGUE
 }
 
-/* Declare the function to be __attribute__((naked)) to prevent GCC
- * from altering the stack pointer. BE AWARE THAT GCC DOCUMENTS THE
- * USAGE AS NOT SUPPORTED, so this is nasty hack once again:
+/* Jump directly to the entry point of the corresponding bailout TB.
+ * STACK POINTER MUST NOT BE ALTERED BY THE COMPILER WITHIN CURRENT
+ * FUNCTION, or execution will not be able to return to the runtime
+ * correctly. Note that TCG generated code (except for the prologue,
+ * epilogue, and call instruction which is not used here) assumes a
+ * constant stack pointer, "as if by gcc's -mno-push-args option".
+ *
+ * Corresponding function has to be declared as __attribute__((naked))
+ * to prevent GCC from altering the stack pointer. BE AWARE THAT GCC
+ * DOCUMENTS THE USAGE AS NOT SUPPORTED, so this is again nasty hack:
  * "[6.33.35 x86 Function Attributes - naked]:
  * While using extended asm or a mixture of basic asm and C code may
  * appear to work, they cannot be depended upon to work reliably and
  * are not supported."
- * One can get rid of this hack simply by using cpu_loop_exit_noexc()
- * instead of tcg_target_jmp(), with tiny little bit of extra runtime
- * overhead.  */
+ *
+ * We always force TEMP_GLOBALs to be SYNC'ed back to their canonical
+ * locations before calling this for the time being, so a direct jump
+ * suffices. Situation may change in future, and a TCGBailoutFrame or
+ * something alike may have to be poped out before (, or, along with)
+ * the control flow alternation.  */
+#define do_rescue_guard_failure(retaddr, bailout_n)                     \
+    tcg_target_jmp(cpu_rescue_guard_failure(retaddr, bailout_n,         \
+                                            env_cpu(TCG_TARGET_AREG0)))
+
+/* For TLB_GUARD failure only, with neither profiling nor interrupt check.  */
 QEMU_NORETURN __attribute__((naked))
-void helper_tlb_guard_failure(CPUArchState *_, uintptr_t retaddr)
+static void helper_guard_failure_1(uintptr_t retaddr)
 {
-    /* Jump directly to the entry point of the corresponding bailout TB.
-     * STACK POINTER MUST NOT BE ALTERED BY THE COMPILER WITHIN CURRENT
-     * FUNCTION, or execution will not be able to return to the runtime
-     * correctly. Note that TCG generated code (except for the prologue,
-     * epilogue, and call instruction which is not used here) assumes a
-     * constant stack pointer, "as if by gcc's -mno-push-args option".
-     *
-     * We always force TEMP_GLOBALs to be SYNC'ed back to their canonical
-     * locations before calling this for the time being, so a direct jump
-     * suffices. Situation may change in future, and a TCGBailoutFrame or
-     * something alike may have to be poped out before (, or, along with)
-     * the control flow alternation.  */
-    tcg_target_jmp(cpu_rescue_guard_failure(env_cpu(TCG_TARGET_AREG0),
-                                            retaddr, CF_BAILOUT_1));
+    do_rescue_guard_failure(retaddr, CF_BAILOUT_1);
 }
+
+/* For GUARD failure that needs to check iTLB before bailout.  */
+QEMU_NORETURN __attribute__((naked))
+static void helper_guard_failure_2(uintptr_t retaddr)
+{
+    do_rescue_guard_failure(retaddr, CF_BAILOUT_2);
+}
+
+/* For anything else.  */
+QEMU_NORETURN __attribute__((naked))
+static void helper_guard_failure_3(uintptr_t retaddr)
+{
+    do_rescue_guard_failure(retaddr, CF_BAILOUT_3);
+}
+
+void * const helpers_guard_failure[] = {
+    helper_guard_failure_1,
+    helper_guard_failure_2,
+    helper_guard_failure_3,
+};
 
 QEMU_ALWAYS_INLINE
 static inline void itlb_check_helper(CPUArchState *env, ram_addr_t phys,

@@ -1889,11 +1889,12 @@ static bool tcg_out_tlb_check_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
     return true;
 }
 
-static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+static void tcg_out_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl,
+                                    tcg_insn_unit *helper_guard_failure_n)
 {
     _Static_assert(TCG_TARGET_REG_BITS == 64);
 
-    /* Offset field in GUARD's JNE should be aligned.  */
+    /* Offset field in GUARD's JXX should be aligned.  */
     tcg_debug_assert((uintptr_t) spl->label_ptr % 4 == 0);
 
     /* Resolve label address.  */
@@ -1901,15 +1902,21 @@ static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
 
     /* Signature of the helper to be called:
      * QEMU_NORETURN
-     * void helper_tlb_guard_failure(CPUArchState *rbp, uintptr_t retaddr);
+     * void helper_guard_failure_n(uintptr_t retaddr, CPUArchState *rbp);
      *
      * Note that the function implements nonstandard calling convention,
      * in the sense that certain arguments are passed through registers
      * specified by corresponding argument name.  */
-    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[1],
+    tcg_out_movi(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0],
                  (uintptr_t) spl->raddr);
     /* Guard failure never returns.  */
-    tcg_out_jmp(s, (tcg_insn_unit *) helper_tlb_guard_failure);
+    tcg_out_jmp(s, helper_guard_failure_n);
+    return;
+}
+
+static bool tcg_out_tlb_guard_slow_path(TCGContext *s, TCGLabelSlowPath *spl)
+{
+    tcg_out_guard_slow_path(s, spl, helpers_guard_failure[0]);
     return true;
 }
 
