@@ -69,6 +69,9 @@ void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               target_ulong pc, target_ulong cs_base,
                               uint32_t flags, uint32_t cflags);
+int encode_search(TranslationBlock *tb, uint8_t *block);
+void tcg_log_tb_out_asm(TranslationBlock *tb);
+TranslationBlock *tb_gen_code_finalize(TranslationBlock *tb);
 
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 void QEMU_NORETURN cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc);

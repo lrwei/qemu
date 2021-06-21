@@ -299,7 +299,7 @@ static target_long decode_sleb128(uint8_t **pp)
    That is, the first column is seeded with the guest pc, the last column
    with the host pc, and the middle columns with zeros.  */
 
-static int encode_search(TranslationBlock *tb, uint8_t *block)
+int encode_search(TranslationBlock *tb, uint8_t *block)
 {
     uint8_t *highwater = tcg_ctx->code_gen_highwater;
     uint8_t *p = block;
@@ -324,6 +324,7 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
            the buffer completely.  Thus we can test for overflow after
            encoding a row without having to check during encoding.  */
         if (unlikely(p > highwater)) {
+            /* Buffer overflow.  */
             return -1;
         }
     }
@@ -1731,175 +1732,13 @@ tb_link_page(TranslationBlock *tb, tb_page_addr_t phys_pc,
     return tb;
 }
 
-/* Called with mmap_lock held for user mode emulation.  */
-static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
-                                              target_ulong cs_base,
-                                              uint32_t flags, uint32_t cflags,
-                                              TCGBailoutInfo *bailout_info)
+void tcg_log_tb_out_asm(TranslationBlock *tb)
 {
-    CPUArchState *env = cpu->env_ptr;
-    TranslationBlock *tb, *existing_tb;
-    tb_page_addr_t phys_pc;
-    tcg_insn_unit *gen_code_buf;
-    int gen_code_size, search_size, max_insns;
-#ifdef CONFIG_PROFILER
-    TCGProfile *prof = &tcg_ctx->prof;
-    int64_t ti;
-#endif
-
-    assert_memory_lock();
-
-    /* BAILOUT_INFO shall be attached to and only to CF_BAILOUT TBs.  */
-    tcg_debug_assert(!!(cflags & CF_BAILOUT_MASK) == !!bailout_info);
-
-    phys_pc = get_page_addr_code(env, pc);
-
-    if (phys_pc == -1) {
-        /* Generate a one-shot TB with 1 insn in it */
-        cflags = (cflags & ~CF_COUNT_MASK) | CF_MONOLITHIC | 1;
-    }
-
-    max_insns = cflags & CF_COUNT_MASK;
-    if (max_insns == 0) {
-        max_insns = CF_COUNT_MASK;
-    }
-    if (max_insns > TCG_MAX_INSNS) {
-        max_insns = TCG_MAX_INSNS;
-    }
-    if (cpu->singlestep_enabled || singlestep) {
-        max_insns = 1;
-    }
-
- buffer_overflow:
-    tb = tcg_tb_alloc(tcg_ctx);
-    if (unlikely(!tb)) {
-        /* flush must be done */
-        tb_flush(cpu);
-        mmap_unlock();
-        /* Make the execution loop process the flush as soon as possible.  */
-        cpu->exception_index = EXCP_INTERRUPT;
-        cpu_loop_exit(cpu);
-    }
-
-    /* Fill page_addr[0] here using the phyisical PC translated above,
-     * page_addr[1] will be filled in at translator_loop_tb_finalize().  */
-    if (phys_pc == -1) {
-        tb->page_addr[0] = -1;
-    } else {
-        tb->page_addr[0] = phys_pc & TARGET_PAGE_MASK;
-    }
-
-    gen_code_buf = tcg_ctx->code_gen_ptr;
-    tb->tc.ptr = gen_code_buf;
-    tb->pc = pc;
-    tb->cs_base = cs_base;
-    tb->flags = flags;
-    tb->cflags = cflags;
-    tb->trace_vcpu_dstate = *cpu->trace_dstate;
-    /* This will only be used by translator_loop(), BAILOUT_INFO would be
-     * made persistent before the TB is commited.  */
-    tb->bailout_info = bailout_info;
-    tb->exec_count = 0;
-    tcg_ctx->tb_cflags = cflags;
- tb_overflow:
-
-#ifdef CONFIG_PROFILER
-    /* includes aborted translations because of exceptions */
-    qatomic_set(&prof->tb_count1, prof->tb_count1 + 1);
-    ti = profile_getclock();
-#endif
-
-    gen_code_size = sigsetjmp(tcg_ctx->jmp_trans, 0);
-    if (unlikely(gen_code_size != 0)) {
-        goto error_return;
-    }
-
-    tcg_func_start(tcg_ctx);
-
-    tcg_ctx->cpu = env_cpu(env);
-    gen_intermediate_code(cpu, tb, max_insns);
-    tcg_ctx->cpu = NULL;
-    max_insns = tb->icount;
-
-    trace_translate_block(tb, tb->pc, tb->tc.ptr);
-
-    /* generate machine code */
-    tb->jmp_reset_offset[0] = TB_JMP_RESET_OFFSET_INVALID;
-    tb->jmp_reset_offset[1] = TB_JMP_RESET_OFFSET_INVALID;
-    tcg_ctx->tb_jmp_reset_offset = tb->jmp_reset_offset;
-    if (TCG_TARGET_HAS_direct_jump) {
-        tcg_ctx->tb_jmp_insn_offset = tb->jmp_target_arg;
-        tcg_ctx->tb_jmp_target_addr = NULL;
-    } else {
-        tcg_ctx->tb_jmp_insn_offset = NULL;
-        tcg_ctx->tb_jmp_target_addr = tb->jmp_target_arg;
-    }
-
-#ifdef CONFIG_PROFILER
-    qatomic_set(&prof->tb_count, prof->tb_count + 1);
-    qatomic_set(&prof->interm_time,
-                prof->interm_time + profile_getclock() - ti);
-    ti = profile_getclock();
-#endif
-
-    gen_code_size = tcg_gen_code(tcg_ctx, tb);
-    if (unlikely(gen_code_size < 0)) {
- error_return:
-        switch (gen_code_size) {
-        case -1:
-            /*
-             * Overflow of code_gen_buffer, or the current slice of it.
-             *
-             * TODO: We don't need to re-do gen_intermediate_code, nor
-             * should we re-do the tcg optimization currently hidden
-             * inside tcg_gen_code.  All that should be required is to
-             * flush the TBs, allocate a new TB, re-initialize it per
-             * above, and re-do the actual code generation.
-             */
-            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
-                          "Restarting code generation for "
-                          "code_gen_buffer overflow\n");
-            goto buffer_overflow;
-
-        case -2:
-            /*
-             * The code generated for the TranslationBlock is too large.
-             * The maximum size allowed by the unwind info is 64k.
-             * There may be stricter constraints from relocations
-             * in the tcg backend.
-             *
-             * Try again with half as many insns as we attempted this time.
-             * If a single insn overflows, there's a bug somewhere...
-             */
-            assert(max_insns > 1);
-            max_insns /= 2;
-            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
-                          "Restarting code generation with "
-                          "smaller translation block (max %d insns)\n",
-                          max_insns);
-            goto tb_overflow;
-
-        default:
-            g_assert_not_reached();
-        }
-    }
-    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
-    if (unlikely(search_size < 0)) {
-        goto buffer_overflow;
-    }
-    tb->tc.size = gen_code_size;
-
-#ifdef CONFIG_PROFILER
-    qatomic_set(&prof->code_time, prof->code_time + profile_getclock() - ti);
-    qatomic_set(&prof->code_in_len, prof->code_in_len + tb->size);
-    qatomic_set(&prof->code_out_len, prof->code_out_len + gen_code_size);
-    qatomic_set(&prof->search_out_len, prof->search_out_len + search_size);
-#endif
-
 #ifdef DEBUG_DISAS
     if (qemu_loglevel_mask(CPU_LOG_TB_OUT_ASM) &&
         qemu_log_in_addr_range(tb->pc)) {
         FILE *logfile = qemu_log_lock();
+        uint32_t gen_code_size = tb->tc.size;
         int code_size, data_size = 0;
         size_t chunk_start;
         int insn = 0;
@@ -1960,20 +1799,24 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
         qemu_log_unlock(logfile);
     }
 #endif
+}
 
-    qatomic_set(&tcg_ctx->code_gen_ptr, (void *)
-        ROUND_UP((uintptr_t)gen_code_buf + gen_code_size + search_size,
-                 CODE_GEN_ALIGN));
+TranslationBlock *tb_gen_code_finalize(TranslationBlock *tb)
+{
+    tb_page_addr_t phys_pc = tb->page_addr[0] + (tb->pc & ~TARGET_PAGE_MASK);
+    TranslationBlock *existing_tb;
 
-    /* init jump list */
+    tcg_log_tb_out_asm(tb);
+
+    /* Init jump list.  */
     qemu_spin_init(&tb->jmp_lock);
-    tb->jmp_list_head = (uintptr_t)NULL;
-    tb->jmp_list_next[0] = (uintptr_t)NULL;
-    tb->jmp_list_next[1] = (uintptr_t)NULL;
-    tb->jmp_dest[0] = (uintptr_t)NULL;
-    tb->jmp_dest[1] = (uintptr_t)NULL;
+    tb->jmp_list_head = (uintptr_t) NULL;
+    tb->jmp_list_next[0] = (uintptr_t) NULL;
+    tb->jmp_list_next[1] = (uintptr_t) NULL;
+    tb->jmp_dest[0] = (uintptr_t) NULL;
+    tb->jmp_dest[1] = (uintptr_t) NULL;
 
-    /* init original jump addresses which have been set during tcg_gen_code() */
+    /* Init original jump addresses set during tcg_gen_code().  */
     if (tb->jmp_reset_offset[0] != TB_JMP_RESET_OFFSET_INVALID) {
         tb_reset_jump(tb, 0);
     }
@@ -1987,7 +1830,7 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
      * except fill in the page_addr[] fields. Return early before
      * attempting to link to other TBs or add to the lookup table.
      */
-    if (phys_pc == -1) {
+    if (tb->page_addr[0] == -1) {
         return tb;
     }
 
@@ -1996,6 +1839,9 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
      * completion. Otherwise cpu_loop_exit() triggered in between may leak
      * memory.  */
     if (tb->cflags & CF_BAILOUT_MASK) {
+        TCGBailoutInfo *bailout_info;
+
+        tcg_debug_assert(!!(bailout_info = tb->bailout_info));
         tb->bailout_info = g_new(TCGBailoutInfo, 1);
         memcpy(tb->bailout_info, bailout_info, sizeof(TCGBailoutInfo));
     }
@@ -2014,14 +1860,182 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
     existing_tb = tb_link_page(tb, phys_pc, tb->page_addr[1]);
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
+        uintptr_t orig_aligned = (uintptr_t) tb->tc.ptr;
 
+        /* This must not be a trace TB, as it would need much more extra work
+         * to remove a trace. We'll avoid this by:
+         * 1. Making it impossible to have more than one thread trace 1 same
+         *    TB, by qatomic_inc_fetch() in profile_tb().
+         * 2. Making CF_MONOLITHIC TB and its !CF_MONOLITHIC counterpart able
+         *    to co-exist with each other when INSERTING (, and the other one
+         *    will be removed afterwards), and only one can be looked up from
+         *    QHT -- which also demands that CF_MONOLITHIC be ignored in TB
+         *    LOOKUP.  */
+        g_assert(!tcg_ctx->trace);
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        qatomic_set(&tcg_ctx->code_gen_ptr, (void *) orig_aligned);
         tcg_tb_remove(tb);
         return existing_tb;
     }
     return tb;
+}
+
+/* Called with mmap_lock held for user mode emulation.  */
+static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
+                                              target_ulong cs_base,
+                                              uint32_t flags, uint32_t cflags,
+                                              TCGBailoutInfo *bailout_info)
+{
+    CPUArchState *env = cpu->env_ptr;
+    TranslationBlock *tb;
+    tb_page_addr_t phys_pc;
+    int search_size, max_insns;
+#ifdef CONFIG_PROFILER
+    TCGProfile *prof = &tcg_ctx->prof;
+    int64_t ti;
+#endif
+
+    assert_memory_lock();
+
+    /* BAILOUT_INFO shall be attached to and only to CF_BAILOUT TBs.  */
+    tcg_debug_assert(!!(cflags & CF_BAILOUT_MASK) == !!bailout_info);
+
+    phys_pc = get_page_addr_code(env, pc);
+
+    if (phys_pc == -1) {
+        /* Generate a one-shot TB with 1 insn in it */
+        cflags = (cflags & ~CF_COUNT_MASK) | CF_MONOLITHIC | 1;
+    }
+
+    max_insns = cflags & CF_COUNT_MASK;
+    if (max_insns == 0) {
+        max_insns = CF_COUNT_MASK;
+    }
+    if (max_insns > TCG_MAX_INSNS) {
+        max_insns = TCG_MAX_INSNS;
+    }
+    if (cpu->singlestep_enabled || singlestep) {
+        max_insns = 1;
+    }
+
+ buffer_overflow:
+    tb = tcg_tb_alloc(tcg_ctx);
+    if (unlikely(!tb)) {
+        /* flush must be done */
+        tb_flush(cpu);
+        mmap_unlock();
+        /* Make the execution loop process the flush as soon as possible.  */
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit(cpu);
+    }
+
+    /* Fill page_addr[0] here using the phyisical PC translated above,
+     * page_addr[1] will be filled in at translator_loop_tb_finalize().  */
+    if (phys_pc == -1) {
+        tb->page_addr[0] = -1;
+    } else {
+        tb->page_addr[0] = phys_pc & TARGET_PAGE_MASK;
+        /* Assert that one can recover PHYS_PC using PAGE_ADDR[0] and
+         * low-bits of TB virtual address, i.e. TB->PC.  */
+        tcg_debug_assert(phys_pc ==
+                         tb->page_addr[0] + (pc & ~TARGET_PAGE_MASK));
+    }
+
+    tb->tc.ptr = tcg_ctx->code_gen_ptr;
+    tb->pc = pc;
+    tb->cs_base = cs_base;
+    tb->flags = flags;
+    tb->cflags = cflags;
+    tb->trace_vcpu_dstate = *cpu->trace_dstate;
+    /* This will only be used by translator_loop(), BAILOUT_INFO would be
+     * made persistent before the TB is commited.  */
+    tb->bailout_info = bailout_info;
+    tb->exec_count = 0;
+    tcg_ctx->tb_cflags = cflags;
+ tb_overflow:
+
+#ifdef CONFIG_PROFILER
+    /* includes aborted translations because of exceptions */
+    qatomic_set(&prof->tb_count1, prof->tb_count1 + 1);
+    ti = profile_getclock();
+#endif
+
+    search_size = sigsetjmp(tcg_ctx->jmp_trans, 0);
+    if (unlikely(search_size != 0)) {
+        goto error_return;
+    }
+
+    tcg_func_start(tcg_ctx);
+
+    tcg_ctx->cpu = env_cpu(env);
+    gen_intermediate_code(cpu, tb, max_insns);
+    tcg_ctx->cpu = NULL;
+    max_insns = tb->icount;
+
+    trace_translate_block(tb, tb->pc, tb->tc.ptr);
+
+#ifdef CONFIG_PROFILER
+    qatomic_set(&prof->tb_count, prof->tb_count + 1);
+    qatomic_set(&prof->interm_time,
+                prof->interm_time + profile_getclock() - ti);
+    ti = profile_getclock();
+#endif
+
+    tcg_pre_gen_code__cold(tcg_ctx, tb);
+
+    search_size = tcg_gen_code(tcg_ctx, tb);
+    if (unlikely(search_size < 0)) {
+ error_return:
+        switch (search_size) {
+        case -1:
+            /*
+             * Overflow of code_gen_buffer, or the current slice of it.
+             *
+             * TODO: We don't need to re-do gen_intermediate_code, nor
+             * should we re-do the tcg optimization currently hidden
+             * inside tcg_gen_code.  All that should be required is to
+             * flush the TBs, allocate a new TB, re-initialize it per
+             * above, and re-do the actual code generation.
+             */
+            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                          "Restarting code generation for "
+                          "code_gen_buffer overflow\n");
+            goto buffer_overflow;
+
+        case -2:
+            /*
+             * The code generated for the TranslationBlock is too large.
+             * The maximum size allowed by the unwind info is 64k.
+             * There may be stricter constraints from relocations
+             * in the tcg backend.
+             *
+             * Try again with half as many insns as we attempted this time.
+             * If a single insn overflows, there's a bug somewhere...
+             */
+            assert(max_insns > 1);
+            max_insns /= 2;
+            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                          "Restarting code generation with "
+                          "smaller translation block (max %d insns)\n",
+                          max_insns);
+            goto tb_overflow;
+
+        default:
+            g_assert_not_reached();
+        }
+    }
+    qatomic_set(&tcg_ctx->code_gen_ptr, (void *)
+                ROUND_UP((uintptr_t) tb->tc.ptr + tb->tc.size + search_size,
+                         CODE_GEN_ALIGN));
+
+#ifdef CONFIG_PROFILER
+    qatomic_set(&prof->code_time, prof->code_time + profile_getclock() - ti);
+    qatomic_set(&prof->code_in_len, prof->code_in_len + tb->size);
+    qatomic_set(&prof->code_out_len, prof->code_out_len + tb->tc.size);
+    qatomic_set(&prof->search_out_len, prof->search_out_len + search_size);
+#endif
+
+    return tb_gen_code_finalize(tb);
 }
 
 TranslationBlock *tb_gen_code(CPUState *cpu, target_ulong pc,

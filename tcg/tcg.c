@@ -4396,18 +4396,59 @@ int64_t tcg_cpu_exec_time(void)
 }
 #endif
 
-
-int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
+static void tcg_optimize__common(TCGContext *s, target_ulong pc)
 {
 #ifdef CONFIG_PROFILER
     TCGProfile *prof = &s->prof;
+
+    qatomic_set(&prof->la_time, prof->la_time - profile_getclock());
 #endif
-    int i, num_insns;
-    TCGOp *op;
+
+    reachable_code_pass(s);
+    liveness_pass_1(s);
+
+    if (s->nb_indirects > 0) {
+#ifdef DEBUG_DISAS
+        if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_IND)
+                     && qemu_log_in_addr_range(pc))) {
+            FILE *logfile = qemu_log_lock();
+            qemu_log("OP before indirect lowering:\n");
+            tcg_dump_ops(s, false);
+            qemu_log("\n");
+            qemu_log_unlock(logfile);
+        }
+#endif
+        /* Replace indirect temps with direct temps.  */
+        if (liveness_pass_2(s)) {
+            /* If changes were made, re-run liveness.  */
+            liveness_pass_1(s);
+        }
+    }
 
 #ifdef CONFIG_PROFILER
+    qatomic_set(&prof->la_time, prof->la_time + profile_getclock());
+#endif
+
+#ifdef DEBUG_DISAS
+    if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
+                 && qemu_log_in_addr_range(pc))) {
+        FILE *logfile = qemu_log_lock();
+        qemu_log("OP after optimization and liveness analysis:\n");
+        tcg_dump_ops(s, true);
+        qemu_log("\n");
+        qemu_log_unlock(logfile);
+    }
+#endif
+}
+
+void tcg_pre_gen_code__cold(TCGContext *s, TranslationBlock *tb)
+{
+#ifdef CONFIG_PROFILER
+    TCGProfile *prof = &s->prof;
+
     {
         int n = 0;
+        TCGOp *op;
 
         QTAILQ_FOREACH(op, &s->ops, link) {
             n++;
@@ -4472,44 +4513,30 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
 
 #ifdef CONFIG_PROFILER
     qatomic_set(&prof->opt_time, prof->opt_time + profile_getclock());
-    qatomic_set(&prof->la_time, prof->la_time - profile_getclock());
 #endif
 
-    reachable_code_pass(s);
-    liveness_pass_1(s);
+    tcg_optimize__common(s, tb->pc);
+}
 
-    if (s->nb_indirects > 0) {
-#ifdef DEBUG_DISAS
-        if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_IND)
-                     && qemu_log_in_addr_range(tb->pc))) {
-            FILE *logfile = qemu_log_lock();
-            qemu_log("OP before indirect lowering:\n");
-            tcg_dump_ops(s, false);
-            qemu_log("\n");
-            qemu_log_unlock(logfile);
-        }
-#endif
-        /* Replace indirect temps with direct temps.  */
-        if (liveness_pass_2(s)) {
-            /* If changes were made, re-run liveness.  */
-            liveness_pass_1(s);
-        }
-    }
-
+int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
+{
 #ifdef CONFIG_PROFILER
-    qatomic_set(&prof->la_time, prof->la_time + profile_getclock());
+    TCGProfile *prof = &s->prof;
 #endif
+    int i, num_insns;
+    TCGOp *op;
 
-#ifdef DEBUG_DISAS
-    if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
-                 && qemu_log_in_addr_range(tb->pc))) {
-        FILE *logfile = qemu_log_lock();
-        qemu_log("OP after optimization and liveness analysis:\n");
-        tcg_dump_ops(s, true);
-        qemu_log("\n");
-        qemu_log_unlock(logfile);
+    /* Prepare for machine code generation.  */
+    tb->jmp_reset_offset[0] = TB_JMP_RESET_OFFSET_INVALID;
+    tb->jmp_reset_offset[1] = TB_JMP_RESET_OFFSET_INVALID;
+    s->tb_jmp_reset_offset = tb->jmp_reset_offset;
+    if (TCG_TARGET_HAS_direct_jump) {
+        s->tb_jmp_insn_offset = tb->jmp_target_arg;
+        s->tb_jmp_target_addr = NULL;
+    } else {
+        s->tb_jmp_insn_offset = NULL;
+        s->tb_jmp_target_addr = tb->jmp_target_arg;
     }
-#endif
 
     tcg_reg_alloc_start(s);
 
@@ -4628,7 +4655,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     /* flush instruction cache */
     flush_icache_range((uintptr_t)s->code_buf, (uintptr_t)s->code_ptr);
 
-    return tcg_current_code_size(s);
+    tb->tc.size = tcg_current_code_size(s);
+    return encode_search(tb, tb->tc.ptr + tb->tc.size);
 }
 
 void tcg_tracer_reset(void)
