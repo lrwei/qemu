@@ -723,6 +723,8 @@ re_enter_tb:
                 skip_prologue = true;
                 goto re_enter_tb;
             }
+            /* The IR sequence should have been fully processed, if any.  */
+            tcg_debug_assert(!tcg_ctx->head_tb || !tcg_ctx->cont.op_start);
             tcg_tracer_commit_trace();
         }
         tcg_debug_assert(!tcg_ctx->trace);

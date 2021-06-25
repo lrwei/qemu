@@ -62,7 +62,12 @@ static void translator_loop_tb_finalize(CPUArchState *env, TranslationBlock *tb)
             }
         }
     } else {
-        g_assert_not_reached();
+        op = tcg_ctx->cont.op_start ?: QTAILQ_FIRST(&tcg_ctx->ops);
+        QTAILQ_FROM_TO(op, op, NULL, link) {
+            if (op->opc == INDEX_op_insn_start) {
+                break;
+            }
+        }
     }
 
     tcg_insert_itlb_check_stub(tcg_ctx, op, tb, false);
@@ -101,7 +106,9 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
          * get corresponding values through tb->flags (so restoration only
          * need to happen once at compile time). However, there does exist
          * situations where this restoration is necessary, e.g. CC_OP for
-         * x86 target.  */
+         * x86 target.
+         * Note that CF_BAILOUT trace needs to rewrite    THIS    to real
+         * trace TB on finalizing.                     vvvvvvvvvv  */
         gen_helper_restore_state_from_bailout(cpu_env, bailout_tb);
 
         /* CF_BAILOUT_1 stands for bailout for TLB_GUARD, which by definition
@@ -123,9 +130,8 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
             break;
         case CF_BAILOUT_2:
         case CF_BAILOUT_3:
-            g_assert_not_reached();
             if (!tcg_ctx->trace) {
-                // gen_helper_profile_tb(cpu_env, bailout_tb);
+                gen_helper_profile_tb(cpu_env, bailout_tb);
                 gen_tb_start(db->tb);
                 tb_start_emitted = true;
             }

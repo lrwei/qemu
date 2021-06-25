@@ -46,6 +46,7 @@
 #endif
 
 #include "tcg/tcg-op.h"
+#include "exec/gen-icount.h"
 
 #if UINTPTR_MAX == UINT32_MAX
 # define ELF_CLASS  ELFCLASS32
@@ -809,6 +810,8 @@ void tcg_register_thread(void)
     err = tcg_region_initial_alloc__locked(tcg_ctx);
     g_assert(!err);
     qemu_mutex_unlock(&region.lock);
+
+    tcg_ctx->tb_set = g_hash_table_new(NULL, NULL);
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -1153,14 +1156,29 @@ void tcg_func_start(TCGContext *s)
     QSIMPLEQ_INIT(&s->labels);
 }
 
+static void tcg_signal_tb_overflow__siglongjmp(TCGContext *s)
+{
+    if (!s->trace) {
+        /* Signal overflow, starting over with fewer guest insns.  */
+        siglongjmp(s->jmp_trans, -2);
+    } else {
+        /* Too bad that it's almost impossible to fix in trace recording mode
+         * since retranslation is necessary. Expected to be really hurt.  */
+        qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                      "Exit cpu loop due to TB overflow within trace recording "
+                      "mode (nb_temps: %d)\n", s->nb_temps);
+        s->head_tb = NULL;
+        cpu_loop_exit_noexc(current_cpu);
+    }
+}
+
 static TCGTemp *tcg_temp_alloc(TCGContext *s, TCGType type, TCGTempKind kind)
 {
     uint32_t n = s->nb_temps++;
     TCGTemp *ts = &s->temps[n];
 
     if (unlikely(n >= TCG_MAX_TEMPS)) {
-        /* Signal overflow, starting over with fewer guest insns.  */
-        siglongjmp(s->jmp_trans, -2);
+        tcg_signal_tb_overflow__siglongjmp(s);
     }
     memset(ts, 0, offsetof(TCGTemp, end_reset_fields));
     ts->type = type;
@@ -3313,8 +3331,7 @@ static void temp_allocate_frame(TCGContext *s, TCGTemp *ts)
 #endif
     if (s->current_frame_offset + (tcg_target_long)sizeof(tcg_target_long) >
         s->frame_end) {
-        /* Overflow of stack slot, starting over with fewer guest insns.  */
-        siglongjmp(s->jmp_trans, -2);
+        tcg_signal_tb_overflow__siglongjmp(s);
     }
     ts->mem_offset = s->current_frame_offset;
     ts->mem_base = s->frame_temp;
@@ -4632,7 +4649,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             return -2;
         }
     }
-    tcg_debug_assert(num_insns >= 0);
+    if (!s->trace) {
+        tcg_debug_assert(num_insns + 1 == tb->icount);
+    } else {
+        tb->icount = num_insns + 1;
+    }
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
@@ -4665,19 +4686,121 @@ void tcg_tracer_reset(void)
         return;
     }
     tcg_ctx->trace = false;
-    /* Clean up all resources allocated for tracing and reset
-     * relevant states.  */
-    g_assert_not_reached();
+    /* Resetting HEAD_TB suffices to do the clean up, everything else will
+     * be re-initialized the next time TCG enters trace recording mode.  */
+    if (tcg_ctx->head_tb) {
+        /* Do not waste if not explicitly nullified (which express the intent
+         * of forbidding further recording starting from here, as its counter
+         * has expired).  */
+        qatomic_set(&tcg_ctx->head_tb->exec_count, PROFILE_THRESHOLD - 5);
+        tcg_ctx->head_tb = NULL;
+    }
 }
 
+static inline bool is_decent_tb_for_tracing(const TranslationBlock *tb)
+{
+    uint32_t cflags = tb_cflags(tb);
+    return likely((cflags & CF_MONOLITHIC) && // !(cflags & CF_BLACKLIST) &&
+                  (tb->page_addr[0] != -1));
+}
+
+/* Return true if the trace recording mode should continue,
+ * otherwise false with IR sequence ready to do codegen.  */
 bool tcg_tracer_retranslate_tb(CPUState *cpu, TranslationBlock *tb)
 {
-    g_assert_not_reached();
+    TCGContext *s = tcg_ctx;
+    uint16_t size = tb->size, icount = tb->icount;
+
+    /* Use s->head_tb to indicate whether or not the tracer state has been
+     * initialized, note that its being nonnull stands for "IR sequence is
+     * valid, please do codegen", so be careful when write to it.  */
+    if (!s->head_tb) {
+        if (!is_decent_tb_for_tracing(tb)) {
+            return false;
+        }
+        s->head_tb = tb;
+        memset(&s->cont, 0, sizeof(s->cont));
+        g_hash_table_remove_all(s->tb_set);
+        tcg_func_start(s);
+        /* CF_BAILOUT trace doesn't need a interrupt checking stub, with reason
+         * similar to that of CF_BAILOUT_1 TB:
+         * 1. Trace recording must have stopped before, as CF_BAILOUT trace is
+         *    side-exit of some existing trace. No need to worry about tracing
+         *    into existing traces.
+         * 2. CF_BAILOUT traces themselves can't form loop.
+         * This makes us able to find "CALL restore_state_from_bailout" at the
+         * very entry of the trace, whose parameter needs to be updated.  */
+        if (!(tb_cflags(tb) & CF_BAILOUT_MASK)) {
+            /* It doesn't matter which TB we are using.  */
+            tcg_debug_assert(!(tb_cflags(tb) & CF_USE_ICOUNT));
+            gen_tb_start(tb);
+        }
+        /* Re-translate the incoming TB, using !monolithic QEMU_{LD, ST}.  */
+        s->tb_cflags = tb_cflags(tb) & ~(CF_MONOLITHIC | CF_BAILOUT_MASK);
+    } else {
+#ifdef CONFIG_DEBUG_TCG
+        /* To prevent previously issued GOTO_TB from disturbing this one.  */
+        s->goto_tb_issue_mask = 0;
+#endif
+    }
+
+    /* Reject the TB if:
+     * 1. The TB is already a trace head or has been blacklisted, or isn't
+     *    backed by ordinary RAM memory area, i.e. not decent.
+     * 2. CS_BASE or FLAGS differ from that of the head TB, given that any
+     *    previous EXIT_TB(0) would have already terminated the trace, it's
+     *    quite weird that this should happen. Known exception is related
+     *    to RISC-V mark_fs_dirty().
+     * 3. Loop back to existing TB collected in the trace is detected.  */
+    if (!is_decent_tb_for_tracing(tb) ||
+        tb->cs_base != s->head_tb->cs_base || tb->flags != s->head_tb->flags ||
+        !g_hash_table_add(s->tb_set, tb)) {
+        /* XXX: Unconditional constant lookup_tb_ptr may be substituted by
+         * iTLB checking stub and a direct jump (GOTO_TB + EXIT_TB maybe),
+         * if the target is legal. This may help if the target is entry of
+         * a function call and has been traced.  */
+        goto done_trace_recording;
+    }
+    /* This probably should be the same.  */
+    tcg_debug_assert(s->tb_cflags == (tb_cflags(tb) & ~CF_MONOLITHIC));
+
+    tcg_debug_assert((s->cpu = cpu) == current_cpu);
+    gen_intermediate_code(cpu, tb, tb->icount);
+    s->cpu = NULL;
+    /* These probably should not be changed during tracing.  */
+    tcg_debug_assert(tb->size == size && tb->icount == icount);
+
+    /* Adapt previous TB epilogue to the newly recorded TB.  */
+    tcg_opt_prune_previous_exit_stub(s, tb);
+
+    /* Trace has reached to its length limit.  */
+    if (g_hash_table_size(s->tb_set) == TRACE_LENGTH_THRESHOLD) {
+        goto done_trace_recording;
+    }
+    return tcg_optimize__warm(s);
+
+done_trace_recording:
+    tcg_optimize__whatever_is_left(s, &s->cont);
+    return false;
 }
 
 TranslationBlock *tcg_tracer_commit_trace(void)
 {
+    TCGContext *s = tcg_ctx;
+    TranslationBlock *tb = NULL;
+
+    tcg_debug_assert(tcg_ctx->trace);
+
+    if (unlikely(!s->head_tb)) {
+        goto exit_turn_off_trace_recording;
+    } else if (s->cont.op_start) {
+        tcg_optimize__whatever_is_left(s, &s->cont);
+    }
     g_assert_not_reached();
+
+exit_turn_off_trace_recording:
+    s->trace = false;
+    return tb;
 }
 
 #ifdef CONFIG_PROFILER

@@ -573,7 +573,8 @@ static inline bool use_monolithic_ldst(void)
     return unlikely(!!(tcg_ctx->tb_cflags & CF_MONOLITHIC));
 }
 
-#define PROFILE_THRESHOLD 0x50
+#define PROFILE_THRESHOLD       0x50
+#define TRACE_LENGTH_THRESHOLD  0x20
 
 static inline void profile_tb(CPUArchState *env, TranslationBlock *tb)
 {

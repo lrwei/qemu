@@ -1967,7 +1967,7 @@ static TranslationBlock *tb_gen_code_internal(CPUState *cpu, target_ulong pc,
 
     tcg_func_start(tcg_ctx);
 
-    tcg_ctx->cpu = env_cpu(env);
+    tcg_debug_assert((tcg_ctx->cpu = cpu) == current_cpu);
     gen_intermediate_code(cpu, tb, max_insns);
     tcg_ctx->cpu = NULL;
     max_insns = tb->icount;

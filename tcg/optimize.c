@@ -2773,6 +2773,17 @@ insert_profile_stub:
     TCGOP_CALLI(op) = 2;
 }
 
+void tcg_optimize__whatever_is_left(TCGContext *s, TCGOptContinuation *cont)
+{
+    tcg_opt_convert_to_ssa_and_peephole(s, cont->op_start, NULL,
+                                        cont->nb_temps);
+    /* Signifies the completion of basic optimization on IR sequence collected
+     * during trace recording mode. To be checked by tcg_tracer_commit_trace(),
+     * otherwise it has to finalize the IR sequence before further codegen.  */
+    cont->op_start = NULL;
+    cont->nb_temps = s->nb_temps;
+}
+
 void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb)
 {
     TCGOptContinuation cont = { .op_start = NULL, .nb_temps = 0 };
@@ -2782,7 +2793,30 @@ void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb)
         return;
     }
     insert_profile_stub_if_needed(s, tb, cont.op_start);
-    tcg_opt_convert_to_ssa_and_peephole(s, cont.op_start, NULL, cont.nb_temps);
+    tcg_optimize__whatever_is_left(s, &cont);
+}
+
+bool tcg_optimize__warm(TCGContext *s)
+{
+    TCGTemp *targets[2] = { NULL, NULL };
+    TCGExitStubType type;
+
+    tcg_debug_assert(!use_monolithic_ldst());
+    if (!tcg_opt_basic_pass(s, &s->cont)) {
+        return false;
+    }
+    type = tcg_opt_extract_exit_targets(s->cont.op_start, targets);
+    if (!targets[0] || !ts_is_const(targets[0])) {
+        tcg_debug_assert(type & STUB_HAS_LOOKUP_TB_PTR);
+        tcg_optimize__whatever_is_left(s, &s->cont);
+        return false;
+    }
+    /* Trace recording terminates when:
+     * 1. Exit stub can't be identified,
+     * 2. Exit stub is indirect branch with PC updated explicitly or implicitly.
+     * Remaining IR are fully processed under both cases. Otherwise, proceed to
+     * retranslate the next TB.  */
+    return true;
 }
 
 void tcg_insert_itlb_check_stub(TCGContext *s, TCGOp *op, TranslationBlock *tb,
@@ -2815,6 +2849,146 @@ void tcg_insert_itlb_check_stub(TCGContext *s, TCGOp *op, TranslationBlock *tb,
     op->args[0] = QTAILQ_PREV(op, link)->args[0];
     op->args[1] = tcg_constant_arg_new(TCG_TYPE_PTR, 1 | phys_page);
     op->args[2] = tcg_constant_arg_new(TCG_TYPE_TL, virt_page);
+}
+
+static bool need_insert_itlb_check_stub(TCGOp *op_brcond, bool examine_taken)
+{
+    TCGOp *op = QTAILQ_NEXT(op_brcond, link);
+
+    if (examine_taken) {
+        QTAILQ_FROM_TO(op, op, NULL, link) {
+            if (op_cast(op, insn_start)) {
+                break;
+            }
+            if (op_cast(op, set_label)) {
+                op = QTAILQ_NEXT(op, link);
+                goto test_if_not_goto_tb;
+            }
+        }
+        g_assert_not_reached();
+    }
+test_if_not_goto_tb:
+    /* With OP pointing to the start of the examined half of the exit stub,
+     * one needs only to test whether it was done originally using GOTO_TB.  */
+    return !op_cast(op, goto_tb);
+}
+
+static TCGOp *tcg_opt_gen_brcond_guard(TCGContext *s, TCGOp *op_insn_start,
+                                       TCGOp *op_brcond, bool brcond_taken,
+                                       target_ulong pc_not_traced)
+{
+    TCGOpcode opc = op_cast(op_brcond, brcond_i32) ? INDEX_op_brcond_guard_i32
+                                                   : INDEX_op_brcond_guard_i64;
+    TCGOp *op;
+
+    op = tcg_op_insert_before(s, op_insn_start, opc);
+    op->args[0] = op_brcond->args[0];
+    op->args[1] = op_brcond->args[1];
+    op->args[2] = brcond_taken ? op_brcond->args[2]
+                               : tcg_invert_cond(op_brcond->args[2]);
+    /* It could be that the targeted bailout page has already been touched
+     * above in the trace, but that needs yet another optimization pass to
+     * propagate those information.  */
+    op->args[3] = need_insert_itlb_check_stub(op_brcond, !brcond_taken);
+
+    /* INSN_START paired with the BRCOND_GUARD, records PC of NOT traced
+     * half of the branch, so that execution could be restored correctly
+     * on possible bailout.  */
+    op = tcg_op_insert_before(s, op, INDEX_op_insn_start);
+    op->args[0] = pc_not_traced;
+    /* Arguments except for PC are copied direct from the first INSN_START
+     * of the next TB, this is justified by that TBFLAGS isn't affected by
+     * PC (at least for x86(_64), ARM, and RISC-V), hence the direction of
+     * brcond will have no affect on TBFLAGS. This macro should be defined
+     * in "cpu.h" which is in turn included in "exec/exec-all.h".  */
+#ifdef TARGET_INSN_START_EXTRA_WORDS
+    memcpy(&op->args[1], &op_insn_start->args[1],
+           sizeof(target_ulong) * TARGET_INSN_START_EXTRA_WORDS);
+#endif
+    return op;
+}
+
+void tcg_opt_prune_previous_exit_stub(TCGContext *s, TranslationBlock *tb)
+{
+    TCGOp *op_exit_stub = s->cont.op_start, *op, *op_next;
+    TCGTemp *targets[2] = { NULL, NULL };
+    target_ulong next_ip = tb->pc - tb->cs_base;
+    TCGExitStubType type;
+
+    /* Trace is still empty, no exit stub to prune.  */
+    if (!op_exit_stub) {
+        tcg_debug_assert(s->cont.nb_temps == 0);
+        return;
+    }
+
+    QTAILQ_FROM_TO(op, QTAILQ_NEXT(op_exit_stub, link), NULL, link) {
+        if (op_cast(op, insn_start)) {
+            break;
+        }
+    }
+    /* | op_exit_stub | <- CONT.OP_START
+     * |     ...      |
+     * |   stub_end   |
+     * ^^^^^^^^^^^^^^^^ END OF LAST TB
+     * |  insn_start  | <- OP pointing to the fist insn_start of
+     * | ir_of_nexttb |    the next TB.  */
+    tcg_debug_assert(op_cast(op, insn_start));
+    tcg_debug_assert(op_cast(QTAILQ_PREV(op, link), exit_tb) ||
+                     op_cast(QTAILQ_PREV(op, link), goto_ptr));
+
+    type = tcg_opt_extract_exit_targets(op_exit_stub, targets);
+    if (type & STUB_IS_CONDITIONAL) {
+        bool brcond_taken = next_ip == ts_value(targets[1]);
+        target_ulong pc_not_traced = ts_value(targets[!brcond_taken]) +
+                                     tb->cs_base;
+
+        tcg_debug_assert(next_ip == ts_value(targets[0]) || brcond_taken);
+
+        /* Insert BRCOND_GUARD before the next TB according to the
+         * traced branching result:
+         * | op_exit_stub |
+         * |     ...      |
+         * |   stub_end   |
+         * ^^^^^^^^^^^^^^^^ END OF LAST TB
+         * | insn_start_2 | <- CONT.OP_START
+         * | brcond_guard |
+         * |  insn_start  | <- OP
+         * (  itlb_check  )
+         * | ir of nexttb | */
+        s->cont.op_start = tcg_opt_gen_brcond_guard(s, op, op_exit_stub,
+                                                    brcond_taken,
+                                                    pc_not_traced);
+        if (need_insert_itlb_check_stub(op_exit_stub, brcond_taken)) {
+            /* Insert ITLB_CHECK after INSN_START of the incoming TB, to
+             * guarantee correct CPU state restore on bailout. Ones that
+             * are redundant will be eliminated by later pass.  */
+            tcg_insert_itlb_check_stub(s, op, tb, true);
+        }
+    } else {
+        /* Insert ITLB_CHECK after the first INSN_START, as described above:
+         * | op_exit_stub |
+         * |     ...      |
+         * |   stub_end   |
+         * ^^^^^^^^^^^^^^^^ END OF LAST TB
+         * |  insn_start  | <- OP, CONT.OP_START
+         * (  itlb_check  )
+         * | ir of nexttb | */
+        s->cont.op_start = op;
+
+        /* Exit stub with unidentifiable PC updation, or indirection ones
+         * should have terminated trace recording.  */
+        tcg_debug_assert(ts_value(targets[0]) == next_ip);
+        if (type & STUB_HAS_LOOKUP_TB_PTR) {
+            tcg_insert_itlb_check_stub(s, op, tb, true);
+        } else {
+            /* Do nothing.  */
+        }
+    }
+
+    /* Prune exit stub of the previous TB.  */
+    QTAILQ_FROM_TO_SAFE(op, op_exit_stub, s->cont.op_start, link, op_next) {
+        tcg_op_remove(s, op);
+    }
 }
 
 void tcg_optimize(TCGContext *s)

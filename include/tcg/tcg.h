@@ -719,6 +719,12 @@ typedef struct TCGContext {
 
     /* Whether or not TCG is in tracing mode. Should start up in FALSE.  */
     bool trace;
+    /* Trace head of execution trace currently being recorded.  */
+    TranslationBlock *head_tb;
+    /* Continuation used by tcg_opt_convert_to_ssa_and_peephole().  */
+    TCGOptContinuation cont;
+    /* Hash set used to record all TB collected so far.  */
+    GHashTable *tb_set;
 } TCGContext;
 
 static inline bool temp_readonly(TCGTemp *ts)
@@ -1104,9 +1110,12 @@ TCGOp *tcg_op_insert_before(TCGContext *s, TCGOp *op, TCGOpcode opc);
 TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op, TCGOpcode opc);
 
 void tcg_optimize(TCGContext *s);
+void tcg_optimize__whatever_is_left(TCGContext *s, TCGOptContinuation *cont);
 void tcg_optimize__cold(TCGContext *s, TranslationBlock *tb);
+bool tcg_optimize__warm(TCGContext *s);
 void tcg_insert_itlb_check_stub(TCGContext *s, TCGOp *op, TranslationBlock *tb,
                                 bool check_branch_to_tb);
+void tcg_opt_prune_previous_exit_stub(TCGContext *s, TranslationBlock *tb);
 
 /* Allocate a new temporary and initialize it with a constant. */
 TCGv_i32 tcg_const_i32(int32_t val);
