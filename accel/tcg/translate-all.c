@@ -332,7 +332,7 @@ int encode_search(TranslationBlock *tb, uint8_t *block)
     return p - block;
 }
 
-static bool reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
+static void reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
                                   uintptr_t searched_pc, uint16_t *pnum_insns,
                                   target_ulong data[TARGET_INSN_START_WORDS])
 {
@@ -341,9 +341,7 @@ static bool reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
     int i, j;
 
     searched_pc -= GETPC_ADJ;
-    if (searched_pc < host_pc) {
-        return false;
-    }
+    g_assert(searched_pc >= host_pc);
 
     data[0] = tb->pc;
     /* Reconstruct the stored insn data while looking for the point
@@ -355,17 +353,17 @@ static bool reconstruct_insn_data(CPUState *cpu, TranslationBlock *tb,
         host_pc += decode_sleb128(&p);
         if (host_pc > searched_pc) {
             *pnum_insns = i;
-            return true;
+            return;
         }
     }
-    return false;
+    g_assert_not_reached();
 }
 
 /* The cpu state corresponding to 'searched_pc' is restored.
  * When reset_icount is true, current TB will be interrupted and
  * icount should be recalculated.
  */
-static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+static void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
                                       uintptr_t searched_pc, bool reset_icount)
 {
     target_ulong data[TARGET_INSN_START_WORDS] = { };
@@ -375,9 +373,7 @@ static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
     int64_t ti = profile_getclock();
 #endif
 
-    if (!reconstruct_insn_data(cpu, tb, searched_pc, &icount, data)) {
-        return false;
-    }
+    reconstruct_insn_data(cpu, tb, searched_pc, &icount, data);
 
     if (reset_icount && (tb_cflags(tb) & CF_USE_ICOUNT)) {
         assert(icount_enabled());
@@ -392,7 +388,6 @@ static bool cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
                 prof->restore_time + profile_getclock() - ti);
     qatomic_set(&prof->restore_count, prof->restore_count + 1);
 #endif
-    return true;
 }
 
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
@@ -2353,7 +2348,7 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
 
     /* On MIPS and SH, delay slot instructions can only be restarted if
        they were already the first instruction in the TB.  If this is not
@@ -2407,7 +2402,7 @@ void cpu_rescue_itlb_check_failure(CPUState *cpu, uintptr_t retaddr)
                   "cpu_rescue_itlb_check_failure: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
     tb_phys_invalidate(tb, false);
 
     /* All ITLB_CHECK is guarded by SIDE_EFFECTS op for the time being,
@@ -2433,7 +2428,7 @@ void cpu_rescue_speculation_failure(CPUState *cpu, uintptr_t retaddr)
                   "cpu_rescue_speculation_failure: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    tcg_debug_assert(cpu_restore_state_from_tb(cpu, tb, retaddr, true));
+    cpu_restore_state_from_tb(cpu, tb, retaddr, true);
 }
 
 static bool bailout_info_finalize(TCGBailoutInfo *pinfo, TranslationBlock *tb,
@@ -2478,7 +2473,7 @@ uintptr_t cpu_rescue_guard_failure(uintptr_t retaddr, uint32_t bailout_n,
                   "cpu_rescue_guard_failure: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    tcg_debug_assert(reconstruct_insn_data(cpu, tb, retaddr, &_, info.data));
+    reconstruct_insn_data(cpu, tb, retaddr, &_, info.data);
     restore_state_to_opc(env, tb, info.data);
 
     if (bailout_info_finalize(&info, tb, retaddr, &jump_target)) {
