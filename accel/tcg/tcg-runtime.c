@@ -168,3 +168,21 @@ void HELPER(exit_atomic)(CPUArchState *env)
 {
     cpu_loop_exit_atomic(env_cpu(env), GETPC());
 }
+
+void HELPER(restore_state_from_tb)(CPUArchState *env, void *tb)
+{
+    TCGBailoutInfo *info = tb_bailout_info(tb);
+
+    /* Restoration of state should be idempotent. As it will be called twice
+     * when execution bails out from certain site for the first time -- both
+     * within cpu_restore_state_from_tb(), and here in the beginning of the
+     * corresponding CF_BAILOUT TB.
+     * Note that restore_state_to_opc() originally accept TB within which
+     * the bailout happens as the 2nd argument, while we pass BAILOUT_TB
+     * here. This will work at least for riscv, arm, and x86_64 frontends,
+     * both of riscv and arm frontend ignore the TB argument, and x86_64
+     * uses CS_BASE of the TB, which must be equal to that of BAILOUT_TB.
+     * In fact, any change of "special" attributes of a TB (like those to
+     * be used here) should have terminated the TB immediately.  */
+    restore_state_to_opc(env, tb, info->data);
+}

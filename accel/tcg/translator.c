@@ -93,6 +93,18 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     tcg_clear_temp_count();
 
     /* Start translating.  */
+    if (tb->cflags & CF_BAILOUT) {
+        TCGv_ptr bailout_tb = tcg_const_ptr((uintptr_t) tb);
+
+        /* BAILOUT TBs shall restore state at TB entry. Most targets don't
+         * care the correctness of the state within the middle of TB, and
+         * get corresponding values through tb->flags (so restoration only
+         * need to happen once at compile time). However, there does exist
+         * situations where this restoration is necessary, e.g. CC_OP for
+         * x86 target. TODO: Emit ITLB_CHECK for cross-page bailout.  */
+        gen_helper_restore_state_from_tb(cpu_env, bailout_tb);
+        tcg_temp_free_ptr(bailout_tb);
+    }
     gen_tb_start(db->tb);
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */

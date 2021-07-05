@@ -1028,9 +1028,11 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
     TranslationBlock *tb;
     void *next;
 
- retry:
-    tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
-    next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+retry:
+    /* Do be careful when update this. It is now assumed by tb_link_page()
+     * that "tb->tc.ptr - ROUNDUP(sizeof(TranslationBlock), align) == tb".  */
+    tb = (void *) ROUND_UP((uintptr_t) s->code_gen_ptr, align);
+    next = (void *) ROUND_UP((uintptr_t) (tb + 1), align);
 
     if (unlikely(next > s->code_gen_highwater)) {
         if (tcg_region_alloc(s)) {

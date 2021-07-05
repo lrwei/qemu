@@ -331,6 +331,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 {
     uintptr_t old;
 
+    tcg_debug_assert(!(tb_cflags(tb_next) & CF_BAILOUT));
     assert(n < ARRAY_SIZE(tb->jmp_list_next));
     qemu_spin_lock(&tb_next->jmp_lock);
 

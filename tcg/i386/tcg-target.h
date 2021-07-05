@@ -210,12 +210,36 @@ static inline void flush_icache_range(uintptr_t start, uintptr_t stop)
 {
 }
 
+typedef int32_t tcg_target_offset_t;
+
+static inline int32_t tcg_target_jump_offset(int32_t *label_ptr,
+                                             uintptr_t jump_target)
+{
+    uintptr_t offset = jump_target - ((uintptr_t) label_ptr + 4);
+
+    g_assert(offset == (int32_t) offset);
+    return offset;
+}
+
+static inline uintptr_t tcg_target_jump_target(int32_t *label_ptr,
+                                               int32_t offset)
+{
+    return (uintptr_t) label_ptr + 4 + offset;
+}
+
+static inline int32_t *tcg_target_label_ptr(uintptr_t retaddr)
+{
+    return (int32_t *) (retaddr - 4);
+}
+
 static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
                                             uintptr_t jmp_addr, uintptr_t addr)
 {
-    /* patch the branch destination */
-    qatomic_set((int32_t *)jmp_addr, addr - (jmp_addr + 4));
-    /* no need to flush icache explicitly */
+    int32_t *label_ptr = (int32_t *) jmp_addr;
+
+    /* Patch the branch destination.  */
+    qatomic_set(label_ptr, tcg_target_jump_offset(label_ptr, addr));
+    /* No need to flush icache explicitly.  */
 }
 
 QEMU_NORETURN QEMU_ALWAYS_INLINE
